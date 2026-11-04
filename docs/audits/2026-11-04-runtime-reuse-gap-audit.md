@@ -63,7 +63,7 @@
 
 ## 验收边界与风险
 
-- 当前 Compose 证据限于 PostgreSQL 迁移、NATS stream、Control Plane/Gateway 启动、TaskFile 上传下载和 SeaweedFS 重启后对象仍在；新增 Enrollment 模块的 19 项单元/HTTP/PostgreSQL 集成测试、Maven verify、Compose config 与 shell 语法校验已通过。测试覆盖真实 JWT 签名/issuer/audience 解码，以及 PostgreSQL 仓库 scope 读取、token hash 持久化、撤销幂等和专用 DB role 最小表权限；CI 强制这些 PostgreSQL 测试执行 4/4。没有证明真实 Worker 执行或多租户隔离。真实 OIDC Provider、Gateway 握手集成尚未运行；启用 Worker 前必须设置 `API_AUTH_ENABLED=true` 并配置真实 IdP。
+- 当前 Compose 证据限于 PostgreSQL 迁移、NATS stream、Control Plane/Gateway 启动、TaskFile 上传下载和 SeaweedFS 重启后对象仍在；新增 Enrollment 模块的 22 项单元/HTTP/PostgreSQL 集成测试、Maven verify、Compose config 与 shell 语法校验已通过。临时 RSA/JWKS 发行者通过真实 HTTP 解码器测试签名、issuer、audience；HTTP→服务→PostgreSQL 集成验证签发哈希、撤销写入和 tenant/project/team scope 全维拒绝；仓库测试覆盖专用 DB role 最小表权限。CI 强制 10/10 PostgreSQL 集成测试执行且不跳过。没有证明真实 Worker 执行或 Gateway 握手；仍需真实 OIDC Provider 配置和 Gateway/Worker 运行时集成验收，启用 Worker 前必须设置 `API_AUTH_ENABLED=true` 并配置真实 IdP。
 - `agentteams-java` 的测试目录已有 ExecutionContext、ScopeIsolation、TaskService、Artifact、Matrix 和调度单元测试；这些测试支持应用机制存在，但不是新部署组合的端到端安全证据。
 - 本文档只审计指定 commit，不保证上游后续版本行为相同。升级共享制品前需按同一矩阵重新审计。
 - 在批次 2/3 通过前，部署说明必须称为「单租户/受信 Worker 试验档」或明确限制租户间共池；不得宣称多租户强隔离、零信任凭证或生产就绪。
