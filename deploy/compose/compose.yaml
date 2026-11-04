@@ -65,6 +65,15 @@ services:
       AGENTTEAMS_WORKER_PROVISIONER_ENABLED: "false"
       AGENTTEAMS_SANDBOX_ENABLED: "false"
       AGENTTEAMS_STORAGE_ENABLED: ${AGENTTEAMS_STORAGE_ENABLED:-false}
+      AGENTTEAMS_SECURITY_API_ENABLED: ${API_AUTH_ENABLED:-false}
+      AGENTTEAMS_SECURITY_OIDC_ENABLED: ${API_AUTH_ENABLED:-false}
+      AGENTTEAMS_SECURITY_OIDC_ISSUER_URI: ${OIDC_ISSUER_URI:-}
+      AGENTTEAMS_SECURITY_OIDC_JWK_SET_URI: ${OIDC_JWK_SET_URI:-}
+      AGENTTEAMS_SECURITY_OIDC_AUDIENCE: ${OIDC_AUDIENCE:-}
+      AGENTTEAMS_SECURITY_OIDC_TENANT_CLAIM: ${OIDC_TENANT_CLAIM:-tenant}
+      AGENTTEAMS_SECURITY_OIDC_PROJECT_CLAIM: ${OIDC_PROJECT_CLAIM:-project}
+      AGENTTEAMS_SECURITY_OIDC_TEAM_CLAIM: ${OIDC_TEAM_CLAIM:-team}
+      AGENTTEAMS_SECURITY_OIDC_PERMISSIONS_CLAIM: ${OIDC_PERMISSIONS_CLAIM:-permissions}
       AGENTTEAMS_STORAGE_ENDPOINT: http://seaweedfs:8333
       AGENTTEAMS_STORAGE_BUCKET: agentteams
       AGENTTEAMS_STORAGE_ACCESS_KEY: ${OBJECT_STORE_ACCESS_KEY:-}
@@ -80,6 +89,81 @@ services:
     ports:
       - "127.0.0.1:${CONTROL_PLANE_PORT:-8080}:8080"
     networks: [data, host-ingress]
+    restart: unless-stopped
+
+  worker-enrollment-db-setup:
+    image: postgres:16-alpine
+    profiles: [secure-api]
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: agentteams
+      PGUSER: agentteams
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      WORKER_ENROLLMENT_DB_PASSWORD: ${WORKER_ENROLLMENT_DB_PASSWORD:?set WORKER_ENROLLMENT_DB_PASSWORD in .env}
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        ready=0
+        attempt=0
+        while [ "$$attempt" -lt 90 ]; do
+          if psql -Atqc "SELECT to_regclass('public.agents') IS NOT NULL AND to_regclass('public.agent_sessions') IS NOT NULL" | grep -qx t; then ready=1; break; fi
+          attempt=$$((attempt + 1))
+          sleep 2
+        done
+        if [ "$$ready" -ne 1 ]; then echo "Control Plane agent/session schema did not become ready" >&2; exit 1; fi
+        psql -v ON_ERROR_STOP=1 <<'SQL'
+        \getenv role_password WORKER_ENROLLMENT_DB_PASSWORD
+        SELECT format('CREATE ROLE worker_enrollment LOGIN PASSWORD %L', :'role_password')
+         WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'worker_enrollment')
+        \gexec
+        SELECT format('ALTER ROLE worker_enrollment PASSWORD %L', :'role_password')
+        \gexec
+        GRANT CONNECT ON DATABASE agentteams TO worker_enrollment;
+        GRANT USAGE ON SCHEMA public TO worker_enrollment;
+        GRANT SELECT ON TABLE agents TO worker_enrollment;
+        GRANT SELECT, INSERT, UPDATE ON TABLE agent_sessions TO worker_enrollment;
+        SQL
+    depends_on:
+      postgres:
+        condition: service_healthy
+      control-plane:
+        condition: service_started
+    networks: [data]
+    restart: "no"
+
+  worker-enrollment:
+    image: agentteams-worker-enrollment:0.1.0-SNAPSHOT
+    build:
+      context: ../..
+      dockerfile: worker-enrollment/Dockerfile
+    profiles: [secure-api]
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/agentteams
+      SPRING_DATASOURCE_USERNAME: worker_enrollment
+      SPRING_DATASOURCE_PASSWORD: ${WORKER_ENROLLMENT_DB_PASSWORD:-}
+      OIDC_ISSUER_URI: ${OIDC_ISSUER_URI:-}
+      OIDC_JWK_SET_URI: ${OIDC_JWK_SET_URI:-}
+      OIDC_AUDIENCE: ${OIDC_AUDIENCE:-}
+      OIDC_TENANT_CLAIM: ${OIDC_TENANT_CLAIM:-tenant}
+      OIDC_PROJECT_CLAIM: ${OIDC_PROJECT_CLAIM:-project}
+      OIDC_TEAM_CLAIM: ${OIDC_TEAM_CLAIM:-team}
+      OIDC_PERMISSIONS_CLAIM: ${OIDC_PERMISSIONS_CLAIM:-permissions}
+      AGENTTEAMS_ENROLLMENT_DEFAULT_TTL: ${AGENTTEAMS_ENROLLMENT_DEFAULT_TTL:-7d}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      worker-enrollment-db-setup:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:${ENROLLMENT_PORT:-8090}:8090"
+    networks: [data]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8090/actuator/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
     restart: unless-stopped
 
   gateway:
@@ -106,7 +190,10 @@ services:
   worker-1:
     image: ${WORKER_IMAGE:?set WORKER_IMAGE to a published image digest}
     platform: linux/amd64
-    profiles: [worker-pool]
+    profiles: [worker-pool, secure-api]
+    env_file:
+      - path: ${WORKER_1_CREDENTIALS_FILE:-./secrets/worker-1.runtime.env}
+        required: false
     environment: &worker-env
       AGENTTEAMS_AGENT_ID: ${WORKER_1_AGENT_ID:?set a registered Worker UUID}
       AGENTTEAMS_GATEWAY_HOST: gateway
@@ -120,13 +207,18 @@ services:
     depends_on:
       gateway:
         condition: service_started
+      worker-enrollment:
+        condition: service_healthy
     networks: [worker-egress]
     restart: unless-stopped
 
   worker-2:
     image: ${WORKER_IMAGE:?set WORKER_IMAGE to a published image digest}
     platform: linux/amd64
-    profiles: [worker-pool]
+    profiles: [worker-pool, secure-api]
+    env_file:
+      - path: ${WORKER_2_CREDENTIALS_FILE:-./secrets/worker-2.runtime.env}
+        required: false
     environment:
       <<: *worker-env
       AGENTTEAMS_AGENT_ID: ${WORKER_2_AGENT_ID:?set a registered Worker UUID}
@@ -134,13 +226,18 @@ services:
     depends_on:
       gateway:
         condition: service_started
+      worker-enrollment:
+        condition: service_healthy
     networks: [worker-egress]
     restart: unless-stopped
 
   worker-3:
     image: ${WORKER_IMAGE:?set WORKER_IMAGE to a published image digest}
     platform: linux/amd64
-    profiles: [worker-pool]
+    profiles: [worker-pool, secure-api]
+    env_file:
+      - path: ${WORKER_3_CREDENTIALS_FILE:-./secrets/worker-3.runtime.env}
+        required: false
     environment:
       <<: *worker-env
       AGENTTEAMS_AGENT_ID: ${WORKER_3_AGENT_ID:?set a registered Worker UUID}
@@ -148,13 +245,18 @@ services:
     depends_on:
       gateway:
         condition: service_started
+      worker-enrollment:
+        condition: service_healthy
     networks: [worker-egress]
     restart: unless-stopped
 
   worker-4:
     image: ${WORKER_IMAGE:?set WORKER_IMAGE to a published image digest}
     platform: linux/amd64
-    profiles: [worker-pool]
+    profiles: [worker-pool, secure-api]
+    env_file:
+      - path: ${WORKER_4_CREDENTIALS_FILE:-./secrets/worker-4.runtime.env}
+        required: false
     environment:
       <<: *worker-env
       AGENTTEAMS_AGENT_ID: ${WORKER_4_AGENT_ID:?set a registered Worker UUID}
@@ -162,13 +264,18 @@ services:
     depends_on:
       gateway:
         condition: service_started
+      worker-enrollment:
+        condition: service_healthy
     networks: [worker-egress]
     restart: unless-stopped
 
   worker-5:
     image: ${WORKER_IMAGE:?set WORKER_IMAGE to a published image digest}
     platform: linux/amd64
-    profiles: [worker-pool]
+    profiles: [worker-pool, secure-api]
+    env_file:
+      - path: ${WORKER_5_CREDENTIALS_FILE:-./secrets/worker-5.runtime.env}
+        required: false
     environment:
       <<: *worker-env
       AGENTTEAMS_AGENT_ID: ${WORKER_5_AGENT_ID:?set a registered Worker UUID}
@@ -176,13 +283,18 @@ services:
     depends_on:
       gateway:
         condition: service_started
+      worker-enrollment:
+        condition: service_healthy
     networks: [worker-egress]
     restart: unless-stopped
 
   worker-6:
     image: ${WORKER_IMAGE:?set WORKER_IMAGE to a published image digest}
     platform: linux/amd64
-    profiles: [worker-pool]
+    profiles: [worker-pool, secure-api]
+    env_file:
+      - path: ${WORKER_6_CREDENTIALS_FILE:-./secrets/worker-6.runtime.env}
+        required: false
     environment:
       <<: *worker-env
       AGENTTEAMS_AGENT_ID: ${WORKER_6_AGENT_ID:?set a registered Worker UUID}
@@ -190,13 +302,18 @@ services:
     depends_on:
       gateway:
         condition: service_started
+      worker-enrollment:
+        condition: service_healthy
     networks: [worker-egress]
     restart: unless-stopped
 
   worker-7:
     image: ${WORKER_IMAGE:?set WORKER_IMAGE to a published image digest}
     platform: linux/amd64
-    profiles: [worker-pool]
+    profiles: [worker-pool, secure-api]
+    env_file:
+      - path: ${WORKER_7_CREDENTIALS_FILE:-./secrets/worker-7.runtime.env}
+        required: false
     environment:
       <<: *worker-env
       AGENTTEAMS_AGENT_ID: ${WORKER_7_AGENT_ID:?set a registered Worker UUID}
@@ -204,13 +321,18 @@ services:
     depends_on:
       gateway:
         condition: service_started
+      worker-enrollment:
+        condition: service_healthy
     networks: [worker-egress]
     restart: unless-stopped
 
   worker-8:
     image: ${WORKER_IMAGE:?set WORKER_IMAGE to a published image digest}
     platform: linux/amd64
-    profiles: [worker-pool]
+    profiles: [worker-pool, secure-api]
+    env_file:
+      - path: ${WORKER_8_CREDENTIALS_FILE:-./secrets/worker-8.runtime.env}
+        required: false
     environment:
       <<: *worker-env
       AGENTTEAMS_AGENT_ID: ${WORKER_8_AGENT_ID:?set a registered Worker UUID}
@@ -218,6 +340,8 @@ services:
     depends_on:
       gateway:
         condition: service_started
+      worker-enrollment:
+        condition: service_healthy
     networks: [worker-egress]
     restart: unless-stopped
 

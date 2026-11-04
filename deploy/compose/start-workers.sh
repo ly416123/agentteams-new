@@ -39,4 +39,4 @@ while [ "$slot" -le "$replicas" ]; do
   set -- "$@" "worker-$slot"
   slot=$((slot + 1))
 done
-compose up -d "$@"
+compose --profile secure-api --profile worker-pool up -d "$@" worker-enrollment

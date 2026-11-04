@@ -1,0 +1,39 @@
+server:
+  port: ${SERVER_PORT:8090}
+  shutdown: graceful
+
+spring:
+  application:
+    name: agentteams-worker-enrollment
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://postgres:5432/agentteams}
+    username: ${SPRING_DATASOURCE_USERNAME:agentteams}
+    password: ${SPRING_DATASOURCE_PASSWORD:}
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: ${OIDC_ISSUER_URI:}
+          jwk-set-uri: ${OIDC_JWK_SET_URI:}
+
+agentteams:
+  enrollment:
+    default-ttl: ${AGENTTEAMS_ENROLLMENT_DEFAULT_TTL:7d}
+    oidc:
+      issuer-uri: ${OIDC_ISSUER_URI:}
+      jwk-set-uri: ${OIDC_JWK_SET_URI:}
+      audience: ${OIDC_AUDIENCE:}
+      tenant-claim: ${OIDC_TENANT_CLAIM:tenant}
+      project-claim: ${OIDC_PROJECT_CLAIM:project}
+      team-claim: ${OIDC_TEAM_CLAIM:team}
+      permissions-claim: ${OIDC_PERMISSIONS_CLAIM:permissions}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      probes:
+        enabled: true

@@ -2,7 +2,7 @@
 
 面向固定容量、多租户 Agent 协作的无 Kubernetes 部署架构。项目以 Java 21 为服务端主线，复用现有 AgentTeams 的任务、租约、Outbox、Gateway 和 Worker 能力，并提供 Docker Compose / systemd 部署路径。
 
-> 当前阶段：已有固定容量 Compose POC 和 digest 锁定的 v0.1.4 镜像；尚未完成真实 Worker 任务、多租户隔离和生产级凭证代理验收。
+> 当前阶段：固定容量 Compose POC 已接入独立 Worker Enrollment 服务、OIDC scope 检查和每槽位会话凭据投放。尚未完成真实 OIDC Provider 下的 Worker 任务、多租户负向隔离与生产验收。
 
 ## 目标
 
@@ -32,6 +32,8 @@
 - [执行计划](docs/plans/2026-11-04-agentteams-new-bootstrap.md)
 - [独立 Maven 消费验证](verification/shared-core-consumer/README.md)
 - [固定容量 Compose POC](deploy/compose/README.md)
+- [Worker Enrollment 实施计划](docs/plans/2026-11-04-worker-enrollment.md)
+- [运行时复用与隔离审计](docs/audits/2026-11-04-runtime-reuse-gap-audit.md)
 - [原仓库 Kubernetes 依赖审计](../agentteams-java/docs/superpowers/specs/2026-11-04-runtime-k8s-dependency-audit.md)
 
 ## 项目结构
@@ -62,7 +64,9 @@ agentteams-new/
 
 任何资源读取与变更都必须先验证组织、租户、项目和主体权限，再以授权后的 scope 查询数据。Task、Assignment、Attempt、Lease、Conversation、Memory、Artifact、workspace 和凭据授权都必须能追溯到同一租户执行上下文。共享 Worker 首期保持单 Worker 单活动 Attempt（`maxConcurrency=1`），任务结束或取消后清理运行时会话、工具客户端、临时文件及凭据缓存。高敏租户绑定专属固定池；不支持的隔离等级必须拒绝任务，不允许静默降级。
 
-Worker 目前仍可能接触模型/MCP 上游密钥。只有完成请求级凭证代理、短时受限消费令牌和负向安全验收后，才能声明 Worker 不持有真实凭证。
+Worker 会话凭据已支持按 tenant/project/team 授权签发、哈希持久化、过期和撤销；每个 Compose Worker 槽位使用独立的 `0600` runtime env 文件。撤销阻止后续 Gateway 握手，不会主动断开已经建立的长连接。
+
+该 Gateway token 只用于 Worker 到 Gateway 的身份认证，不是模型/MCP 上游凭据。Worker 仍可能接触上游模型/MCP 密钥；在请求级凭证代理和负向安全验收完成前，不声明上游密钥与 Worker 隔离。
 
 ## 当前不承诺
 
@@ -70,7 +74,7 @@ Worker 目前仍可能接触模型/MCP 上游密钥。只有完成请求级凭�
 - 用 Matrix 替代任务状态、租约或持久消息系统。
 - 仅凭普通本机容器提供等同 gVisor、Kata 或 MicroVM 的强隔离。
 - 在凭证代理完成前宣称上游密钥不会到达 Worker。
-- 当前仓库已经包含可启动 Compose、可发布镜像或生产就绪实现。
+- 真实 OIDC Provider 与真实多租户业务下的集成验收、生产就绪状态。
 
 ## Maven 制品
 

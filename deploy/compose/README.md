@@ -2,7 +2,7 @@
 
 本目录提供不依赖 Kubernetes API、CRD、Operator 或 Docker Socket 的单机/单节点部署入口。Compose 管理 PostgreSQL、NATS JetStream、Control Plane、Gateway 和最多 8 个预先定义的 Worker 槽位。Worker 数量通过启动脚本显式选择，不会随任务动态创建或扩缩。
 
-> 当前是 POC 部署档，不代表生产就绪。多租户会话/制品隔离、凭证代理、Worker drain 恢复和完整端到端验收仍按项目计划逐批交付。
+> 当前是 POC 部署档，不代表生产就绪。Worker Enrollment 已实现 OIDC scope 授权、哈希存储会话凭据和每槽位投放；真实 IdP 下的端到端任务、多租户负向隔离、上游凭证代理和 Worker drain 恢复仍待验收。
 
 ## 前置条件
 
@@ -21,7 +21,9 @@ cp .env.example .env
 
 要启用 Artifact 对象存储，将 `AGENTTEAMS_STORAGE_ENABLED=true`，并设置 `OBJECT_STORE_ACCESS_KEY` 与至少 24 字符的 `OBJECT_STORE_SECRET_KEY`。启动脚本会先启动 `storage` profile 中的 SeaweedFS S3，并等待 S3 服务就绪后再启动 Control Plane；`agentteams` bucket 在 SeaweedFS 启动时创建，参数采用 [SeaweedFS `weed mini` S3 配置](https://github-wiki-see.page/m/seaweedfs/seaweedfs/wiki/Quick-Start-with-weed-mini)。S3 和管理端口都不发布到宿主机。当前 POC 使用单节点 SeaweedFS，并把全局 S3 凭证提供给 Control Plane；生产环境应改用具备 bucket 范围授权、备份和恢复能力的对象存储身份/服务。
 
-**当前不能启动可认证的 Worker。** v0.1.4 Gateway 会校验 `agent_sessions` 中的短时会话 Token，但该版本没有 Token 签发/撤销接口，Compose 也没有每槽位凭证投放机制。不要手工向数据库写长期 Token。另需注意，v0.1.4 Control Plane 默认关闭 OIDC API 安全；端口仅绑定 `127.0.0.1` 供本机 POC 使用，不可改为公网或局域网监听。
+Worker 池启用前，配置真实 OIDC issuer、JWKS URL、audience，并设置唯一的 `WORKER_ENROLLMENT_DB_PASSWORD`（至少 24 字符）；将 `API_AUTH_ENABLED=true`。这个开关同时开启 Control Plane API OIDC 安全和 Enrollment OIDC 验证。Enrollment 数据库角色由一次性 setup 容器创建，只能读取 `agents` 并读写 `agent_sessions`。不要手工向数据库写 Token。Control Plane 和 Enrollment HTTP 端口只绑定到 `127.0.0.1`，不可改为公网或局域网监听；如需远端访问，应放在完成 TLS 和身份校验的可信入口后。
+
+Enrollment 端口默认为 `127.0.0.1:8090`；若 `.env` 中覆盖 `ENROLLMENT_PORT`，该值仅影响宿主机端口映射，绑定地址仍固定为 loopback。`enroll-worker.sh` 需要 `curl`、`jq` 和由 OIDC Provider 签发且 scope/audience 匹配的临时 access token 文件。
 
 使用私有 GHCR 镜像时，先在本机执行 `docker login ghcr.io`。不要把 PAT 写入 Compose 文件或 `.env`。
 
@@ -46,9 +48,15 @@ Control Plane 仅绑定到 `127.0.0.1:${CONTROL_PLANE_PORT}`；PostgreSQL、NATS
 
 ## 固定 Worker 槽位
 
-`WORKER_REPLICAS` 取值为 0 到 8。每个槽位有固定且唯一的 `AGENTTEAMS_AGENT_ID`；不要使用 `docker compose --scale`，它会复制同一个槽位身份。启动脚本只选择前 N 个槽位，不会一并拉起全部 Worker。当前脚本仅用于校验 Compose 固定槽位配置；在新项目完成 enrollment 和每槽位 Token 投放前，Worker 不能完成 Gateway 身份认证。
+`WORKER_REPLICAS` 取值为 0 到 8。每个槽位有固定且唯一的 `AGENTTEAMS_AGENT_ID`；不要使用 `docker compose --scale`，它会复制同一个槽位身份。启动脚本只选择前 N 个槽位，不会一并拉起全部 Worker。
 
-在 `.env` 中设置 `WORKER_REPLICAS=2`，并确认前两个 Agent UUID 已在 Control Plane 注册：
+先启动基础服务并注册 Agent。Agent scope 必须在 `metadata.scope` 中包含 enrollment 配置所使用的 `tenant`、`project`、`team` 值。申请 OIDC access token 的主体需带 `worker:session:manage` 权限。为每个要启用的槽位单独签发 token（bearer token 从安全的临时文件读取，不要放进 shell history）：
+
+```sh
+./enroll-worker.sh http://127.0.0.1:8090 <agent-uuid> /secure/path/oidc-access-token ./secrets/worker-1.runtime.env
+```
+
+脚本只把 Gateway token 写入槽位文件，不会打印；明文 token 仅在 Enrollment 响应和本机受限文件短暂出现，数据库存哈希。设置 `.env` 中对应的 `WORKER_1_CREDENTIALS_FILE` 路径（相对路径以本目录为准）、`WORKER_REPLICAS=1`，再启动：
 
 ```sh
 ./start-workers.sh
@@ -57,7 +65,15 @@ Control Plane 仅绑定到 `127.0.0.1:${CONTROL_PLANE_PORT}`；PostgreSQL、NATS
 
 命令中显式列出槽位，避免 Compose profile 一次启动全部 8 个 Worker。Worker 并发固定为 1。增加容量需要修改版本化部署配置、执行受控变更并确认注册状态；任务高峰超过容量时由系统排队/限流，不创建 Worker。
 
-Worker 使用模型 token 文件。未配置有效凭证时不要启动 Worker；空占位文件只用于让无 Worker 的基础服务配置校验通过。
+启动脚本会校验每个活动槽位的 Agent UUID、独立凭据文件和文件权限，并自动开启 `secure-api` 与 `worker-pool` profile。不要复用槽位凭据文件。
+
+轮换时先签发新 token 到当前槽位文件，重启对应 Worker 使其重新握手，再撤销旧 session：
+
+```sh
+./revoke-worker-session.sh http://127.0.0.1:8090 <agent-uuid> <old-session-uuid> /secure/path/oidc-access-token
+```
+
+撤销只阻止后续 Gateway 握手；v0.1.4 不会主动断开已建立的连接。Worker 还会通过模型 token 文件调用模型服务，这与 Gateway session 是两类凭据。
 
 ## 状态与运维
 

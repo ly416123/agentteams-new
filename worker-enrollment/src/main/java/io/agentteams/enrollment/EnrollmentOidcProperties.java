@@ -1,0 +1,62 @@
+package io.agentteams.enrollment;
+
+import java.net.URI;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+
+@ConfigurationProperties(prefix = "agentteams.enrollment.oidc")
+public class EnrollmentOidcProperties {
+    private String issuerUri = "";
+    private String jwkSetUri = "";
+    private String audience = "";
+    private String tenantClaim = "tenant";
+    private String projectClaim = "project";
+    private String teamClaim = "team";
+    private String permissionsClaim = "permissions";
+
+    public void validate() {
+        requireAbsoluteUri(issuerUri, "issuer-uri");
+        requireAbsoluteUri(jwkSetUri, "jwk-set-uri");
+        requireText(audience, "audience");
+        requireText(tenantClaim, "tenant-claim");
+        requireText(projectClaim, "project-claim");
+        requireText(teamClaim, "team-claim");
+        requireText(permissionsClaim, "permissions-claim");
+    }
+
+    private static void requireAbsoluteUri(String value, String field) {
+        requireText(value, field);
+        try {
+            URI uri = URI.create(value);
+            if (!uri.isAbsolute() || uri.getHost() == null || uri.getUserInfo() != null) {
+                throw new IllegalArgumentException();
+            }
+        } catch (IllegalArgumentException error) {
+            throw new IllegalStateException("agentteams.enrollment.oidc." + field + " must be an absolute HTTP(S) URI");
+        }
+        String scheme = URI.create(value).getScheme();
+        if (!"https".equalsIgnoreCase(scheme) && !"http".equalsIgnoreCase(scheme)) {
+            throw new IllegalStateException("agentteams.enrollment.oidc." + field + " must use HTTP or HTTPS");
+        }
+    }
+
+    private static void requireText(String value, String field) {
+        if (value == null || value.isBlank()) {
+            throw new IllegalStateException("agentteams.enrollment.oidc." + field + " is required");
+        }
+    }
+
+    public String issuerUri() { return issuerUri; }
+    public void setIssuerUri(String issuerUri) { this.issuerUri = issuerUri; }
+    public String jwkSetUri() { return jwkSetUri; }
+    public void setJwkSetUri(String jwkSetUri) { this.jwkSetUri = jwkSetUri; }
+    public String audience() { return audience; }
+    public void setAudience(String audience) { this.audience = audience; }
+    public String tenantClaim() { return tenantClaim; }
+    public void setTenantClaim(String tenantClaim) { this.tenantClaim = tenantClaim; }
+    public String projectClaim() { return projectClaim; }
+    public void setProjectClaim(String projectClaim) { this.projectClaim = projectClaim; }
+    public String teamClaim() { return teamClaim; }
+    public void setTeamClaim(String teamClaim) { this.teamClaim = teamClaim; }
+    public String permissionsClaim() { return permissionsClaim; }
+    public void setPermissionsClaim(String permissionsClaim) { this.permissionsClaim = permissionsClaim; }
+}

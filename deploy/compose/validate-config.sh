@@ -20,6 +20,43 @@ if [ "$replicas" -lt 0 ] || [ "$replicas" -gt 8 ]; then
   exit 2
 fi
 
+api_auth_enabled=$(value API_AUTH_ENABLED)
+api_auth_enabled=${api_auth_enabled:-false}
+case "$api_auth_enabled" in
+  true|false) ;;
+  *) echo "API_AUTH_ENABLED must be true or false" >&2; exit 2 ;;
+esac
+if [ "$replicas" -gt 0 ] && [ "$api_auth_enabled" != "true" ]; then
+  echo "API_AUTH_ENABLED=true is required before starting Workers" >&2
+  exit 2
+fi
+if [ "$replicas" -gt 0 ]; then
+  enrollment_port=$(value ENROLLMENT_PORT)
+  enrollment_port=${enrollment_port:-8090}
+  case "$enrollment_port" in *[!0-9]*|'') echo "ENROLLMENT_PORT must be a TCP port number" >&2; exit 2 ;; esac
+  if [ "$enrollment_port" -lt 1 ] || [ "$enrollment_port" -gt 65535 ]; then
+    echo "ENROLLMENT_PORT must be between 1 and 65535" >&2
+    exit 2
+  fi
+fi
+if [ "$api_auth_enabled" = "true" ]; then
+  for key in OIDC_ISSUER_URI OIDC_JWK_SET_URI; do
+    oidc_value=$(value "$key")
+    case "$oidc_value" in
+      https://*|http://*) ;;
+      *) echo "$key must be an absolute HTTP(S) URL when API_AUTH_ENABLED=true" >&2; exit 2 ;;
+    esac
+  done
+  audience=$(value OIDC_AUDIENCE)
+  if [ -z "$audience" ]; then echo "OIDC_AUDIENCE is required when API_AUTH_ENABLED=true" >&2; exit 2; fi
+  enrollment_db_password=$(value WORKER_ENROLLMENT_DB_PASSWORD)
+  if [ "${#enrollment_db_password}" -lt 24 ] \
+      || [ "$enrollment_db_password" = "replace-with-a-unique-enrollment-db-password" ]; then
+    echo "Set a unique WORKER_ENROLLMENT_DB_PASSWORD of at least 24 characters" >&2
+    exit 2
+  fi
+fi
+
 password=$(value POSTGRES_PASSWORD)
 if [ "${#password}" -lt 24 ] || [ "$password" = "replace-with-a-long-random-password" ]; then
   echo "Set POSTGRES_PASSWORD to a unique value of at least 24 characters in $env_file" >&2
@@ -75,6 +112,20 @@ if [ "$replicas" -gt 0 ]; then
       *" $normalized_id "*) echo "Worker Agent UUIDs must be unique" >&2; exit 2 ;;
     esac
     seen_ids="$seen_ids$normalized_id "
+    credential_file=$(value "WORKER_${slot}_CREDENTIALS_FILE")
+    case "$credential_file" in
+      /*) ;;
+      *) credential_file="$(CDPATH= cd -- "$(dirname -- "$env_file")" && pwd)/$credential_file" ;;
+    esac
+    if [ ! -r "$credential_file" ] || ! grep -Eq '^AGENTTEAMS_GATEWAY_AUTH_TOKEN=ats_[A-Za-z0-9_-]{40,}$' "$credential_file"; then
+      echo "WORKER_${slot}_CREDENTIALS_FILE must contain an enrolled Gateway token" >&2
+      exit 2
+    fi
+    if mode=$(stat -f '%Lp' "$credential_file" 2>/dev/null); then :; else mode=$(stat -c '%a' "$credential_file"); fi
+    if [ "$((0$mode & 077))" -ne 0 ]; then
+      echo "Worker credential file must not be readable by group or other users: $credential_file" >&2
+      exit 2
+    fi
     slot=$((slot + 1))
   done
 fi

@@ -28,6 +28,8 @@ NATS JetStream ──► Agent Gateway ◄─────┘ command persistence
 - PostgreSQL 保存任务、Attempt、Assignment、Lease、授权关系、Outbox 和可恢复状态，是业务事实源。
 - NATS JetStream 承载持久事件。Gateway 持久化命令并按序号、ACK 游标处理断线恢复。
 - Worker 静态部署并主动注册。控制面不接触 Docker Socket，不持有创建容器的权限。
+- 固定 Worker 的 Gateway 会话由独立 `worker-enrollment` 服务签发：调用者须通过 OIDC issuer、签名、audience 验证，并持有 `worker:session:manage` 权限；调用 scope 必须与 Agent 注册元数据中的 tenant/project/team 完全一致。明文随机 token 只返回一次，数据库仅保存 SHA-256，TTL 限制在 1 小时至 30 天。
+- Enrollment 数据库帐号只拥有读取 `agents`、读取/插入/更新 `agent_sessions` 的权限；Compose 为每个 Worker 槽位单独加载 `0600` 凭据文件。v0.1.4 Gateway 只在握手时验证 session，撤销不主动断开现有连接。
 - Matrix 是可选的人机协作适配器；不能作为调度总线或任务状态库。
 - Artifact 正文存储在隔离的对象存储命名空间，通过租户授权后的短期 URL 访问。
 
@@ -55,7 +57,7 @@ NATS JetStream ──► Agent Gateway ◄─────┘ command persistence
 
 ## 5. 凭证流
 
-短期兼容模式允许受信任 Worker 从容器 Secret 文件读取上游密钥，但不能称为零信任凭证隔离。目标模式由凭证代理验证短期消费令牌，检查租户、项目、Attempt、模型/工具 allowlist、过期和撤销状态，再由代理解析上游密钥并转发。模型与 MCP 分别定义适配协议；代理不可用时 fail-closed，日志/事件/Trace 不记录密钥。
+Enrollment 只解决 Worker 到 Gateway 的身份凭据，不是模型/MCP 上游凭证代理。短期兼容模式允许受信任 Worker 从容器 Secret 文件读取上游密钥，但不能称为零信任凭证隔离。目标模式由凭证代理验证短期消费令牌，检查租户、项目、Attempt、模型/工具 allowlist、过期和撤销状态，再由代理解析上游密钥并转发。模型与 MCP 分别定义适配协议；代理不可用时 fail-closed，日志/事件/Trace 不记录密钥。
 
 Secret Manager 负责密钥存储和轮换；数据库及消息只存引用、版本、策略与审计元数据。Higress 可作为模型代理候选，MCP 需单独评估 MCP Connector/Gateway，不能假设普通 AI Gateway 自动具备完整工具授权能力。
 
