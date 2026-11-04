@@ -26,6 +26,21 @@ if [ "${#password}" -lt 24 ] || [ "$password" = "replace-with-a-long-random-pass
   exit 2
 fi
 
+storage_enabled=$(value AGENTTEAMS_STORAGE_ENABLED)
+case "$storage_enabled" in
+  true|false) ;;
+  *) echo "AGENTTEAMS_STORAGE_ENABLED must be true or false" >&2; exit 2 ;;
+esac
+if [ "$storage_enabled" = "true" ]; then
+  minio_user=$(value MINIO_ROOT_USER)
+  minio_password=$(value MINIO_ROOT_PASSWORD)
+  if [ "${#minio_user}" -lt 3 ] || [ "${#minio_password}" -lt 24 ] \
+      || [ "$minio_password" = "replace-with-a-32-character-minio-password" ]; then
+    echo "Set MINIO_ROOT_USER (3+ chars) and MINIO_ROOT_PASSWORD (24+ chars) before enabling storage" >&2
+    exit 2
+  fi
+fi
+
 for key in CONTROL_PLANE_IMAGE GATEWAY_IMAGE WORKER_IMAGE; do
   image=$(value "$key")
   case "$image" in ghcr.io/ly416123/*@sha256:*) ;; *) echo "$key must reference ghcr.io/ly416123 by digest" >&2; exit 2 ;; esac
@@ -55,10 +70,11 @@ if [ "$replicas" -gt 0 ]; then
       echo "WORKER_${slot}_AGENT_ID must be a UUID registered with this Control Plane" >&2
       exit 2
     fi
+    normalized_id=$(printf '%s' "$id" | tr '[:upper:]' '[:lower:]')
     case "$seen_ids" in
-      *" $id "*) echo "Worker Agent UUIDs must be unique" >&2; exit 2 ;;
+      *" $normalized_id "*) echo "Worker Agent UUIDs must be unique" >&2; exit 2 ;;
     esac
-    seen_ids="$seen_ids$id "
+    seen_ids="$seen_ids$normalized_id "
     slot=$((slot + 1))
   done
 fi

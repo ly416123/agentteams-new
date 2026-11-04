@@ -18,6 +18,8 @@ cp .env.example .env
 
 编辑 `.env`：填入强随机 `POSTGRES_PASSWORD`。镜像已固定到同一发布 tag 和 source commit，升级时从签名的 release manifest 获取新 digest 后一起更新。将 `WORKER_n_AGENT_ID` 改为 Control Plane 注册接口为每个 Worker 返回的 UUID，保证唯一且重启稳定。设置 `MODEL_TOKEN_FILE` 为本机模型 token 文件路径；相对路径相对于本目录。使用 ChatGPT Plan Worker 时，该文件应为现有 Worker 运行时支持的 access-token 格式。
 
+要启用 Artifact 对象存储，将 `AGENTTEAMS_STORAGE_ENABLED=true`，并设置 `MINIO_ROOT_USER` 与至少 24 字符的 `MINIO_ROOT_PASSWORD`。启动脚本会先启动 `storage` profile 中的 MinIO 并初始化 `agentteams` bucket，再启动 Control Plane。MinIO API 和 Console 都不发布到宿主机。当前 POC 将 MinIO root 凭证提供给 Control Plane；生产环境应换成 bucket 范围的专用身份和 Secret Manager。
+
 使用私有 GHCR 镜像时，先在本机执行 `docker login ghcr.io`。不要把 PAT 写入 Compose 文件或 `.env`。
 
 ## 校验与启动
@@ -32,6 +34,12 @@ docker compose --env-file .env ps
 ```
 
 Control Plane 仅绑定到 `127.0.0.1:${CONTROL_PLANE_PORT}`；PostgreSQL、NATS 和 Gateway gRPC 端口不发布到宿主机。PostgreSQL/NATS 位于无外连的 `data` 网络；Worker 仅加入 `worker-egress` 网络，与同时连接两网的 Gateway 通信，不能直接连接数据库或 NATS。Worker 的 bridge 网络允许访问模型服务；主机防火墙/出站代理策略需按环境限制 Worker 外部访问。NATS 第一次启动时创建 TASK_EVENTS、AGENT_EVENTS、CONTROL_EVENTS、DEADLETTER_EVENTS 四个持久 stream；数据库由 Control Plane Flyway 迁移。
+
+启用 MinIO 时，使用启动脚本完成先后顺序与 bucket 初始化：
+
+```sh
+./start-workers.sh
+```
 
 ## 固定 Worker 槽位
 
@@ -55,7 +63,7 @@ Worker 使用模型 token 文件。未配置有效凭证时不要启动 Worker�
 - 备份前暂停写入或使用一致性备份流程。生产部署需另外落实异机备份、恢复演练、升级/回滚和镜像签名校验。
 - `docker compose down` 保留命名卷；`docker compose down -v` 会删除 PostgreSQL/NATS 数据，请谨慎操作。
 - `docker compose logs -f control-plane gateway` 查看应用日志。不得将凭证或租户敏感内容写入日志。
-- 目前没有 Matrix、MinIO 可选 profile：Compose POC 先验证固定容量和共享持久化基础设施；对象存储/IM 接入待对应适配器与租户隔离验收后再加入。
+- MinIO 通过可选 `storage` profile 提供 Artifact 对象存储；Matrix 适配器尚未加入 Compose。
 
 ## 当前限制
 
