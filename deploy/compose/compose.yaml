@@ -1,0 +1,217 @@
+name: agentteams
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: agentteams
+      POSTGRES_USER: agentteams
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agentteams -d agentteams"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [backend]
+    restart: unless-stopped
+
+  nats:
+    image: nats:2.10-alpine
+    command: ["--jetstream", "--store_dir=/data/jetstream", "--http_port=8222"]
+    volumes:
+      - nats-data:/data/jetstream
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8222/healthz | grep -q ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    networks: [backend]
+    restart: unless-stopped
+
+  nats-bootstrap:
+    image: natsio/nats-box:0.14.0
+    depends_on:
+      nats:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        until nats --server nats://nats:4222 stream ls >/dev/null 2>&1; do sleep 2; done
+        nats --server nats://nats:4222 stream info TASK_EVENTS >/dev/null 2>&1 || nats --server nats://nats:4222 stream add TASK_EVENTS --subjects 'task.events.*' --storage file --retention limits
+        nats --server nats://nats:4222 stream info AGENT_EVENTS >/dev/null 2>&1 || nats --server nats://nats:4222 stream add AGENT_EVENTS --subjects 'agent.events.*' --storage file --retention limits
+        nats --server nats://nats:4222 stream info CONTROL_EVENTS >/dev/null 2>&1 || nats --server nats://nats:4222 stream add CONTROL_EVENTS --subjects 'control.events' --storage file --retention limits
+        nats --server nats://nats:4222 stream info DEADLETTER_EVENTS >/dev/null 2>&1 || nats --server nats://nats:4222 stream add DEADLETTER_EVENTS --subjects 'deadletter.events' --storage file --retention limits
+        nats --server nats://nats:4222 stream info TASK_EVENTS >/dev/null
+        nats --server nats://nats:4222 stream info AGENT_EVENTS >/dev/null
+        nats --server nats://nats:4222 stream info CONTROL_EVENTS >/dev/null
+        nats --server nats://nats:4222 stream info DEADLETTER_EVENTS >/dev/null
+    networks: [backend]
+    restart: "no"
+
+  control-plane:
+    image: ${CONTROL_PLANE_IMAGE:?set CONTROL_PLANE_IMAGE to a published image digest}
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/agentteams
+      SPRING_DATASOURCE_USERNAME: agentteams
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      AGENTTEAMS_NATS_ENABLED: "true"
+      AGENTTEAMS_NATS_URL: nats://nats:4222
+      AGENTTEAMS_OUTBOX_RELAY_ENABLED: "true"
+      AGENTTEAMS_TEAM_SYNC_ENABLED: "false"
+      AGENTTEAMS_WORKER_PROVISIONER_ENABLED: "false"
+      AGENTTEAMS_SANDBOX_ENABLED: "false"
+      AGENTTEAMS_STORAGE_ENABLED: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats-bootstrap:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:${CONTROL_PLANE_PORT:-8080}:8080"
+    networks: [backend]
+    restart: unless-stopped
+
+  gateway:
+    image: ${GATEWAY_IMAGE:?set GATEWAY_IMAGE to a published image digest}
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/agentteams
+      SPRING_DATASOURCE_USERNAME: agentteams
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      AGENTTEAMS_GATEWAY_NATS_ENABLED: "true"
+      AGENTTEAMS_GATEWAY_NATS_URL: nats://nats:4222
+      AGENTTEAMS_GATEWAY_NATS_INSTANCE_ID: compose-gateway
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats-bootstrap:
+        condition: service_completed_successfully
+      control-plane:
+        condition: service_started
+    expose: ["9090"]
+    networks: [backend]
+    restart: unless-stopped
+
+  worker-1:
+    image: ${WORKER_IMAGE:?set WORKER_IMAGE to a published image digest}
+    profiles: [worker-pool]
+    environment: &worker-env
+      AGENTTEAMS_AGENT_ID: ${WORKER_1_AGENT_ID:?set a registered Worker UUID}
+      AGENTTEAMS_GATEWAY_HOST: gateway
+      AGENTTEAMS_GATEWAY_PORT: "9090"
+      AGENTTEAMS_RUNTIME: AGENTSCOPE
+      AGENTTEAMS_MODEL_PROVIDER: chatgpt-plan
+      AGENTTEAMS_MODEL: chatgpt-plan:gpt-5.6-luna
+      AGENTTEAMS_MAX_CONCURRENT_TASKS: "1"
+      AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE: /run/secrets/model_token
+    secrets: [model_token]
+    depends_on:
+      gateway:
+        condition: service_started
+    networks: [backend]
+    restart: unless-stopped
+
+  worker-2:
+    image: ${WORKER_IMAGE:?set WORKER_IMAGE to a published image digest}
+    profiles: [worker-pool]
+    environment:
+      <<: *worker-env
+      AGENTTEAMS_AGENT_ID: ${WORKER_2_AGENT_ID:?set a registered Worker UUID}
+    secrets: [model_token]
+    depends_on:
+      gateway:
+        condition: service_started
+    networks: [backend]
+    restart: unless-stopped
+
+  worker-3:
+    image: ${WORKER_IMAGE:?set WORKER_IMAGE to a published image digest}
+    profiles: [worker-pool]
+    environment:
+      <<: *worker-env
+      AGENTTEAMS_AGENT_ID: ${WORKER_3_AGENT_ID:?set a registered Worker UUID}
+    secrets: [model_token]
+    depends_on:
+      gateway:
+        condition: service_started
+    networks: [backend]
+    restart: unless-stopped
+
+  worker-4:
+    image: ${WORKER_IMAGE:?set WORKER_IMAGE to a published image digest}
+    profiles: [worker-pool]
+    environment:
+      <<: *worker-env
+      AGENTTEAMS_AGENT_ID: ${WORKER_4_AGENT_ID:?set a registered Worker UUID}
+    secrets: [model_token]
+    depends_on:
+      gateway:
+        condition: service_started
+    networks: [backend]
+    restart: unless-stopped
+
+  worker-5:
+    image: ${WORKER_IMAGE:?set WORKER_IMAGE to a published image digest}
+    profiles: [worker-pool]
+    environment:
+      <<: *worker-env
+      AGENTTEAMS_AGENT_ID: ${WORKER_5_AGENT_ID:?set a registered Worker UUID}
+    secrets: [model_token]
+    depends_on:
+      gateway:
+        condition: service_started
+    networks: [backend]
+    restart: unless-stopped
+
+  worker-6:
+    image: ${WORKER_IMAGE:?set WORKER_IMAGE to a published image digest}
+    profiles: [worker-pool]
+    environment:
+      <<: *worker-env
+      AGENTTEAMS_AGENT_ID: ${WORKER_6_AGENT_ID:?set a registered Worker UUID}
+    secrets: [model_token]
+    depends_on:
+      gateway:
+        condition: service_started
+    networks: [backend]
+    restart: unless-stopped
+
+  worker-7:
+    image: ${WORKER_IMAGE:?set WORKER_IMAGE to a published image digest}
+    profiles: [worker-pool]
+    environment:
+      <<: *worker-env
+      AGENTTEAMS_AGENT_ID: ${WORKER_7_AGENT_ID:?set a registered Worker UUID}
+    secrets: [model_token]
+    depends_on:
+      gateway:
+        condition: service_started
+    networks: [backend]
+    restart: unless-stopped
+
+  worker-8:
+    image: ${WORKER_IMAGE:?set WORKER_IMAGE to a published image digest}
+    profiles: [worker-pool]
+    environment:
+      <<: *worker-env
+      AGENTTEAMS_AGENT_ID: ${WORKER_8_AGENT_ID:?set a registered Worker UUID}
+    secrets: [model_token]
+    depends_on:
+      gateway:
+        condition: service_started
+    networks: [backend]
+    restart: unless-stopped
+
+secrets:
+  model_token:
+    file: ${MODEL_TOKEN_FILE:?set MODEL_TOKEN_FILE to a readable model token file}
+
+volumes:
+  postgres-data:
+  nats-data:
+
+networks:
+  backend:
+    driver: bridge

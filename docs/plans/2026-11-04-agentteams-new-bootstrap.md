@@ -36,6 +36,8 @@
 
 **当前进度：** 批次 0 共享核心制品边界已完成本地与远端验证。`agentteams-java` tag `v0.1.1`（commit `0b0ac9e78a3e4be719fba6e5a66042e6ed16b507`）的 release workflow `41821553040` 已成功发布根 parent 与 6 个共享模块；该工作流随后在 OCI 镜像签名/attestation 阶段失败，与 Maven 发布步骤无关。2026-11-04 从 `agentteams-new` 使用本机代理 `127.0.0.1:7892`、classic PAT `read:packages`、临时 Maven settings 和独立本地缓存执行远端 `dependency:tree`，成功解析 6 个 `0.1.1` 模块与第三方依赖并输出 `BUILD SUCCESS`。Maven Packages 列表为 [agentteams-java Packages](https://github.com/ly416123/agentteams-java/packages)。该 registry 的 Maven 包继承仓库权限，无独立包授权入口。跨仓库 GitHub Actions `GITHUB_TOKEN` 路径尚未验证；旧仓库 Kind CI 问题留待后续部署/镜像批次处理。
 
+**批次 1 执行记录：** 在 `agentteams-java` 隔离 worktree 中修复 release workflow provenance 的 jq 对象括号错误（`cf1f4f1`），将修复推送到旧仓库 `main` 并触发 `v0.1.2` 发布 workflow `41830278642`。发布任务仍在执行验证门禁，尚未确认镜像 digest。`agentteams-new` 的隔离 worktree 已新增 Compose 固定槽位清单、启动脚本、配置前置校验和部署说明；`docker compose config --quiet`、shell 语法及 `git diff --check` 已通过。镜像引用仍是明确标记的占位值，待 release 成功后替换为真实 digest。由于旧版 Worker 的配置要求真实注册 Agent UUID 和模型凭证，启动脚本校验槽位 ID/凭证路径；这份 POC 仍不构成多租户隔离或生产验收。
+
 ## 批次 1：无 Kubernetes 固定容量 Compose POC
 
 1. 先从旧仓库构建并发布 Control Plane、Gateway、Worker 的固定版本 OCI 镜像；记录镜像 digest 和源 commit。
