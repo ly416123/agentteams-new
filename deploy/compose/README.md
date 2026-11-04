@@ -31,7 +31,7 @@ docker compose --env-file .env up -d postgres nats nats-bootstrap control-plane 
 docker compose --env-file .env ps
 ```
 
-Control Plane 仅绑定到 `127.0.0.1:${CONTROL_PLANE_PORT}`；PostgreSQL、NATS 和 Gateway gRPC 端口不发布到宿主机。容器 bridge 网络允许 Worker 访问模型服务；主机防火墙/出站代理策略需按环境限制 Worker 的外部访问。NATS 第一次启动时创建 TASK_EVENTS、AGENT_EVENTS、CONTROL_EVENTS、DEADLETTER_EVENTS 四个持久 stream；数据库由 Control Plane Flyway 迁移。
+Control Plane 仅绑定到 `127.0.0.1:${CONTROL_PLANE_PORT}`；PostgreSQL、NATS 和 Gateway gRPC 端口不发布到宿主机。PostgreSQL/NATS 位于无外连的 `data` 网络；Worker 仅加入 `worker-egress` 网络，与同时连接两网的 Gateway 通信，不能直接连接数据库或 NATS。Worker 的 bridge 网络允许访问模型服务；主机防火墙/出站代理策略需按环境限制 Worker 外部访问。NATS 第一次启动时创建 TASK_EVENTS、AGENT_EVENTS、CONTROL_EVENTS、DEADLETTER_EVENTS 四个持久 stream；数据库由 Control Plane Flyway 迁移。
 
 ## 固定 Worker 槽位
 

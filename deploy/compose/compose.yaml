@@ -14,7 +14,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
-    networks: [backend]
+    networks: [data]
     restart: unless-stopped
 
   nats:
@@ -28,7 +28,7 @@ services:
       timeout: 5s
       retries: 20
       start_period: 10s
-    networks: [backend]
+    networks: [data]
     restart: unless-stopped
 
   nats-bootstrap:
@@ -48,7 +48,7 @@ services:
         nats --server nats://nats:4222 stream info AGENT_EVENTS >/dev/null
         nats --server nats://nats:4222 stream info CONTROL_EVENTS >/dev/null
         nats --server nats://nats:4222 stream info DEADLETTER_EVENTS >/dev/null
-    networks: [backend]
+    networks: [data]
     restart: "no"
 
   control-plane:
@@ -71,7 +71,7 @@ services:
         condition: service_completed_successfully
     ports:
       - "127.0.0.1:${CONTROL_PLANE_PORT:-8080}:8080"
-    networks: [backend]
+    networks: [data, host-ingress]
     restart: unless-stopped
 
   gateway:
@@ -91,7 +91,7 @@ services:
       control-plane:
         condition: service_started
     expose: ["9090"]
-    networks: [backend]
+    networks: [data, worker-egress]
     restart: unless-stopped
 
   worker-1:
@@ -110,7 +110,7 @@ services:
     depends_on:
       gateway:
         condition: service_started
-    networks: [backend]
+    networks: [worker-egress]
     restart: unless-stopped
 
   worker-2:
@@ -123,7 +123,7 @@ services:
     depends_on:
       gateway:
         condition: service_started
-    networks: [backend]
+    networks: [worker-egress]
     restart: unless-stopped
 
   worker-3:
@@ -136,7 +136,7 @@ services:
     depends_on:
       gateway:
         condition: service_started
-    networks: [backend]
+    networks: [worker-egress]
     restart: unless-stopped
 
   worker-4:
@@ -149,7 +149,7 @@ services:
     depends_on:
       gateway:
         condition: service_started
-    networks: [backend]
+    networks: [worker-egress]
     restart: unless-stopped
 
   worker-5:
@@ -162,7 +162,7 @@ services:
     depends_on:
       gateway:
         condition: service_started
-    networks: [backend]
+    networks: [worker-egress]
     restart: unless-stopped
 
   worker-6:
@@ -175,7 +175,7 @@ services:
     depends_on:
       gateway:
         condition: service_started
-    networks: [backend]
+    networks: [worker-egress]
     restart: unless-stopped
 
   worker-7:
@@ -188,7 +188,7 @@ services:
     depends_on:
       gateway:
         condition: service_started
-    networks: [backend]
+    networks: [worker-egress]
     restart: unless-stopped
 
   worker-8:
@@ -201,7 +201,7 @@ services:
     depends_on:
       gateway:
         condition: service_started
-    networks: [backend]
+    networks: [worker-egress]
     restart: unless-stopped
 
 secrets:
@@ -213,5 +213,9 @@ volumes:
   nats-data:
 
 networks:
-  backend:
+  data:
+    internal: true
+  host-ingress:
+    driver: bridge
+  worker-egress:
     driver: bridge
