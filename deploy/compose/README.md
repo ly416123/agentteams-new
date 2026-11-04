@@ -17,9 +17,11 @@ cd deploy/compose
 cp .env.example .env
 ```
 
-编辑 `.env`：填入强随机 `POSTGRES_PASSWORD`。镜像已固定到同一发布 tag 和 source commit，升级时从签名的 release manifest 获取新 digest 后一起更新。将 `WORKER_n_AGENT_ID` 改为 Control Plane 注册接口为每个 Worker 返回的 UUID，保证唯一且重启稳定。设置 `MODEL_TOKEN_FILE` 为本机模型 token 文件路径；相对路径相对于本目录。使用 ChatGPT Plan Worker 时，该文件应为现有 Worker 运行时支持的 access-token 格式。
+编辑 `.env`：填入强随机 `POSTGRES_PASSWORD`。镜像已固定到同一发布 tag 和 source commit，升级时从签名的 release manifest 获取新 digest 后一起更新。`POST /api/v1/agents` 只创建 Worker 记录并返回 UUID，不会签发 Gateway 会话 Token。设置 `MODEL_TOKEN_FILE` 为本机模型 token 文件路径；相对路径相对于本目录。使用 ChatGPT Plan Worker 时，该文件应为现有 Worker 运行时支持的 access-token 格式。
 
 要启用 Artifact 对象存储，将 `AGENTTEAMS_STORAGE_ENABLED=true`，并设置 `OBJECT_STORE_ACCESS_KEY` 与至少 24 字符的 `OBJECT_STORE_SECRET_KEY`。启动脚本会先启动 `storage` profile 中的 SeaweedFS S3，并等待 S3 服务就绪后再启动 Control Plane；`agentteams` bucket 在 SeaweedFS 启动时创建，参数采用 [SeaweedFS `weed mini` S3 配置](https://github-wiki-see.page/m/seaweedfs/seaweedfs/wiki/Quick-Start-with-weed-mini)。S3 和管理端口都不发布到宿主机。当前 POC 使用单节点 SeaweedFS，并把全局 S3 凭证提供给 Control Plane；生产环境应改用具备 bucket 范围授权、备份和恢复能力的对象存储身份/服务。
+
+**当前不能启动可认证的 Worker。** v0.1.4 Gateway 会校验 `agent_sessions` 中的短时会话 Token，但该版本没有 Token 签发/撤销接口，Compose 也没有每槽位凭证投放机制。不要手工向数据库写长期 Token。另需注意，v0.1.4 Control Plane 默认关闭 OIDC API 安全；端口仅绑定 `127.0.0.1` 供本机 POC 使用，不可改为公网或局域网监听。
 
 使用私有 GHCR 镜像时，先在本机执行 `docker login ghcr.io`。不要把 PAT 写入 Compose 文件或 `.env`。
 
@@ -44,9 +46,8 @@ Control Plane 仅绑定到 `127.0.0.1:${CONTROL_PLANE_PORT}`；PostgreSQL、NATS
 
 ## 固定 Worker 槽位
 
-`WORKER_REPLICAS` 取值为 0 到 8。每个槽位有固定且唯一的 `AGENTTEAMS_AGENT_ID`；不要使用 `docker compose --scale`，它会复制同一个槽位身份。启动脚本只选择前 N 个槽位，不会一并拉起全部 Worker。
+`WORKER_REPLICAS` 取值为 0 到 8。每个槽位有固定且唯一的 `AGENTTEAMS_AGENT_ID`；不要使用 `docker compose --scale`，它会复制同一个槽位身份。启动脚本只选择前 N 个槽位，不会一并拉起全部 Worker。当前脚本仅用于校验 Compose 固定槽位配置；在新项目完成 enrollment 和每槽位 Token 投放前，Worker 不能完成 Gateway 身份认证。
 
-```sh
 在 `.env` 中设置 `WORKER_REPLICAS=2`，并确认前两个 Agent UUID 已在 Control Plane 注册：
 
 ```sh

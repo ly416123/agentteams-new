@@ -40,15 +40,19 @@
 
 **运行时复用边界审计：** 对 `agentteams-java` v0.1.4 源码 commit `02d5ad3017f56b2a3cbb6c60112077d32f3299f4` 完成只读检查，记录见 [旧运行时复用边界审计](../audits/2026-11-04-runtime-reuse-gap-audit.md)。旧版可复用任务状态机、DB Lease/恢复、Gateway 持久状态、应用层租户授权、Matrix 绑定和 Artifact API；但未发现 PostgreSQL RLS policy，MCP 凭证可从 Worker 环境读取、模型 Token 可由 Worker 读取文件，Compose 也尚未跑真实 Worker Attempt。上述机制不构成新项目的多租户强隔离或凭证不落 Worker 证明。后续先完成真实固定 Worker 生命周期，再依次落地 scope 闭环、Attempt 隔离、RLS 纵深防御与凭证代理。
 
+**Worker 启动阻断项：** 继续核对固定槽位真实连接条件时发现，v0.1.4 Gateway 在共享 PostgreSQL 可用时自动启用 `agent_sessions` Hash 校验，但旧源码只有查询端，没有 Token 签发/撤销服务；Compose 也未注入 `AGENTTEAMS_GATEWAY_AUTH_TOKEN`。同时 Control Plane 的 API OIDC 默认为关闭。故当前 Compose 能启动 Worker 容器配置，但没有可受支持的注册凭证生命周期，真实 Worker Attempt 尚不能验收。批次 1 收尾前，必须在 `agentteams-new` 增加受控 Worker enrollment（Token 只展示一次、DB 仅存 Hash、支持撤销/轮换、每槽位独立投放）和明确的 OIDC API 配置；不得通过手工插入长期 Token 或公开 API 临时绕过认证来宣布通过。
+
 ## 批次 1：无 Kubernetes 固定容量 Compose POC
 
 1. 先从旧仓库构建并发布 Control Plane、Gateway、Worker 的固定版本 OCI 镜像；记录镜像 digest 和源 commit。
 2. 新仓库新增 `deploy/compose/compose.yaml`、`.env.example`、`README.md` 和配置校验脚本。服务包括 PostgreSQL、NATS JetStream、Control Plane、Gateway 和由 `WORKER_REPLICAS` 静态配置生成的固定 Worker 槽位；不提供 Docker Socket。
 3. 为数据库和 NATS 配置持久卷、健康检查、启动依赖和最小凭据配置；单节点 S3 兼容存储与 Matrix 作为可选 profile。
-4. 明确 Worker 实例身份稳定性、注册/心跳、drain、关闭信号与重启重连要求；Compose 只做部署编排，不实现任务级扩缩。
-5. 编写一条端到端操作手册：启动、创建租户/Team、注册 Worker、提交任务、读取 Timeline/Artifact、停止并重启恢复。
+4. 实现固定 Worker enrollment：服务端验证槽位归属并签发单次呈现的短时 Gateway Token，持久层只保存 Hash，支持撤销、轮换和过期；每槽位单独投放凭证，不放入共享 `.env`。
+5. 配置 Control Plane OIDC issuer、audience 与租户/项目/团队 claim；生产档缺少身份配置时拒绝启动，local-dev 档仅允许回环绑定并显式标注。
+6. 明确 Worker 实例身份稳定性、注册/心跳、drain、关闭信号与重启重连要求；Compose 只做部署编排，不实现任务级扩缩。
+7. 编写一条端到端操作手册：启动、创建租户/Team、签发并注册 Worker、提交任务、读取 Timeline/Artifact、停止并重启恢复。
 
-**门槛：** 环境不提供 Kubernetes 凭据或 API 时可完成端到端任务；服务重启后任务、Outbox、命令和 ACK 状态正确恢复；容量不足只排队/限流。
+**门槛：** 环境不提供 Kubernetes 凭据或 API 时可完成端到端任务；通过受支持的 enrollment 完成 Worker 认证；API 身份认证启用；服务重启后任务、Outbox、命令和 ACK 状态正确恢复；容量不足只排队/限流。
 
 ## 批次 2：租户与会话隔离
 
