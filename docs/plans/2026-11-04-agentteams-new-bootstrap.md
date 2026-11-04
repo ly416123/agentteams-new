@@ -38,6 +38,8 @@
 
 **批次 1 执行记录：** 在 `agentteams-java` 隔离 worktree 中修复 release workflow provenance 的 jq 括号、Cosign 类型及 SLSA v1 predicate 结构（`cf1f4f1`、`02d5ad3`、`02d5ad30`）。`v0.1.2` workflow `41830278642` 的 Maven 包和 Control Plane 镜像已发布，但完整 release 在 provenance 阶段失败；`v0.1.3` workflow `41833566751` 因修复前结构已触发并提交取消。修正后的 `v0.1.4` workflow `41833753572` 成功，发布了 parent + 6 个 Maven 核心包、4 个签名/attestation 镜像和签名 release manifest；本机 Cosign 2.4.1 `attest --no-upload` 红/绿验证、远端 Maven consumer `0.1.4` 和 release manifest 签名校验均通过。三项 Compose 镜像 digest 固定在 `deploy/compose/.env.example`，对应 source commit `02d5ad3017f56b2a3cbb6c60112077d32f3299f4`。Compose 提供可选单节点 S3 `storage` profile；Worker egress 网络与数据库/NATS/对象存储数据网络隔离，UUID 校验不区分大小写。基础、storage、worker profiles 的配置解析、配置校验正/负场景、shell 语法及 `git diff --check` 已通过。2026-11-04 宿主机本机代理可访问 Docker Hub/GHCR，但默认 Colima profile 的 dockerd 没有使用代理；为避免重启并中断现有容器，另建隔离的 `agentteams-poc` Colima profile 并配置 daemon proxy，成功拉取 `natsio/nats-box:0.14.0`、PostgreSQL、NATS 和 SeaweedFS。验证发现 `minio/minio`、`minio/mc` 无法从 Docker Hub 获取，Quay 返回未授权；因此改为固定 digest 的 SeaweedFS 4.52 单节点 S3，实际容器启动成功、创建 `agentteams` bucket，S3 endpoint 可达且匿名请求被拒绝（HTTP 403）。随后修复 NATS stream bootstrap 交互确认问题，在隔离 Compose 环境完成 NATS 四个 stream 创建、PostgreSQL 迁移到 v121、Control Plane/Gateway 启动；通过 Control Plane TaskFile API 上传并下载对象成功，SeaweedFS 容器重启后同一对象仍可读取。应用镜像为 amd64-only，Compose 已明确平台；ARM64 开发 smoke 使用 QEMU 仿真，启动时间显著更长。真实 Worker 任务、Worker drain、专用 Artifact presigned-upload 流程、多租户/会话隔离和凭证代理仍待后续批次验收；本 POC 不代表生产就绪。
 
+**运行时复用边界审计：** 对 `agentteams-java` v0.1.4 源码 commit `02d5ad3017f56b2a3cbb6c60112077d32f3299f4` 完成只读检查，记录见 [旧运行时复用边界审计](../audits/2026-11-04-runtime-reuse-gap-audit.md)。旧版可复用任务状态机、DB Lease/恢复、Gateway 持久状态、应用层租户授权、Matrix 绑定和 Artifact API；但未发现 PostgreSQL RLS policy，MCP 凭证可从 Worker 环境读取、模型 Token 可由 Worker 读取文件，Compose 也尚未跑真实 Worker Attempt。上述机制不构成新项目的多租户强隔离或凭证不落 Worker 证明。后续先完成真实固定 Worker 生命周期，再依次落地 scope 闭环、Attempt 隔离、RLS 纵深防御与凭证代理。
+
 ## 批次 1：无 Kubernetes 固定容量 Compose POC
 
 1. 先从旧仓库构建并发布 Control Plane、Gateway、Worker 的固定版本 OCI 镜像；记录镜像 digest 和源 commit。
@@ -51,12 +53,12 @@
 ## 批次 2：租户与会话隔离
 
 1. 定义不可变 `ExecutionContext` 的 protobuf 字段、签发方、验证方、版本及过期规则；scope 不由 Worker/客户端自行选择。
-2. 盘点 Task、Attempt、Conversation、Memory、Artifact、MCP binding 和 workspace 表/API，逐一确认授权后的租户 scope 过滤；为跨租户 ID 猜测和伪造上下文写拒绝场景。
+2. 先建立按 Task、Attempt、Conversation、Memory、Artifact、MCP binding、workspace 和后台 Job 划分的 scope 矩阵，统一 scope-aware 数据访问入口；跨租户 ID 猜测、伪造上下文、无 scope 的后台操作默认拒绝。
 3. 实现 Attempt 独立会话状态、目录、缓存键和 MCP 客户端生命周期；完成/取消/失败/租约过期均执行清理。
-4. 明确 PostgreSQL RLS 的启用范围与连接池事务变量设置；如果暂不采用 RLS，仍需数据库访问层集中 scope 并给出等价负向验证。
+4. 决定 PostgreSQL RLS 的表范围、独立 DB role 和连接池事务变量设置；应用层 scope 校验保持强制，RLS 用于防止漏过滤的纵深防御。若分期启用，先完成集中 scope 访问与等价负向验证，再逐表启用 RLS。
 5. 实现租户级并发、速率和模型预算；支持共享池与专属固定池路由，高敏租户不能落入共享池。
 
-**门槛：** A/B 租户并发和连续复用同一 Worker 的负向验收证明 Conversation、Memory、Task、Artifact、工具状态、临时文件和凭据缓存互不可见；越权和伪造 scope 均拒绝。
+**门槛：** 先完成真实 Worker Attempt、注册/心跳、drain、租约过期恢复和重启重连。随后 A/B 租户并发及连续复用同一 Worker 的负向验收证明 Conversation、Memory、Task、Artifact、工具状态、临时文件和凭据缓存互不可见；越权和伪造 scope 均拒绝。通过前部署档位必须明确限制为单租户/受信 Worker 试验，不对外宣称强隔离。
 
 ## 批次 3：凭证源与凭证代理
 
