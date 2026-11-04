@@ -64,6 +64,11 @@ services:
       AGENTTEAMS_WORKER_PROVISIONER_ENABLED: "false"
       AGENTTEAMS_SANDBOX_ENABLED: "false"
       AGENTTEAMS_STORAGE_ENABLED: ${AGENTTEAMS_STORAGE_ENABLED:-false}
+      AGENTTEAMS_STORAGE_ENDPOINT: http://minio:9000
+      AGENTTEAMS_STORAGE_BUCKET: agentteams
+      AGENTTEAMS_STORAGE_ACCESS_KEY: ${MINIO_ROOT_USER:-}
+      AGENTTEAMS_STORAGE_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-}
+      # The currently pinned 0.1.4 Control Plane binds credentials through these legacy names.
       MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-}
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-}
     depends_on:
