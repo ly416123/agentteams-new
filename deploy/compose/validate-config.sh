@@ -32,11 +32,11 @@ case "$storage_enabled" in
   *) echo "AGENTTEAMS_STORAGE_ENABLED must be true or false" >&2; exit 2 ;;
 esac
 if [ "$storage_enabled" = "true" ]; then
-  minio_user=$(value MINIO_ROOT_USER)
-  minio_password=$(value MINIO_ROOT_PASSWORD)
-  if [ "${#minio_user}" -lt 3 ] || [ "${#minio_password}" -lt 24 ] \
-      || [ "$minio_password" = "replace-with-a-32-character-minio-password" ]; then
-    echo "Set MINIO_ROOT_USER (3+ chars) and MINIO_ROOT_PASSWORD (24+ chars) before enabling storage" >&2
+  object_store_access_key=$(value OBJECT_STORE_ACCESS_KEY)
+  object_store_secret_key=$(value OBJECT_STORE_SECRET_KEY)
+  if [ "${#object_store_access_key}" -lt 3 ] || [ "${#object_store_secret_key}" -lt 24 ] \
+      || [ "$object_store_secret_key" = "replace-with-a-32-character-object-store-secret" ]; then
+    echo "Set OBJECT_STORE_ACCESS_KEY (3+ chars) and OBJECT_STORE_SECRET_KEY (24+ chars) before enabling storage" >&2
     exit 2
   fi
 fi

@@ -18,9 +18,14 @@ if [ "$replicas" -lt 0 ] || [ "$replicas" -gt 8 ]; then
   exit 2
 fi
 if [ "$storage_enabled" = "true" ]; then
-  echo "Starting MinIO and creating the agentteams bucket"
-  compose --profile storage up -d minio
-  compose --profile storage run --rm minio-bucket-bootstrap
+  echo "Starting SeaweedFS S3 and waiting for the endpoint"
+  compose --profile storage up -d seaweedfs
+  attempt=0
+  until compose --profile storage exec -T seaweedfs sh -ec 'code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 2 http://127.0.0.1:8333/); [ "$code" -ge 200 ] && [ "$code" -lt 500 ]' >/dev/null 2>&1; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge 60 ]; then echo "SeaweedFS did not become ready within 120 seconds" >&2; exit 1; fi
+    sleep 2
+  done
 fi
 if [ "$replicas" -eq 0 ]; then
   echo "WORKER_REPLICAS=0; starting infrastructure without Workers"

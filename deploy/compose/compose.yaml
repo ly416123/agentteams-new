@@ -40,10 +40,10 @@ services:
     command:
       - |
         until nats --server nats://nats:4222 stream ls >/dev/null 2>&1; do sleep 2; done
-        nats --server nats://nats:4222 stream info TASK_EVENTS >/dev/null 2>&1 || nats --server nats://nats:4222 stream add TASK_EVENTS --subjects 'task.events.*' --storage file --retention limits
-        nats --server nats://nats:4222 stream info AGENT_EVENTS >/dev/null 2>&1 || nats --server nats://nats:4222 stream add AGENT_EVENTS --subjects 'agent.events.*' --storage file --retention limits
-        nats --server nats://nats:4222 stream info CONTROL_EVENTS >/dev/null 2>&1 || nats --server nats://nats:4222 stream add CONTROL_EVENTS --subjects 'control.events' --storage file --retention limits
-        nats --server nats://nats:4222 stream info DEADLETTER_EVENTS >/dev/null 2>&1 || nats --server nats://nats:4222 stream add DEADLETTER_EVENTS --subjects 'deadletter.events' --storage file --retention limits
+        nats --server nats://nats:4222 stream info TASK_EVENTS >/dev/null 2>&1 || nats --server nats://nats:4222 stream add TASK_EVENTS --subjects 'task.events.*' --storage file --retention limits --defaults
+        nats --server nats://nats:4222 stream info AGENT_EVENTS >/dev/null 2>&1 || nats --server nats://nats:4222 stream add AGENT_EVENTS --subjects 'agent.events.*' --storage file --retention limits --defaults
+        nats --server nats://nats:4222 stream info CONTROL_EVENTS >/dev/null 2>&1 || nats --server nats://nats:4222 stream add CONTROL_EVENTS --subjects 'control.events' --storage file --retention limits --defaults
+        nats --server nats://nats:4222 stream info DEADLETTER_EVENTS >/dev/null 2>&1 || nats --server nats://nats:4222 stream add DEADLETTER_EVENTS --subjects 'deadletter.events' --storage file --retention limits --defaults
         nats --server nats://nats:4222 stream info TASK_EVENTS >/dev/null
         nats --server nats://nats:4222 stream info AGENT_EVENTS >/dev/null
         nats --server nats://nats:4222 stream info CONTROL_EVENTS >/dev/null
@@ -53,6 +53,7 @@ services:
 
   control-plane:
     image: ${CONTROL_PLANE_IMAGE:?set CONTROL_PLANE_IMAGE to a published image digest}
+    platform: linux/amd64
     environment:
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/agentteams
       SPRING_DATASOURCE_USERNAME: agentteams
@@ -64,13 +65,13 @@ services:
       AGENTTEAMS_WORKER_PROVISIONER_ENABLED: "false"
       AGENTTEAMS_SANDBOX_ENABLED: "false"
       AGENTTEAMS_STORAGE_ENABLED: ${AGENTTEAMS_STORAGE_ENABLED:-false}
-      AGENTTEAMS_STORAGE_ENDPOINT: http://minio:9000
+      AGENTTEAMS_STORAGE_ENDPOINT: http://seaweedfs:8333
       AGENTTEAMS_STORAGE_BUCKET: agentteams
-      AGENTTEAMS_STORAGE_ACCESS_KEY: ${MINIO_ROOT_USER:-}
-      AGENTTEAMS_STORAGE_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-}
-      # The currently pinned 0.1.4 Control Plane binds credentials through these legacy names.
-      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-}
-      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-}
+      AGENTTEAMS_STORAGE_ACCESS_KEY: ${OBJECT_STORE_ACCESS_KEY:-}
+      AGENTTEAMS_STORAGE_SECRET_KEY: ${OBJECT_STORE_SECRET_KEY:-}
+      # The currently pinned 0.1.4 Control Plane binds storage credentials through these names.
+      MINIO_ACCESS_KEY: ${OBJECT_STORE_ACCESS_KEY:-}
+      MINIO_SECRET_KEY: ${OBJECT_STORE_SECRET_KEY:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -83,6 +84,7 @@ services:
 
   gateway:
     image: ${GATEWAY_IMAGE:?set GATEWAY_IMAGE to a published image digest}
+    platform: linux/amd64
     environment:
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/agentteams
       SPRING_DATASOURCE_USERNAME: agentteams
@@ -103,6 +105,7 @@ services:
 
   worker-1:
     image: ${WORKER_IMAGE:?set WORKER_IMAGE to a published image digest}
+    platform: linux/amd64
     profiles: [worker-pool]
     environment: &worker-env
       AGENTTEAMS_AGENT_ID: ${WORKER_1_AGENT_ID:?set a registered Worker UUID}
@@ -122,6 +125,7 @@ services:
 
   worker-2:
     image: ${WORKER_IMAGE:?set WORKER_IMAGE to a published image digest}
+    platform: linux/amd64
     profiles: [worker-pool]
     environment:
       <<: *worker-env
@@ -135,6 +139,7 @@ services:
 
   worker-3:
     image: ${WORKER_IMAGE:?set WORKER_IMAGE to a published image digest}
+    platform: linux/amd64
     profiles: [worker-pool]
     environment:
       <<: *worker-env
@@ -148,6 +153,7 @@ services:
 
   worker-4:
     image: ${WORKER_IMAGE:?set WORKER_IMAGE to a published image digest}
+    platform: linux/amd64
     profiles: [worker-pool]
     environment:
       <<: *worker-env
@@ -161,6 +167,7 @@ services:
 
   worker-5:
     image: ${WORKER_IMAGE:?set WORKER_IMAGE to a published image digest}
+    platform: linux/amd64
     profiles: [worker-pool]
     environment:
       <<: *worker-env
@@ -174,6 +181,7 @@ services:
 
   worker-6:
     image: ${WORKER_IMAGE:?set WORKER_IMAGE to a published image digest}
+    platform: linux/amd64
     profiles: [worker-pool]
     environment:
       <<: *worker-env
@@ -187,6 +195,7 @@ services:
 
   worker-7:
     image: ${WORKER_IMAGE:?set WORKER_IMAGE to a published image digest}
+    platform: linux/amd64
     profiles: [worker-pool]
     environment:
       <<: *worker-env
@@ -200,6 +209,7 @@ services:
 
   worker-8:
     image: ${WORKER_IMAGE:?set WORKER_IMAGE to a published image digest}
+    platform: linux/amd64
     profiles: [worker-pool]
     environment:
       <<: *worker-env
@@ -211,40 +221,24 @@ services:
     networks: [worker-egress]
     restart: unless-stopped
 
-  minio:
-    image: minio/minio:RELEASE.2024-11-07T00-52-20Z
+  seaweedfs:
+    image: chrislusf/seaweedfs@sha256:57877e32bb90073b37dc109b438ba66e84fd5ed9ced5f5c04f56444ef243ce59
     profiles: [storage]
-    command: ["server", "/data", "--console-address", ":9001"]
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER when storage profile is enabled}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD when storage profile is enabled}
+      AWS_ACCESS_KEY_ID: ${OBJECT_STORE_ACCESS_KEY:?set OBJECT_STORE_ACCESS_KEY when storage profile is enabled}
+      AWS_SECRET_ACCESS_KEY: ${OBJECT_STORE_SECRET_KEY:?set OBJECT_STORE_SECRET_KEY when storage profile is enabled}
+      S3_BUCKET: agentteams
     volumes:
-      - minio-data:/data
-    expose: ["9000"]
+      - seaweedfs-data:/data
+    expose: ["8333"]
     networks: [data]
+    healthcheck:
+      test: ["CMD-SHELL", "code=$$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:8333/); [ \"$$code\" -ge 200 ] && [ \"$$code\" -lt 500 ]"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 15s
     restart: unless-stopped
-
-  minio-bucket-bootstrap:
-    image: minio/mc:RELEASE.2025-07-21T05-28-08Z
-    profiles: [storage]
-    depends_on:
-      minio:
-        condition: service_started
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER when storage profile is enabled}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD when storage profile is enabled}
-    entrypoint: ["sh", "-ec"]
-    command:
-      - |
-        attempt=0
-        until mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" >/dev/null 2>&1; do
-          attempt=$$((attempt + 1))
-          if [ "$$attempt" -ge 60 ]; then echo 'MinIO did not become reachable within 120 seconds' >&2; exit 1; fi
-          sleep 2
-        done
-        mc mb --ignore-existing local/agentteams
-    networks: [data]
-    restart: "no"
 
 secrets:
   model_token:
@@ -253,7 +247,7 @@ secrets:
 volumes:
   postgres-data:
   nats-data:
-  minio-data:
+  seaweedfs-data:
 
 networks:
   data:
