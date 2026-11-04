@@ -50,7 +50,8 @@
 - [x] 运行 22 项 Enrollment 测试、Maven verify、Compose config 与 shell 静态校验；CI 已覆盖同样的 Java 21/Compose 检查。
 - [x] 使用 Testcontainers/PostgreSQL 验证 scope 查询、Token Hash 落库、撤销幂等和专用 DB role 仅能访问授权表；CI 明确要求 10 项 PostgreSQL 集成断言全部执行。
 - [x] 使用进程内临时 RSA/JWKS 发行者通过真实 HTTP JWT 解码器与 PostgreSQL 验证签名、issuer、audience、Token Hash、撤销和 tenant/project/team scope 拒绝。
-- [ ] 在部署环境使用真实 OIDC Provider 验证其 claims 映射，并连接 v0.1.4 Gateway/Worker 完成真实握手和撤销后新连接拒绝；测试发行者不替代真实 IdP，当前没有有效 Worker 模型凭据。
+- [x] 在 CI 中启动固定 digest 的 v0.1.4 Gateway 和 PostgreSQL，以最小 protobuf/gRPC 客户端验证有效握手、Gateway/Agent 状态投影，以及未知、过期、撤销和 Agent 绑定不匹配的拒绝；共 5 项，CI 强制确认未跳过。
+- [ ] 在部署环境使用真实 OIDC Provider 验证 claims 映射，并使用真实 Worker runtime 完成任务 attempt、续租/重连及撤销后的新连接拒绝；测试发行者不替代真实 IdP，当前没有有效 Worker 模型凭据。
 - [x] 检查没有测试密钥或 Token 文件入库；更新审计、PR 描述并提交。
 
 ## 不变量
@@ -58,5 +59,6 @@
 - 不更改 `agentteams-java`，不复制旧 Task/Attempt/Gateway 状态机。
 - 不向数据库、日志、Trace、Shell 历史、共享 `.env` 写入或输出明文 Worker Token。
 - Worker Token 仅认证 Worker 对 Gateway 的连接，不是模型/MCP 上游凭证；后者仍由批次 3 凭证代理解决。
+- 固定 digest Gateway 测试使用合成数据库 session 与协议客户端；它验证 Gateway 鉴权和状态写入，但不代表完整 Worker AgentScope runtime 或任务闭环验收。
 - OIDC/JWKS 配置错误必须 fail-closed。生产 Compose 不允许关闭 API 身份认证或将 Control Plane/enrollment 端口绑定到非回环地址，除非前置可信 TLS 入口已明确配置。
 - v0.1.4 Worker 只在连接时校验 Session；Token 到期不会主动断开已建立连接。轮换流程必须创建新 Session 并触发 Worker 重连，不能把到期等同于即时撤销。
