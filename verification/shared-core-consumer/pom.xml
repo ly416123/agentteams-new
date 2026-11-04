@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>io.agentteams</groupId>
+        <artifactId>agentteams-new</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+        <relativePath>../../pom.xml</relativePath>
+    </parent>
+
+    <artifactId>shared-core-consumer-verification</artifactId>
+    <name>Shared Core Consumer Verification</name>
+
+    <dependencies>
+        <dependency>
+            <groupId>io.agentteams</groupId>
+            <artifactId>agentteams-contracts</artifactId>
+            <version>${agentteams.core.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.agentteams</groupId>
+            <artifactId>agentteams-domain</artifactId>
+            <version>${agentteams.core.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.agentteams</groupId>
+            <artifactId>agentteams-application-contracts</artifactId>
+            <version>${agentteams.core.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.agentteams</groupId>
+            <artifactId>agentteams-observability</artifactId>
+            <version>${agentteams.core.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.agentteams</groupId>
+            <artifactId>agentteams-storage</artifactId>
+            <version>${agentteams.core.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.agentteams</groupId>
+            <artifactId>agentteams-runtime</artifactId>
+            <version>${agentteams.core.version}</version>
+        </dependency>
+    </dependencies>
+</project>

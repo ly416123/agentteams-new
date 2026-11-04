@@ -1,0 +1,76 @@
+# AgentTeams New
+
+面向固定容量、多租户 Agent 协作的无 Kubernetes 部署架构。项目以 Java 21 为服务端主线，复用现有 AgentTeams 的任务、租约、Outbox、Gateway 和 Worker 能力，并提供 Docker Compose / systemd 部署路径。
+
+> 当前阶段：架构基线与复用边界梳理。尚未承诺可直接启动的 Compose 镜像或生产级凭证代理。
+
+## 目标
+
+- 不依赖 Kubernetes API、CRD 或 Operator 即可运行任务控制面和固定 Worker 池。
+- Worker 数量通过容量评估后预先配置；运行时只调度已注册且空闲的 Worker，不按任务创建或扩缩 Worker。
+- 支持多租户数据、会话、文件、工具和凭据授权隔离；共享池和专属池可按租户信任等级选择。
+- 保持 PostgreSQL 为任务与租约事实源，保留 Outbox、NATS JetStream、Gateway 持久命令及 ACK 重放语义。
+- Kubernetes 保留为可选的 Sandbox / 企业部署 Provider，不成为基础运行前提。
+
+## 技术路线
+
+- **主线：** Java 21、Spring Boot、现有 AgentScope Worker、protobuf/gRPC。
+- **持久化与消息：** PostgreSQL、NATS JetStream；对象存储通过 Artifact 接口接入。
+- **本机部署：** Docker Compose；单机服务管理可使用 systemd。首期不要求额外 Supervisor 或容器管理 API。
+- **跨语言：** Python 仅用于需要其专属 SDK 的 Agent、评测或离线任务；通过版本化 API/gRPC 接入。无实测依据不引入 Go/Rust 服务。
+
+## 仓库边界
+
+当前 `agentteams-java` 是完整源码仓库，其模块继承同一个 Maven 根 POM，内部依赖为 `0.1.0-SNAPSHOT`，还没有可供独立仓库稳定引用的已发布模块制品。因此本仓库不会通过本机相对路径引用兄弟目录，也不复制一份控制面和 Worker 后独立演进。
+
+第一阶段先在 `agentteams-java` 确定并发布共享模块的版本化 Maven 制品（优先评估 contracts、domain、application-contracts、runtime、observability、storage），再让此项目按版本消费。若验证发现模块边界不适合独立发布，则以受控迁移和兼容 API/事件契约替代；决策及影响记录在 [共享核心复用 ADR](docs/decisions/0001-shared-core-reuse.md)。
+
+## 架构与计划
+
+- [架构基线](docs/architecture.md)
+- [共享核心复用决策](docs/decisions/0001-shared-core-reuse.md)
+- [执行计划](docs/plans/2026-11-04-agentteams-new-bootstrap.md)
+- [独立 Maven 消费验证](verification/shared-core-consumer/README.md)
+- [原仓库 Kubernetes 依赖审计](../agentteams-java/docs/superpowers/specs/2026-11-04-runtime-k8s-dependency-audit.md)
+
+## 项目结构
+
+```text
+agentteams-new/
+├── docs/
+│   ├── decisions/       # 架构决策记录
+│   ├── plans/           # 分阶段执行计划
+│   └── architecture.md  # 组件边界、运行与隔离模型
+├── deploy/
+│   └── compose/         # 固定容量部署配置（完成制品策略后落地）
+├── verification/
+│   └── shared-core-consumer/ # 独立 Maven 依赖解析 fixture
+├── pom.xml              # 新项目 Maven 配置与核心制品仓库
+└── README.md
+```
+
+## 部署档位
+
+| 档位 | 目标 | 运行组件 | 边界 |
+|---|---|---|---|
+| `local-dev` | 开发与单机验证 | PostgreSQL、NATS、控制面、Gateway、固定 Worker | 无 Kubernetes；本地凭据为受信任开发模式 |
+| `self-hosted-small` | 小规模自托管 | 同一 Java 服务组合、持久卷、固定 Worker 清单 | 配置容量与备份；不自动扩缩、不承诺主机级强隔离 |
+| `enterprise-k8s` | 既有企业集群 | 复用现有 Helm/Operator 与 Sandbox Provider | 属于可选兼容档，不是 `agentteams-new` 的基础依赖 |
+
+## 多租户安全基线
+
+任何资源读取与变更都必须先验证组织、租户、项目和主体权限，再以授权后的 scope 查询数据。Task、Assignment、Attempt、Lease、Conversation、Memory、Artifact、workspace 和凭据授权都必须能追溯到同一租户执行上下文。共享 Worker 首期保持单 Worker 单活动 Attempt（`maxConcurrency=1`），任务结束或取消后清理运行时会话、工具客户端、临时文件及凭据缓存。高敏租户绑定专属固定池；不支持的隔离等级必须拒绝任务，不允许静默降级。
+
+Worker 目前仍可能接触模型/MCP 上游密钥。只有完成请求级凭证代理、短时受限消费令牌和负向安全验收后，才能声明 Worker 不持有真实凭证。
+
+## 当前不承诺
+
+- 任务到达时创建 Worker 或自动扩缩容。
+- 用 Matrix 替代任务状态、租约或持久消息系统。
+- 仅凭普通本机容器提供等同 gVisor、Kata 或 MicroVM 的强隔离。
+- 在凭证代理完成前宣称上游密钥不会到达 Worker。
+- 当前仓库已经包含可启动 Compose、可发布镜像或生产就绪实现。
+
+## Maven 制品
+
+共享 Java 模块使用 `agentteams-java` 的稳定 Git tag 作为统一版本发布到 GitHub Packages；新项目只消费固定的 release 版本，不读取 SNAPSHOT。首次发布完成前，默认 `agentteams.core.version` 仅是目标版本声明，独立消费者验证不会从远端解析成功。

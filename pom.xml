@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>io.agentteams</groupId>
+    <artifactId>agentteams-new</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+    <packaging>pom</packaging>
+
+    <name>AgentTeams New</name>
+    <description>Fixed-capacity, Kubernetes-independent AgentTeams deployment and architecture</description>
+
+    <properties>
+        <maven.compiler.release>21</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <agentteams.core.version>0.1.0</agentteams.core.version>
+        <agentteams.maven.repository>https://maven.pkg.github.com/ly416123/agentteams-java</agentteams.maven.repository>
+    </properties>
+
+    <repositories>
+        <repository>
+            <id>github</id>
+            <name>AgentTeams Java Maven Packages</name>
+            <url>${agentteams.maven.repository}</url>
+            <releases>
+                <enabled>true</enabled>
+            </releases>
+            <snapshots>
+                <enabled>false</enabled>
+            </snapshots>
+        </repository>
+    </repositories>
+</project>
