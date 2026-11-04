@@ -275,6 +275,7 @@ class GatewaySessionHandshakeTest {
                 + "last_ack_sequence BIGINT NOT NULL DEFAULT 0, updated_at TIMESTAMPTZ NOT NULL)");
         jdbc.execute("CREATE TABLE gateway_commands (agent_id TEXT NOT NULL, sequence BIGINT NOT NULL, "
                 + "event_id TEXT NOT NULL, attempt_id TEXT, command_bytes BYTEA NOT NULL, created_at TIMESTAMPTZ NOT NULL, "
+                + "cancelled_at TIMESTAMPTZ, "
                 + "PRIMARY KEY (agent_id, sequence), UNIQUE (agent_id, event_id))");
     }
 
