@@ -2,7 +2,7 @@
 
 面向固定容量、多租户 Agent 协作的无 Kubernetes 部署架构。项目以 Java 21 为服务端主线，复用现有 AgentTeams 的任务、租约、Outbox、Gateway 和 Worker 能力，并提供 Docker Compose / systemd 部署路径。
 
-> 当前阶段：固定容量 Compose POC 已接入独立 Worker Enrollment 服务、OIDC scope 检查和每槽位会话凭据投放。尚未完成真实 OIDC Provider 下的 Worker 任务、多租户负向隔离与生产验收。
+> 当前阶段：固定容量 Compose POC 已接入独立 Worker Enrollment 服务、OIDC scope 检查和每槽位会话凭据投放；Enrollment 使用临时本地 JWKS 的签名/issuer/audience HTTP 安全测试通过。真实 OIDC Provider 下的 Worker 任务、多租户负向隔离与生产验收仍未完成。
 
 ## 目标
 

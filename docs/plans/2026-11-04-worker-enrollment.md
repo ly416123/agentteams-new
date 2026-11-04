@@ -47,9 +47,9 @@
 
 ## Task 4：验证与交付
 
-- [x] 运行 enrollment 定向测试、Maven package、Compose config 与 shell 静态校验。
-- [ ] 在隔离 Compose profile 中使用 OIDC 测试发行者或本地测试密钥，验证跨 tenant/project/team 拒绝、错误 audience 拒绝、Token Hash 入库、撤销后新连接拒绝。当前没有配置 OIDC issuer，未执行真实 HTTP/Gateway 集成验收。
-- [ ] 检查无测试密钥或 Token 文件入库；更新审计、PR 描述并提交。
+- [x] 运行 enrollment 测试、Maven verify、Compose config 与 shell 静态校验；CI 已覆盖同样的 Java 21/Compose 检查。
+- [ ] 在隔离 Compose profile 中验证数据库 Token Hash、跨 tenant/project/team 拒绝、撤销后新 Gateway 连接拒绝。当前已用进程内临时 RSA/JWKS 发行者通过真实 HTTP JWT 解码器验证签名、issuer、audience 与 401/200 边界；真实 IdP、数据库和 Gateway 集成仍未运行。
+- [x] 检查没有测试密钥或 Token 文件入库；更新审计、PR 描述并提交。
 
 ## 不变量
 
