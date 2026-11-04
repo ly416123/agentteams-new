@@ -271,6 +271,11 @@ class GatewaySessionHandshakeTest {
                 + "capabilities JSONB NOT NULL DEFAULT '{}'::jsonb, spec_digest TEXT, config_revision TEXT, "
                 + "secret_generation TEXT, connected_at TIMESTAMPTZ, last_seen_at TIMESTAMPTZ NOT NULL, "
                 + "disconnected_at TIMESTAMPTZ, updated_at TIMESTAMPTZ NOT NULL)");
+        jdbc.execute("CREATE TABLE gateway_ack_cursors (agent_id TEXT PRIMARY KEY, "
+                + "last_ack_sequence BIGINT NOT NULL DEFAULT 0, updated_at TIMESTAMPTZ NOT NULL)");
+        jdbc.execute("CREATE TABLE gateway_commands (agent_id TEXT NOT NULL, sequence BIGINT NOT NULL, "
+                + "event_id TEXT NOT NULL, attempt_id TEXT, command_bytes BYTEA NOT NULL, created_at TIMESTAMPTZ NOT NULL, "
+                + "PRIMARY KEY (agent_id, sequence), UNIQUE (agent_id, event_id))");
     }
 
     @FunctionalInterface
