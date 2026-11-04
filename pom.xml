@@ -15,7 +15,7 @@
     <properties>
         <maven.compiler.release>21</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <agentteams.core.version>0.1.0</agentteams.core.version>
+        <agentteams.core.version>0.1.1</agentteams.core.version>
         <agentteams.maven.repository>https://maven.pkg.github.com/ly416123/agentteams-java</agentteams.maven.repository>
     </properties>
 

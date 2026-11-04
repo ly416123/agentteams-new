@@ -4,7 +4,7 @@
 
 ## 发布前提
 
-GitHub Packages 的 Maven Registry 需要认证。`agentteams-new` 仓库必须获得 `agentteams-java` 对应 Maven package 的读取权限；本地消费使用具备 `read:packages` scope 的 classic PAT。CI 可使用有 package 读取权限的 `GITHUB_TOKEN`。`~/.m2/settings.xml` 使用与 POM 中 `github` ID 对应的 server，并通过 `GITHUB_ACTOR`、`GITHUB_TOKEN` 环境变量注入凭据，不要把 Token 写进文件或命令历史。
+GitHub Packages 的 Maven Registry 需要认证，即使包关联的仓库公开也需凭证。Apache Maven 包使用仓库级权限，包设置页不提供独立包授权。已验证的本机消费方式是使用对来源仓库有读取权限、带 `read:packages` scope 的 classic PAT。跨仓库 GitHub Actions 的 `GITHUB_TOKEN` 读取路径尚未验证；CI 可先使用仓库 Secret 中的 classic PAT。`~/.m2/settings.xml` 使用与 POM 中 `github` ID 对应的 server，并通过 `GITHUB_ACTOR`、`GITHUB_TOKEN` 环境变量注入凭据，不要把 Token 写进文件或命令历史。
 
 ```xml
 <settings xmlns="http://maven.apache.org/SETTINGS/1.0.0">
@@ -29,7 +29,7 @@ mvn -f verification/shared-core-consumer/pom.xml \
   dependency:tree -Dverbose
 ```
 
-成功标准是 Maven 从 GitHub Packages 解析 `agentteams-java:0.1.0` parent 和 6 个核心 JAR，并从 Maven Central 解析它们的第三方传递依赖。使用临时 local cache 可避免旧的本机 SNAPSHOT 或手工安装包掩盖远端缺失。若发布版本号改变，通过 `-Dagentteams.core.version=<release-version>` 指定同一版本。
+成功标准是 Maven 从 GitHub Packages 解析 `agentteams-java:0.1.1` parent 和 6 个核心 JAR，并从 Maven Central 解析它们的第三方传递依赖。使用临时 local cache 可避免旧的本机 SNAPSHOT 或手工安装包掩盖远端缺失。若发布版本号改变，通过 `-Dagentteams.core.version=<release-version>` 指定同一版本。
 
 ## 验证未上传的候选发布
 
@@ -42,4 +42,4 @@ AGENTTEAMS_CORE_VERSION=0.1.1 \
   verification/shared-core-consumer/verify-local-release.sh
 ```
 
-截至当前批次，`0.1.1` 仅是本地验证候选版本，不能据此推断 GitHub Packages 已发布。实际发布后，再使用上节命令和独立 Maven 缓存访问 GitHub Packages；本地 file repository 验证不能替代远端权限和下载验收。
+2026-11-04 已使用本机 `gh` 凭证（`read:packages`）和本机代理 `127.0.0.1:7892`，在临时 Maven settings 与独立 local cache 下执行远端 `dependency:tree`。Maven 从 GitHub Packages 成功解析根 parent、6 个核心模块 `0.1.1` 及第三方传递依赖，输出 `BUILD SUCCESS`。凭证通过环境变量注入，未写入仓库或持久 settings。该验证证明本机凭证路径可用；新仓库 GitHub Actions 的 `GITHUB_TOKEN` 跨仓库访问仍待单独验证。

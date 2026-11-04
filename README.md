@@ -21,9 +21,9 @@
 
 ## 仓库边界
 
-当前 `agentteams-java` 是完整源码仓库，其模块继承同一个 Maven 根 POM，内部依赖为 `0.1.0-SNAPSHOT`，还没有可供独立仓库稳定引用的已发布模块制品。因此本仓库不会通过本机相对路径引用兄弟目录，也不复制一份控制面和 Worker 后独立演进。
+当前 `agentteams-java` 是完整源码仓库。为避免本仓库通过本机相对路径引用兄弟目录，或复制一份控制面和 Worker 后独立演进，批次 0 已将 6 个共享模块与根 parent 以 `0.1.1` 发布到 GitHub Packages，并通过本仓库独立 Maven consumer 完成远端解析验证。
 
-第一阶段先在 `agentteams-java` 确定并发布共享模块的版本化 Maven 制品（优先评估 contracts、domain、application-contracts、runtime、observability、storage），再让此项目按版本消费。若验证发现模块边界不适合独立发布，则以受控迁移和兼容 API/事件契约替代；决策及影响记录在 [共享核心复用 ADR](docs/decisions/0001-shared-core-reuse.md)。
+批次 0 已在 `agentteams-java` 发布并验证 contracts、domain、application-contracts、runtime、observability、storage 六个共享模块的版本化 Maven 制品。后续如发现模块边界不适合独立发布，则以受控迁移和兼容 API/事件契约替代；决策及影响记录在 [共享核心复用 ADR](docs/decisions/0001-shared-core-reuse.md)。
 
 ## 架构与计划
 
@@ -73,4 +73,4 @@ Worker 目前仍可能接触模型/MCP 上游密钥。只有完成请求级凭�
 
 ## Maven 制品
 
-共享 Java 模块使用 `agentteams-java` 的稳定 Git tag 作为统一版本发布到 GitHub Packages；新项目只消费固定的 release 版本，不读取 SNAPSHOT。当前仅通过本地 file repository 验证发布边界和独立消费者解析；GitHub Packages 尚无已验证的共享核心发布版本，真实跨仓库下载仍是批次 0 的未完成门槛。可用 `verification/shared-core-consumer/verify-local-release.sh` 重放本地端到端验证。
+共享 Java 模块使用 `agentteams-java` 的稳定 Git tag 作为统一版本发布到 GitHub Packages；新项目固定消费 `0.1.1`，不读取 SNAPSHOT。已通过本机代理和 classic PAT（`read:packages`）使用独立 Maven 缓存完成远端解析；本地发布边界也可用 `verification/shared-core-consumer/verify-local-release.sh` 重放。GitHub Packages Maven Registry 要求认证，即使包关联的仓库公开也需凭证。

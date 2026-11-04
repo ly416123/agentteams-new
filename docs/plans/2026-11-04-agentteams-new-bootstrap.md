@@ -23,18 +23,18 @@
 
 - [x] 从 `agentteams-java` 根 POM 与模块 POM 提取模块依赖图。6 个共享模块依赖闭包包含根 parent；Control Plane/Gateway/Worker 作为 OCI 应用交付。
 - [x] 检查候选 `contracts`、`domain`、`application-contracts`、`runtime`、`observability`、`storage` 的 Maven parent、版本属性和内部依赖。
-- [x] 选定 GitHub Packages、稳定 tag 版本、`GITHUB_TOKEN` 发布权限，以及 `agentteams-new` 的 package 读取权限要求。
+- [x] 选定 GitHub Packages、稳定 tag 版本、`GITHUB_TOKEN` 发布权限，以及独立消费者使用 classic PAT `read:packages` 的本机读取方式。
 - [x] 在旧仓库根 POM 增加 `distributionManagement`，在 release workflow 中归一化 tag 版本并发布 parent + 6 个共享核心模块；预检 13 个 POM/JAR 文件以支持成功重跑并阻止部分覆盖。
 - [x] 在新仓库添加 Maven parent POM 和独立 consumer fixture。
-- [x] 创建 GitHub 仓库 `ly416123/agentteams-new` 并推送启动基线 `34010d1`；旧仓库 Maven 包尚未发布，因此跨仓库读取仍待验证。
+- [x] 创建 GitHub 仓库 `ly416123/agentteams-new` 并推送启动基线 `34010d1`。
 - [x] 在新仓库实现 `verification/shared-core-consumer/verify-local-release.sh`，从旧仓库已提交 ref 生成干净源码快照，在临时 file repository 发布并校验 13 个 POM/JAR，再用空 Maven settings 和独立 local cache 端到端解析 parent、6 个模块及第三方传递依赖。
-- [x] 增加 Maven 发布状态分类测试：未发布时允许发布，完整已发布时跳过，部分发布时失败并要求保留现有制品、修复后使用新 patch tag；预检先校验 GitHub 仓库身份访问，再仅跟随 HTTPS 重定向且不向跨主机转发凭证，并禁用 `.netrc`。GitHub 包必须授予旧仓库写权限。
-- [ ] 在稳定 tag 发布首个 GitHub Maven Package，并验证 `agentteams-new` 仓库授权后的真实远端读取。`v0.1.0` 发布 workflow 在测试门禁失败，未发布 Maven 制品；不能复用该 tag。
-- [ ] 将实际发布版本写入 `agentteams.core.version`，并记录 source tag、package URLs 和验证输出。
+- [x] 增加 Maven 发布状态分类测试：未发布时允许发布，完整已发布时跳过，部分发布时失败并要求保留现有制品、修复后使用新 patch tag；预检先校验 GitHub 仓库身份访问，再仅跟随 HTTPS 重定向且不向跨主机转发凭证，并禁用 `.netrc`。发布权限由来源仓库 workflow 的 `packages: write` 提供。
+- [x] 在稳定 tag 发布首个 GitHub Maven Package，并使用远端消费者验证真实下载。`v0.1.0` 发布 workflow 在测试门禁失败，未发布 Maven 制品；该 tag 未复用。
+- [x] 将实际发布版本 `0.1.1` 写入 `agentteams.core.version`，记录 source tag、包列表和远端验证结果。
 
 **门槛：** 不依赖本机兄弟目录或手工 SNAPSHOT 安装；模块版本、源 commit 与依赖树可追溯。
 
-**当前进度：** 本地 file repository 独立消费验证已通过。2026-11-04 使用旧仓库 commit `0b0ac9e78a3e4be719fba6e5a66042e6ed16b507`、候选版本 `0.1.1` 执行验证器，Maven reactor 构建/部署成功，消费者从临时 file repository 解析全部 6 个模块及传递依赖，输出 `SHARED_CORE_LOCAL_CONSUMER_OK`。这不代表远端发布成功。旧仓库 `v0.1.0` CI 曾在测试门禁失败；最新 CI `41816738317` 仍失败于 Kind 的 Tuwunel AppService 403 与 Worker 调度未产生 Attempt。GitHub 远端发布和跨仓库权限验证尚未完成；Compose POC 需等待该门槛完成。
+**当前进度：** 批次 0 共享核心制品边界已完成本地与远端验证。`agentteams-java` tag `v0.1.1`（commit `0b0ac9e78a3e4be719fba6e5a66042e6ed16b507`）的 release workflow `41821553040` 已成功发布根 parent 与 6 个共享模块；该工作流随后在 OCI 镜像签名/attestation 阶段失败，与 Maven 发布步骤无关。2026-11-04 从 `agentteams-new` 使用本机代理 `127.0.0.1:7892`、classic PAT `read:packages`、临时 Maven settings 和独立本地缓存执行远端 `dependency:tree`，成功解析 6 个 `0.1.1` 模块与第三方依赖并输出 `BUILD SUCCESS`。Maven Packages 列表为 [agentteams-java Packages](https://github.com/ly416123/agentteams-java/packages)。该 registry 的 Maven 包继承仓库权限，无独立包授权入口。跨仓库 GitHub Actions `GITHUB_TOKEN` 路径尚未验证；旧仓库 Kind CI 问题留待后续部署/镜像批次处理。
 
 ## 批次 1：无 Kubernetes 固定容量 Compose POC
 
