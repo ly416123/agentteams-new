@@ -154,7 +154,8 @@ class GatewaySessionHandshakeTest {
         try {
             Status terminal = handshake.status().poll(10, TimeUnit.SECONDS);
             assertThat(terminal).isNotNull();
-            assertThat(terminal.getCode()).isEqualTo(Status.Code.UNAUTHENTICATED);
+            assertThat(terminal.getCode()).withFailMessage("Gateway rejected the handshake: %s", terminal)
+                    .isEqualTo(Status.Code.UNAUTHENTICATED);
         } finally {
             handshake.call().cancel("test complete", null);
             handshake.channel().shutdownNow();
@@ -192,7 +193,7 @@ class GatewaySessionHandshakeTest {
             string(out, 2, agentId.toString());
         });
         byte[] version = message(out -> {
-            out.writeUInt32(1, 1);
+            out.writeUInt32(1, 2);
             out.writeUInt32(2, 0);
         });
         byte[] hello = message(out -> {
