@@ -33,4 +33,13 @@ mvn -f verification/shared-core-consumer/pom.xml \
 
 ## 验证未上传的候选发布
 
-发布 workflow 使用同一套 POM 和 artifact coordinates。提交 tag 前，可先将源码完整 checkout 到临时目录，用 `versions-maven-plugin` 将全 reactor 改为待发布版本，并以 `altDeploymentRepository` 发布到临时 file repository；再将 `agentteams.maven.repository` 覆盖为该 file repository，以空 Maven local cache 运行上述 consumer 命令。该验证由批次 0 的执行记录给出实际命令与输出摘要。
+使用仓库内脚本可完整重放发布和消费流程。脚本会从 `agentteams-java` 的已提交 ref 导出干净快照，不读取未提交文件；在临时目录中归一化版本、使用隔离 Maven settings 和本地缓存发布到 file repository，校验 13 个 POM/JAR 文件，再运行本 consumer 的 `dependency:tree`：
+
+```bash
+AGENTTEAMS_JAVA_SOURCE=/path/to/agentteams-java \
+AGENTTEAMS_JAVA_REF=<commit-or-tag> \
+AGENTTEAMS_CORE_VERSION=0.1.1 \
+  verification/shared-core-consumer/verify-local-release.sh
+```
+
+截至当前批次，`0.1.1` 仅是本地验证候选版本，不能据此推断 GitHub Packages 已发布。实际发布后，再使用上节命令和独立 Maven 缓存访问 GitHub Packages；本地 file repository 验证不能替代远端权限和下载验收。

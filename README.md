@@ -73,4 +73,4 @@ Worker 目前仍可能接触模型/MCP 上游密钥。只有完成请求级凭�
 
 ## Maven 制品
 
-共享 Java 模块使用 `agentteams-java` 的稳定 Git tag 作为统一版本发布到 GitHub Packages；新项目只消费固定的 release 版本，不读取 SNAPSHOT。首次发布完成前，默认 `agentteams.core.version` 仅是目标版本声明，独立消费者验证不会从远端解析成功。
+共享 Java 模块使用 `agentteams-java` 的稳定 Git tag 作为统一版本发布到 GitHub Packages；新项目只消费固定的 release 版本，不读取 SNAPSHOT。当前仅通过本地 file repository 验证发布边界和独立消费者解析；GitHub Packages 尚无已验证的共享核心发布版本，真实跨仓库下载仍是批次 0 的未完成门槛。可用 `verification/shared-core-consumer/verify-local-release.sh` 重放本地端到端验证。

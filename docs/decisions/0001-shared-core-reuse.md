@@ -32,7 +32,8 @@
 
 - 发布清单：根 parent POM 加 6 个核心 JAR；模块图由 Gateway/Control Plane/Worker 的 OCI 镜像交付，不另发为共享库。
 - 发布版本来自稳定 tag；不能依赖本机 `~/.m2` 手工安装的 SNAPSHOT。
-- 本地独立消费者 fixture 已以临时 Maven file repository 和独立 Maven local cache 解析 6 个模块与 parent POM，版本 `0.1.1` 的验证退出码为 0。GitHub Packages 实际发布和跨仓库读取授权仍需在首个稳定 tag 发布时验证。
+- 本地独立消费者 fixture 已有可重放脚本 `verification/shared-core-consumer/verify-local-release.sh`：从旧仓库 commit `0b0ac9e78a3e4be719fba6e5a66042e6ed16b507` 导出干净源码，版本 `0.1.1` 发布到临时 file repository，校验 13 个 POM/JAR，并以空 Maven settings 和独立 local cache 解析 6 个模块与第三方传递依赖；验证退出码为 0。`0.1.1` 只是本地候选版本。GitHub Packages 实际发布和跨仓库读取授权仍未验证。
+- 远端发布门槛当前未通过：不可变 tag `v0.1.0` 对应 workflow 在测试门禁失败，未产生 Maven Package；后续不能移动或复用该 tag。旧仓库最新 CI `41816738317` 失败于 `kind-oidc` 的 Tuwunel AppService 回调 403，以及 `kind-recovery` 中 Worker 任务保持 QUEUED、未创建 Attempt。修复这些 required CI 门禁并以新 patch tag 发布后，再执行远端消费验证。
 - 发布重试先检查 13 个关键 POM/JAR 文件：全有则跳过，全无才发布，部分存在时中止并列出缺项；保留部分制品，修复后使用新 patch tag。
 - 镜像需要可追溯到源 commit、制品版本和配置版本。
 - 新旧路径共享同一 PostgreSQL 事实源期间，禁止双写同一业务状态；若要切换实例，先 drain Lease 并明确单一调度写入者。
