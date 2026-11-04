@@ -26,6 +26,7 @@
 - [x] 选定 GitHub Packages、稳定 tag 版本、`GITHUB_TOKEN` 发布权限，以及 `agentteams-new` 的 package 读取权限要求。
 - [x] 在旧仓库根 POM 增加 `distributionManagement`，在 release workflow 中归一化 tag 版本并发布 parent + 6 个共享核心模块；预检 13 个 POM/JAR 文件以支持成功重跑并阻止部分覆盖。
 - [x] 在新仓库添加 Maven parent POM 和独立 consumer fixture。
+- [x] 创建 GitHub 仓库 `ly416123/agentteams-new` 并推送启动基线 `34010d1`；旧仓库 Maven 包尚未发布，因此跨仓库读取仍待验证。
 - [x] 使用临时 file repository、Maven 版本 `0.1.1` 和独立 consumer local cache 端到端验证 parent、6 个模块及传递依赖解析。
 - [x] 增加 Maven 发布状态分类测试：未发布时允许发布，完整已发布时跳过，部分发布时失败并要求保留现有制品、修复后使用新 patch tag；预检先校验 GitHub 仓库身份访问，再仅跟随 HTTPS 重定向且不向跨主机转发凭证，并禁用 `.netrc`。GitHub 包必须授予旧仓库写权限。
 - [ ] 在稳定 tag 发布首个 GitHub Maven Package，并验证 `agentteams-new` 仓库授权后的真实远端读取。
