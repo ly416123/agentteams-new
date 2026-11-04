@@ -50,7 +50,7 @@
 - [x] 运行 22 项 Enrollment 测试、Maven verify、Compose config 与 shell 静态校验；CI 已覆盖同样的 Java 21/Compose 检查。
 - [x] 使用 Testcontainers/PostgreSQL 验证 scope 查询、Token Hash 落库、撤销幂等和专用 DB role 仅能访问授权表；CI 明确要求 10 项 PostgreSQL 集成断言全部执行。
 - [x] 使用进程内临时 RSA/JWKS 发行者通过真实 HTTP JWT 解码器与 PostgreSQL 验证签名、issuer、audience、Token Hash、撤销和 tenant/project/team scope 拒绝。
-- [x] 在 CI 中启动固定 digest 的 v0.1.4 Gateway 和 PostgreSQL，以最小 protobuf/gRPC 客户端验证有效握手、Gateway/Agent 状态投影，以及未知、过期、撤销和 Agent 绑定不匹配的拒绝；共 5 项，CI 强制确认未跳过。
+- [ ] 在 CI 中启动固定 digest 的 v0.1.4 Gateway 和 PostgreSQL，以最小 protobuf/gRPC 客户端验证有效握手、Gateway/Agent 状态投影，以及未知、过期、撤销和 Agent 绑定不匹配的拒绝；共 5 项，CI 强制确认未跳过。测试已加入，最新 GitHub Actions run 仍排队，待实际执行并通过后勾选。
 - [ ] 在部署环境使用真实 OIDC Provider 验证 claims 映射，并使用真实 Worker runtime 完成任务 attempt、续租/重连及撤销后的新连接拒绝；测试发行者不替代真实 IdP，当前没有有效 Worker 模型凭据。
 - [x] 检查没有测试密钥或 Token 文件入库；更新审计、PR 描述并提交。
 
