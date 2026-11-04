@@ -21,8 +21,8 @@ if [ "$replicas" -lt 0 ] || [ "$replicas" -gt 8 ]; then
 fi
 
 password=$(value POSTGRES_PASSWORD)
-if [ -z "$password" ] || [ "$password" = "replace-with-a-long-random-password" ]; then
-  echo "Set POSTGRES_PASSWORD to a unique, strong value in $env_file" >&2
+if [ "${#password}" -lt 24 ] || [ "$password" = "replace-with-a-long-random-password" ]; then
+  echo "Set POSTGRES_PASSWORD to a unique value of at least 24 characters in $env_file" >&2
   exit 2
 fi
 
@@ -43,17 +43,22 @@ if [ "$replicas" -gt 0 ]; then
     /*) ;;
     *) token_file="$(CDPATH= cd -- "$(dirname -- "$env_file")" && pwd)/$token_file" ;;
   esac
-  if [ ! -r "$token_file" ] || [ "${token_file##*/}" = "model-token.example" ]; then
-    echo "Set MODEL_TOKEN_FILE to a readable, real model token file before starting Workers" >&2
+  if [ ! -r "$token_file" ] || [ ! -s "$token_file" ] || [ "${token_file##*/}" = "model-token.example" ]; then
+    echo "Set MODEL_TOKEN_FILE to a readable, non-empty model token file before starting Workers" >&2
     exit 2
   fi
   slot=1
+  seen_ids=" "
   while [ "$slot" -le "$replicas" ]; do
     id=$(value "WORKER_${slot}_AGENT_ID")
     if ! printf '%s\n' "$id" | awk '/^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$/ { ok=1 } END { exit !ok }'; then
       echo "WORKER_${slot}_AGENT_ID must be a UUID registered with this Control Plane" >&2
       exit 2
     fi
+    case "$seen_ids" in
+      *" $id "*) echo "Worker Agent UUIDs must be unique" >&2; exit 2 ;;
+    esac
+    seen_ids="$seen_ids$id "
     slot=$((slot + 1))
   done
 fi

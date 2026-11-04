@@ -67,7 +67,7 @@ PostgreSQL、NATS、对象存储与 Matrix（启用时）都要有持久化、�
 
 ## 7. 兼容与共享代码边界
 
-新架构不另建 Task/Attempt/RBAC/Outbox 状态机，不双写事实源。外部边界使用版本化 protobuf/gRPC 与稳定公共 API。共享核心 Maven 制品已按 `0.1.1` 发布并通过独立远端消费者验证；Compose 仍须等待 Control Plane、Gateway 与 Worker 的固定版本 OCI 镜像可追溯到源 commit 和 digest。
+新架构不另建 Task/Attempt/RBAC/Outbox 状态机，不双写事实源。外部边界使用版本化 protobuf/gRPC 与稳定公共 API。共享核心 Maven 制品 `0.1.4` 已发布并通过独立远端消费者验证。Control Plane、Gateway、Worker 的 OCI 镜像来自 `agentteams-java v0.1.4`，均按 digest 固定在 `deploy/compose/.env.example`，源 commit 为 `02d5ad3017f56b2a3cbb6c60112077d32f3299f4`；发布清单见 [v0.1.4 release](https://github.com/ly416123/agentteams-java/releases/tag/v0.1.4)。
 
 Java 21 继续承载 Control Plane、Gateway、Scheduler、协议和 AgentScope Worker。Python 仅用于确实需要 Python SDK 的独立 Agent/评测/批处理；其他语言需先有可测量的性能或隔离需求。
 

@@ -7,7 +7,8 @@
 ## 前置条件
 
 - Docker Engine 与 Docker Compose v2。
-- 已发布的 Control Plane、Gateway、Worker GHCR 镜像 digest。不要使用 `latest` 或可变 tag。
+- Docker daemon 可访问 Docker Hub 与 GHCR。终端里的 `HTTP_PROXY` 不一定会传给 daemon；需要代理时，也要在 Docker Desktop/Engine 侧配置 registry 出站代理。
+- 已发布的 Control Plane、Gateway、Worker GHCR 镜像 digest。`.env.example` 当前固定到 `agentteams-java v0.1.4`（source commit `02d5ad3017f56b2a3cbb6c60112077d32f3299f4`）。不要使用 `latest` 或可变 tag。
 - Worker 模型调用所需的 token 文件。token 只以只读 Compose secret 文件挂入 Worker，不写进 `.env`。
 
 ```sh
@@ -15,7 +16,7 @@ cd deploy/compose
 cp .env.example .env
 ```
 
-编辑 `.env`：填入强随机 `POSTGRES_PASSWORD`，并将三个镜像变量替换为发布流水线给出的 `ghcr.io/ly416123/...@sha256:...`。确认镜像来自同一个发布 tag/source commit。将 `WORKER_n_AGENT_ID` 改为 Control Plane 注册接口为每个 Worker 返回的 UUID，保证唯一且重启稳定。设置 `MODEL_TOKEN_FILE` 为本机模型 token 文件路径；相对路径相对于本目录。使用 ChatGPT Plan Worker 时，该文件应为现有 Worker 运行时支持的 access-token 格式。
+编辑 `.env`：填入强随机 `POSTGRES_PASSWORD`。镜像已固定到同一发布 tag 和 source commit，升级时从签名的 release manifest 获取新 digest 后一起更新。将 `WORKER_n_AGENT_ID` 改为 Control Plane 注册接口为每个 Worker 返回的 UUID，保证唯一且重启稳定。设置 `MODEL_TOKEN_FILE` 为本机模型 token 文件路径；相对路径相对于本目录。使用 ChatGPT Plan Worker 时，该文件应为现有 Worker 运行时支持的 access-token 格式。
 
 使用私有 GHCR 镜像时，先在本机执行 `docker login ghcr.io`。不要把 PAT 写入 Compose 文件或 `.env`。
 
@@ -24,6 +25,7 @@ cp .env.example .env
 不启动 Worker 的基础服务：
 
 ```sh
+./validate-config.sh .env
 docker compose --env-file .env config --quiet
 docker compose --env-file .env up -d postgres nats nats-bootstrap control-plane gateway
 docker compose --env-file .env ps
