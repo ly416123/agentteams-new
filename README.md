@@ -8,7 +8,7 @@
 
 - 不依赖 Kubernetes API、CRD 或 Operator 即可运行任务控制面和固定 Worker 池。
 - Worker 数量通过容量评估后预先配置；运行时只调度已注册且空闲的 Worker，不按任务创建或扩缩 Worker。
-- 支持多租户数据、会话、文件、工具和凭据授权隔离；共享池和专属池可按租户信任等级选择。
+- 支持多租户数据、会话、文件、工具和凭据授权隔离；固定 Worker 槽位绑定单一 Tenant/Project/Team，共享基础设施不代表同一 Worker 可跨租户执行。
 - 保持 PostgreSQL 为任务与租约事实源，保留 Outbox、NATS JetStream、Gateway 持久命令及 ACK 重放语义。
 - Kubernetes 保留为可选的 Sandbox / 企业部署 Provider，不成为基础运行前提。
 
@@ -35,6 +35,7 @@
 - [独立 Maven 消费验证](verification/shared-core-consumer/README.md)
 - [固定容量 Compose POC](deploy/compose/README.md)
 - [Worker Enrollment 实施计划](docs/plans/2026-11-04-worker-enrollment.md)
+- [多租户与会话隔离验收矩阵](docs/specs/2026-11-05-tenant-session-isolation-matrix.md)
 - [运行时复用与隔离审计](docs/audits/2026-11-04-runtime-reuse-gap-audit.md)
 - [原仓库 Kubernetes 依赖审计](../agentteams-java/docs/superpowers/specs/2026-11-04-runtime-k8s-dependency-audit.md)
 
@@ -64,7 +65,7 @@ agentteams-new/
 
 ## 多租户安全基线
 
-任何资源读取与变更都必须先验证组织、租户、项目和主体权限，再以授权后的 scope 查询数据。Task、Assignment、Attempt、Lease、Conversation、Memory、Artifact、workspace 和凭据授权都必须能追溯到同一租户执行上下文。共享 Worker 首期保持单 Worker 单活动 Attempt（`maxConcurrency=1`），任务结束或取消后清理运行时会话、工具客户端、临时文件及凭据缓存。高敏租户绑定专属固定池；不支持的隔离等级必须拒绝任务，不允许静默降级。
+任何资源读取与变更都必须先验证组织、租户、项目和主体权限，再以授权后的 scope 查询数据。Task、Assignment、Attempt、Lease、Conversation、Memory、Artifact、workspace 和凭据授权都必须能追溯到同一租户执行上下文。每个固定 Worker 槽位绑定单一 Tenant/Project/Team，首期保持单 Worker 单活动 Attempt（`maxConcurrency=1`）；任务结束或取消后清理运行时会话、工具客户端、临时文件及凭据缓存。高敏租户绑定专属固定池；不支持的隔离等级必须拒绝任务，不允许静默降级。若以后要让同一进程跨租户复用，必须另行实现并通过 Attempt 全隔离验收后再启用。
 
 Worker 会话凭据已支持按 tenant/project/team 授权签发、哈希持久化、过期和撤销；每个 Compose Worker 槽位使用独立的 `0600` runtime env 文件。撤销阻止后续 Gateway 握手，不会主动断开已经建立的长连接。
 

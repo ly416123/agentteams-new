@@ -50,6 +50,8 @@
 
 **固定容量启动契约与 L5 资源盘点（2026-11-05）：** 新增无容器副作用的 `start-workers.sh` 契约测试，检查 `WORKER_REPLICAS=0` 只启动共享服务、配置为 2 时只点名 `worker-1` 和 `worker-2`，并禁止使用 `--scale`；OIDC URL 契约测试同时要求 API Auth 启用时 issuer/JWKS 使用 HTTPS。L5 只读确认现有 Keycloak discovery/JWKS、API audience/claim 配置及 Worker Pod 对模型 Token Secret 的引用；未读取 Secret 内容。L5 现有 issuer/JWKS 为 HTTP，且当前 kube context 无权读取 Secret/ConfigMap，不能直接作为新 Compose 的安全凭据来源；真实 IdP/Worker Attempt 验收需先提供 HTTPS OIDC 入口与受信凭据文件路径。现有 L5 工作负载未改动。
 
+**批次 2A scope 基线（2026-11-05）：** 新增 Tenant/Project/Team/Agent/Task/Attempt/Lease/Conversation/Artifact/Tool/Workspace/Credential/事件/审计资源矩阵，逐项定义可信 scope 来源、校验点、生命周期和负向验收；同步建立项目领域词汇。当前 Enrollment 已有 Tenant/Project/Team 逐项比较及跨 scope PostgreSQL/JWT 测试；旧 Worker 上游源码有 Attempt session/workspace 清理机制，但 Compose 双 Tenant 真实任务、Task/Artifact 全链路和数据库 RLS 尚未验证，批次 2 仍未通过。
+
 ## 批次 1：无 Kubernetes 固定容量 Compose POC
 
 1. 先从旧仓库构建并发布 Control Plane、Gateway、Worker 的固定版本 OCI 镜像；记录镜像 digest 和源 commit。
@@ -64,13 +66,13 @@
 
 ## 批次 2：租户与会话隔离
 
-1. 定义不可变 `ExecutionContext` 的 protobuf 字段、签发方、验证方、版本及过期规则；scope 不由 Worker/客户端自行选择。
+1. 以[多租户与会话隔离验收矩阵](../specs/2026-11-05-tenant-session-isolation-matrix.md)为资源基线，定义不可变 `ExecutionContext` 的 protobuf 字段、签发方、验证方、版本及过期规则；scope 不由 Worker/客户端自行选择。
 2. 先建立按 Task、Attempt、Conversation、Memory、Artifact、MCP binding、workspace 和后台 Job 划分的 scope 矩阵，统一 scope-aware 数据访问入口；跨租户 ID 猜测、伪造上下文、无 scope 的后台操作默认拒绝。
 3. 实现 Attempt 独立会话状态、目录、缓存键和 MCP 客户端生命周期；完成/取消/失败/租约过期均执行清理。
 4. 决定 PostgreSQL RLS 的表范围、独立 DB role 和连接池事务变量设置；应用层 scope 校验保持强制，RLS 用于防止漏过滤的纵深防御。若分期启用，先完成集中 scope 访问与等价负向验证，再逐表启用 RLS。
 5. 实现租户级并发、速率和模型预算；支持共享池与专属固定池路由，高敏租户不能落入共享池。
 
-**门槛：** 先完成真实 Worker Attempt、注册/心跳、drain、租约过期恢复和重启重连。随后 A/B 租户并发及连续复用同一 Worker 的负向验收证明 Conversation、Memory、Task、Artifact、工具状态、临时文件和凭据缓存互不可见；越权和伪造 scope 均拒绝。通过前部署档位必须明确限制为单租户/受信 Worker 试验，不对外宣称强隔离。
+**门槛：** 先完成真实 Worker Attempt、注册/心跳、drain、租约过期恢复和重启重连。随后验证同一 Tenant/Project/Team 内连续复用 Worker 不残留会话/文件/工具状态，并由不同固定 Worker 并发处理 A/B Tenant；跨 Tenant Assignment 必须拒绝。越权和伪造 scope 均拒绝。通过前部署档位必须明确限制为单租户/受信 Worker 试验，不对外宣称强隔离。
 
 ## 批次 3：凭证源与凭证代理
 

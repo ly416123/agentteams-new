@@ -1,6 +1,6 @@
 # AgentTeams New 架构基线
 
-**状态：** 初始设计，供实现计划使用
+**状态：** 阶段性目标架构；Compose 基础服务已验证，真实 Worker 与多租户隔离尚未验收
 **日期：** 2026-11-04
 
 ## 1. 设计目标
@@ -35,7 +35,7 @@ NATS JetStream ──► Agent Gateway ◄─────┘ command persistence
 
 ## 3. 固定容量与调度
 
-容量规划给出 Worker 实例数和执行槽位数，部署配置据此启动固定池。扩容由运维修改版本化配置并执行受控滚动；任务高峰超出容量时按租户配额公平排队或限流。
+容量规划给出 Worker 实例数和执行槽位数，部署配置据此启动固定池。每个 Worker Agent 绑定单一 Tenant/Project/Team；共享基础设施不允许同一 Worker 进程跨租户执行。扩容由运维修改版本化配置并执行受控滚动；任务高峰超出容量时按租户配额公平排队或限流。
 
 首期 `maxConcurrency=1`。Worker 的在线状态不代表拥有任务；只有有效 Assignment/Attempt Lease 才能执行。注册、心跳、drain、取消、租约过期与 ACK 恢复沿用现有协议，具体接口差异需在 Compose POC 前确认。
 
