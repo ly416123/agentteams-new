@@ -3,6 +3,8 @@
 **核验日期：** 2026-11-05  
 **核验方式：** 使用本机 `readonly-pod-logs` Kubernetes Context 做只读检查，并读取公开 OIDC Discovery/JWKS 元数据。未读取 Kubernetes Secret 正文、Token、私钥或 JWKS 公钥材料。
 
+**权限复核（2026-11-06）：** 再次检查本机 context 与 RBAC。当前 context 仍是本地 `kind-agentteams`；显式指定 `readonly-pod-logs` 后，`can-i` 显示可读取/列出 `agentteams` Pod，但不能读取 Secret，也不能列出 ConfigMap 或 Deployment；尝试列出 namespace 亦被拒绝。允许列出的 Job/CronJob 不是 OIDC、Worker 部署或凭据文件的充分证据。因此本次不能从 L5 实时确认是否已新增 HTTPS IdP 入口、专供 `agentteams-new` 的 Worker 资源，或运行主机上的 Provider 凭据文件。未尝试读取任何 Secret 内容或本机凭据内容。
+
 ## 结论
 
 L5 已有可响应的 Keycloak OIDC Realm，可作为新项目联调候选；但当前 Issuer 是 HTTP，不能直接用于 `agentteams-new` 安全 Compose 配置要求的可信 HTTPS OIDC。L5 也有正在运行的旧版 AgentTeams Worker，但没有发现可直接交给新 Credential Proxy 使用的通用模型 API Key 文件。
@@ -42,6 +44,8 @@ JWKS 当前返回 2 个元数据项：`RS256/sig` 与 `RSA-OAEP/enc`。只检查
 ## 权限边界与核验限制
 
 当前 Context 可以列出 Namespace 中的 Pod、读取 Pod 元数据和日志；RBAC 不允许列出 Deployment、Service、ConfigMap、Secret。本次没有读取任何 Secret 内容。因而无法确认实时 Control Plane 的 Audience/Claim 配置。Discovery/JWKS 是公开端点元数据，不代表已完成 OIDC 登录、Claim 映射、签名验收或多租户拒绝用例。
+
+2026-11-06 的权限复核进一步确认：当前可用的 L5 context 名为 `readonly-pod-logs`，仅凭它不能判断集群里有没有上述资源。若要完成只读资源确认，需要运维提供可列出 `agentteams` 命名空间 Deployment、Service、Ingress 与 ConfigMap 元数据的只读权限；Secret 数据仍无需开放。若运维确认资源尚未部署，则本项应记录为缺失，而不是继续扩大权限。
 
 ## 对 `agentteams-new` 计划的影响
 
