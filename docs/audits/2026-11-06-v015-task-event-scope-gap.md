@@ -68,11 +68,11 @@ Control Plane observation adapter 也缺少跨 Tenant Task ID + 任意 Run/Attem
   或 Webhook delivery。
 - 过程事件仍可按既有 best-effort 语义丢弃，不能因拒绝事件关闭承载终态状态迁移的
   gRPC 流。
-- 因 `agentteams-new` 当前固定复用 v0.1.5 Control Plane/Gateway，这个缺口阻断其
-  多租户强隔离验收。API OIDC、Enrollment RLS 和 Credential Proxy 授权不能补上
-  此异步写入边界。按仓库边界，本轮只在 `agentteams-new` 记录并门禁，不修改
-  `agentteams-java`；解除阻断需要换用已修复且经固定镜像负向测试验证的上游版本，或
-  将该观测处理路径迁入新项目并纳入新的执行身份授权边界。
+- 在加固补丁完成前，这个缺口阻断 `agentteams-new` 多租户强隔离验收；API OIDC、
+  Enrollment RLS 和 Credential Proxy 授权不能替代此异步写入边界。后续由新仓库维护的
+  固定 v0.1.5 补丁关闭该 `TASK_EVENT` 路径，真实事件链负向验收见下文。此结论不覆盖
+  `CONFIG_APPLIED`、其他异步消费者或整体隔离。按仓库边界只在 `agentteams-new` 维护补丁
+  和门禁，不修改 `agentteams-java`。
 
 ## `agentteams-new` 派生 Control Plane 加固进展（2026-11-06）
 
@@ -82,4 +82,4 @@ Control Plane observation adapter 也缺少跨 Tenant Task ID + 任意 Run/Attem
 
 补丁同时把上游 Control Plane Dockerfile 的 Maven/JRE 基础镜像固定到 Docker proxy 镜像 digest；派生镜像标签记录上游 commit `0156f2c1fecdc868cb4a0f4f13fb068bb4162834` 与补丁 SHA-256 `497cdab6d8e3a47012186234288f355a73552ababe45635d3b8b042e3c39f5bd`。`self-hosted-small` 配置门禁只接受这个固定派生镜像，启动脚本会先构建或复用本地校验标签匹配的镜像；`local-dev` 零 Worker POC 仍可使用原固定镜像。该端到端验收证明异步事件写入边界已被锁住，不等同于真实 HTTPS OIDC 登录、A/B Tenant HTTP/API 权限、Worker Enrollment 或 Provider 联调验收；这些门槛仍未完成。
 
-该派生镜像已在 `agentteams-new-validation` Compose POC 替换 Control Plane 容器，复用原 PostgreSQL/NATS 数据，`/actuator/health` 返回 `UP`，容器运行且无重启。此运行态验证只证明新镜像能连接现有 v121 数据库和启动；**尚未**通过真实 Gateway→NATS→Control Plane 事件链发送跨 Tenant 事件，也未对数据库 Run、Process Event、Webhook delivery 做端到端前后行数断言。因而修复进入可构建、可运行状态，但多租户任务启用门槛仍需完成这项负向端到端验收及真实 HTTPS OIDC/A-B Tenant 请求。
+此前构建的加固派生镜像已在 `agentteams-new-validation` Compose POC 运行，复用原 PostgreSQL/NATS 数据；本次复核 `/actuator/health` 返回 HTTP 200/`UP`。本次补丁扩充只加入测试与构建门禁，没有改动运行时代码，因此没有为测试变更重建运行中的 POC 容器。最新派生镜像本机重建成功，其 OCI 标签记录上游 commit 与当前 patch SHA。真实 Gateway→NATS→Control Plane 事件链负向验收现已完成：固定未加固 v0.1.5 基线会新增 1 条 Run；加固版等待 Control Plane Consumer ACK 后，Tenant B Task 的 Run、Process Event、Webhook delivery 均为 0。该测试在 CI run [42111461762](https://github.com/ly416123/agentteams-new/actions/runs/42111461762) 通过。剩余真实 HTTPS OIDC 登录、受认证 A/B Tenant HTTP/API 和真实 Worker/Provider 验收仍未完成，故不能据此宣布全部多租户隔离通过。
