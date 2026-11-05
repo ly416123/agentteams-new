@@ -52,7 +52,7 @@
 
 **批次 2A scope 基线（2026-11-05）：** 新增 Tenant/Project/Team/Agent/Task/Attempt/Lease/Conversation/Artifact/Tool/Workspace/Credential/事件/审计资源矩阵，逐项定义可信 scope 来源、校验点、生命周期和负向验收；同步建立项目领域词汇。当前 Enrollment 已有 Tenant/Project/Team 逐项比较及跨 scope PostgreSQL/JWT 测试；旧 Worker 上游源码有 Attempt session/workspace 清理机制，但 Compose 双 Tenant 真实任务与 Task/Artifact 全链路尚未验证，批次 2 仍未通过。
 
-**批次 2C Enrollment RLS 子集（2026-11-05）：** 为独立 `worker_enrollment` 数据库角色在 `agents` 与 `agent_sessions` 表启用 RLS；scope 由已验证 JWT 进入事务局部 GUC，窄列权限禁止读取 Session Token Hash，角色设置为非 owner、非 superuser、无 `BYPASSRLS`。Testcontainers 验证缺 scope 默认拒绝、Tenant A/B 同连接隔离、跨 scope 写拒绝和事务结束清理，定向 PostgreSQL 测试 5/5 通过。其他任务/会话/Artifact 等表仍未采用 RLS。完整本机 `verify` 中复用 Gateway 镜像在 ARM64 Colima 上未能于 2 分钟开放 gRPC 端口；不含该镜像用例的 23 项通过，PR CI 继续负责完整 Gateway 门禁。
+**批次 2C Enrollment RLS 子集（2026-11-05）：** 为独立 `worker_enrollment` 数据库角色在 `agents` 与 `agent_sessions` 表启用 RLS；scope 由已验证 JWT 进入事务局部 GUC，窄列权限禁止读取 Session Token Hash，角色设置为非 owner、非 superuser、无 `BYPASSRLS`。Testcontainers 验证缺 scope 默认拒绝、Tenant A/B 同连接隔离、跨 scope 写拒绝和事务结束清理，定向 PostgreSQL 测试 5/5 通过。其他任务/会话/Artifact 等表仍未采用 RLS。完整本机 `verify` 中复用 Gateway 镜像在 ARM64 Colima 上未能于 2 分钟开放 gRPC 端口；不含该镜像用例的 23 项通过。推送后 Ubuntu CI run [41981566128](https://github.com/ly416123/agentteams-new/actions/runs/41981566128) 完整通过，要求的 PostgreSQL、签名 OIDC→数据库和固定 Gateway 握手 16 项均执行、无跳过；Compose 配置和 shell 检查通过。
 
 ## 批次 1：无 Kubernetes 固定容量 Compose POC
 
