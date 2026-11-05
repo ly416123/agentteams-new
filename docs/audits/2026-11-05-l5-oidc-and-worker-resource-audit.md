@@ -7,9 +7,9 @@
 
 ## 结论
 
-L5 已有可响应的 Keycloak OIDC Realm，可作为新项目联调候选；但当前 Issuer 是 HTTP，不能直接用于 `agentteams-new` 安全 Compose 配置要求的可信 HTTPS OIDC。L5 也有正在运行的旧版 AgentTeams Worker，但没有发现可直接交给新 Credential Proxy 使用的通用模型 API Key 文件。
+L5 已有可响应的 Keycloak OIDC Realm，可作为新项目联调候选；但当前 Issuer 是 HTTP，不能直接用于 `agentteams-new` 安全 Compose 配置要求的可信 HTTPS OIDC。L5 也有正在运行的旧版 AgentTeams Worker；已检查的旧 Worker 元数据只确认了 `chatgpt-plan` OAuth token 引用，没有确认可直接交给新 Credential Proxy 使用的通用模型 API Key 文件。
 
-L5 中看到的 Keycloak、Worker、Gateway、PostgreSQL、NATS 和 MinIO 属于现有 `agentteams-java` 工作负载。没有发现专供 `agentteams-new` 的部署资源，因此这些旧工作负载只提供可复用的集成环境线索，不代表新项目已部署或通过验收。
+此前可见的 Keycloak、Worker、Gateway、PostgreSQL、NATS 和 MinIO Pod 属于现有 `agentteams-java` 工作负载。由于当前 RBAC 不能列出 Deployment、Service、Ingress 或 ConfigMap，无法据此判定 L5 是否另有专供 `agentteams-new` 的部署资源；这些可见旧工作负载只提供集成环境线索，不代表新项目已部署或通过验收。
 
 ## OIDC 发现端点
 
@@ -39,7 +39,7 @@ JWKS 当前返回 2 个元数据项：`RS256/sig` 与 `RSA-OAEP/enc`。只检查
 - Worker 还引用 `agentteams-gateway/worker-token` 和 `agentteams-mcp-tools/mcp-tools-token`。这两项是 Gateway/MCP 凭据，不是通用模型 API Key。
 - Namespace 中当时有 12 个运行中的旧版 Worker Pod；这些不是 `agentteams-new` 的固定 Compose Worker。
 
-发现的文件是旧版 `chatgpt-plan` 运行时使用的 OAuth access token 文件，不等同于已确认可供新 Credential Proxy 使用的 Provider API Key。不要将其挂载到新 Credential Proxy，也不要复制旧 Secret。当前 L5 检查没有识别出适用于新代理的通用 Provider 凭据文件；真实上游模型请求仍需独立、明确的凭据接入方案。
+已检查的旧 Worker 引用的是 `chatgpt-plan` 运行时 OAuth access token 文件，不等同于已确认可供新 Credential Proxy 使用的 Provider API Key。不要将其挂载到新 Credential Proxy，也不要复制旧 Secret。由于没有权限枚举 Secret/配置元数据，当前无法判定 L5 是否另有适用于新代理的 Provider 凭据文件；真实上游模型请求仍需独立、明确的凭据接入方案。
 
 ## 权限边界与核验限制
 
