@@ -33,10 +33,18 @@ public class EnrollmentOidcProperties {
         } catch (IllegalArgumentException error) {
             throw new IllegalStateException("agentteams.enrollment.oidc." + field + " must be an absolute HTTP(S) URI");
         }
-        String scheme = URI.create(value).getScheme();
-        if (!"https".equalsIgnoreCase(scheme) && !"http".equalsIgnoreCase(scheme)) {
-            throw new IllegalStateException("agentteams.enrollment.oidc." + field + " must use HTTP or HTTPS");
-        }
+        URI uri = URI.create(value);
+        if ("https".equalsIgnoreCase(uri.getScheme())) return;
+        if ("http".equalsIgnoreCase(uri.getScheme()) && isLoopbackHost(uri.getHost())) return;
+        throw new IllegalStateException("agentteams.enrollment.oidc." + field
+                + " must use HTTPS; HTTP is allowed only for loopback test or development endpoints");
+    }
+
+    private static boolean isLoopbackHost(String host) {
+        return host != null && ("localhost".equalsIgnoreCase(host)
+                || "127.0.0.1".equals(host)
+                || "[::1]".equals(host)
+                || "::1".equals(host));
     }
 
     private static void requireText(String value, String field) {
