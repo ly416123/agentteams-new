@@ -2,7 +2,7 @@
 
 本目录提供不依赖 Kubernetes API、CRD、Operator 或 Docker Socket 的单机/单节点部署入口。Compose 管理 PostgreSQL、NATS JetStream、Control Plane、Gateway 和最多 8 个预先定义的 Worker 槽位。Worker 数量通过启动脚本显式选择，不会随任务动态创建或扩缩。
 
-> 当前是 POC 部署档，不代表生产就绪。固定复用的 v0.1.5 Control Plane/Gateway 存在 `TASK_EVENT` 按消息 Task ID 写入、未核对 Attempt/Lease/Agent 归属的跨租户事件注入缺口（[审计](../../docs/audits/2026-11-06-v015-task-event-scope-gap.md)）。该边界修复并通过负向集成测试前，不得将此复用路径用于多租户任务。Worker Enrollment 已实现 OIDC scope 授权和哈希凭据；Credential Proxy 已加入固定 Worker 启动链，真实 IdP 下的端到端任务、多租户隔离、真实 Provider 联调和 Worker drain 恢复仍待验收。
+> 当前是 POC 部署档，不代表生产就绪。原版 v0.1.5 Control Plane/Gateway 存在 `TASK_EVENT` 按消息 Task ID 写入、未核对 Attempt/Lease/Agent 归属的跨租户事件注入缺口（[审计](../../docs/audits/2026-11-06-v015-task-event-scope-gap.md)）。`self-hosted-small` 现强制从 `agentteams-new` 固定补丁构建 Control Plane，并在数据库事实校验通过后才允许投影事件；补丁已有 PostgreSQL/适配器负向测试，且已在零 Worker Compose POC 运行。Gateway→NATS→Control Plane 的真实事件链及数据库/Webhook 无副作用断言仍未完成，因此多租户隔离不能记为通过。Worker Enrollment 已实现 OIDC scope 授权和哈希凭据；Credential Proxy 已加入固定 Worker 启动链，真实 IdP 下的端到端任务、跨租户隔离、真实 Provider 联调和 Worker drain 恢复仍待验收。
 
 ## 前置条件
 
@@ -19,7 +19,7 @@ cp .env.example .env
 
 编辑 `.env`：填入随机且互不相同的 `POSTGRES_PASSWORD`、`CONTROL_PLANE_DB_PASSWORD`、`WORKER_ENROLLMENT_DB_PASSWORD` 和 `CREDENTIAL_PROXY_DB_PASSWORD`（各至少 24 字符）。PostgreSQL 初始化用户 `agentteams` 只供 Flyway 迁移和数据库角色初始化使用；Control Plane SQL 使用非超级用户 `agentteams_runtime`。将 `CREDENTIAL_PROXY_UID`、`CREDENTIAL_PROXY_GID` 设为运行部署用户的数字 UID/GID；Compose 中 Worker 和 Credential Proxy 都以此身份运行，以便它们只读各自挂载的 `0600` 文件。镜像已固定到发布 digest，升级时从签名 release manifest 获取新 digest 后一起更新。`POST /api/v1/agents` 只创建 Worker 记录，不会签发会话 Token。
 
-`.env.example` 的 `DEPLOYMENT_MODE=local-dev` 与 `API_AUTH_ENABLED=false` 只适用于零 Worker 的本机开发，Control Plane API 不执行 OIDC 认证。用于多租户或任何自托管环境时，将档位设为 `DEPLOYMENT_MODE=self-hosted-small`、启用 `API_AUTH_ENABLED=true`，并提供可信 HTTPS issuer/JWKS 与 audience；配置校验会拒绝未认证的非 local-dev 部署。Worker 槽位大于 0 时无论档位如何都必须启用认证。部署前通过 `./validate-config.sh .env` 或 `./start-workers.sh .env` 校验配置，不要绕过校验脚本直接启动共享 API 服务。当前 Compose 只实现 `local-dev` 与 `self-hosted-small`；`enterprise-k8s` 尚未实现。
+`.env.example` 的 `DEPLOYMENT_MODE=local-dev` 与 `API_AUTH_ENABLED=false` 只适用于零 Worker 的本机开发，Control Plane API 不执行 OIDC 认证。用于多租户或任何自托管环境时，将档位设为 `DEPLOYMENT_MODE=self-hosted-small`、启用 `API_AUTH_ENABLED=true`，并提供可信 HTTPS issuer/JWKS 与 audience；同时将 `CONTROL_PLANE_BUILD_FROM_SOURCE=true`、`CONTROL_PLANE_IMAGE=agentteams-new/control-plane:v0.1.5-task-event-scope-guard-0156f2c`。首次构建需要已登录且可读取公开源码的 GitHub CLI（`gh`）和 Docker；启动脚本会从固定的 `agentteams-java` v0.1.5 源码 commit 下载源码，在临时目录应用本仓库维护的 TASK_EVENT 归属补丁，运行 PostgreSQL 正向/负向测试并构建本机 Control Plane 镜像。当前 v0.1.5 预构建镜像仍存在 TASK_EVENT 跨租户事件注入缺口，配置校验会拒绝在 self-hosted 档位使用它；修复只由 `agentteams-new` 的补丁与派生镜像承载，不修改 `agentteams-java` 工作树。Worker 槽位大于 0 时无论档位如何都必须启用认证。部署前通过 `./validate-config.sh .env` 或 `./start-workers.sh .env` 校验配置，不要绕过校验脚本直接启动共享 API 服务。当前 Compose 只实现 `local-dev` 与 `self-hosted-small`；`enterprise-k8s` 尚未实现。
 
 创建 `PROVIDER_CREDENTIALS_DIR` 指定的目录，并按 `file:<tenant>/<project>/<team>/<credential-name>` 的引用组织凭据。例如 `.env` 中 `WORKER_1_MODEL_CREDENTIAL_REF=file:tenant-a/project-a/team-a/chatgpt` 对应文件 `secrets/provider/tenant-a/project-a/team-a/chatgpt`。引用中的 Tenant、Project、Team 必须与数据库活动 Attempt 的 scope 完全一致。目录和所有子目录权限设为 `0700`，凭据文件设为 `0600`，所有者 UID 与 `CREDENTIAL_PROXY_UID` 一致。Credential Proxy 只读挂载此目录；Worker 网络为 internal 网络，只能访问 Gateway 和 Proxy，Provider 出站只由 Proxy 所在网络提供。每个活动 Worker 还需要各自的 `WORKER_n_MODEL_PROXY_TOKEN_FILE`，由 Enrollment 命令生成；这些 `atp_` 文件也须为 `0600` 且由同一 UID 拥有。只需为活动槽位准备模型代理 Token 和其引用的 Provider 凭据文件。
 

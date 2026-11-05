@@ -9,6 +9,23 @@ case "$compose_project" in ''|[!a-z0-9]*|*[!a-z0-9_-]*) echo "Invalid Compose pr
 compose() {
   docker compose -p "$compose_project" --env-file "$env_file" -f "$script_dir/compose.yaml" "$@"
 }
+deployment_mode=$(awk -F= '$1 == "DEPLOYMENT_MODE" { value=$2 } END { gsub(/[[:space:]]/, "", value); print value }' "$env_file")
+if [ "$deployment_mode" = "self-hosted-small" ]; then
+  control_plane_image=$(python3 - "$env_file" <<'PY'
+from pathlib import Path
+import sys
+
+value = ""
+for line in Path(sys.argv[1]).read_text().splitlines():
+    key, separator, candidate = line.partition("=")
+    if separator and key == "CONTROL_PLANE_IMAGE":
+        value = candidate.strip().strip("\"'")
+print(value)
+PY
+  )
+  echo "Building the pinned TASK_EVENT-hardened Control Plane from agentteams-new's source patch"
+  python3 "$script_dir/build-control-plane-hardening.py" "$control_plane_image"
+fi
 replicas=$(awk -F= '$1 == "WORKER_REPLICAS" { value=$2 } END { gsub(/[[:space:]]/, "", value); print value }' "$env_file")
 storage_enabled=$(awk -F= '$1 == "AGENTTEAMS_STORAGE_ENABLED" { value=$2 } END { gsub(/[[:space:]]/, "", value); print value }' "$env_file")
 

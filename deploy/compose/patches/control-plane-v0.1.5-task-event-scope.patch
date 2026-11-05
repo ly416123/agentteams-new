@@ -1,0 +1,389 @@
+diff --git a/control-plane/src/main/java/io/agentteams/controlplane/ControlPlaneConfiguration.java b/control-plane/src/main/java/io/agentteams/controlplane/ControlPlaneConfiguration.java
+index 3e59349..693a19f 100644
+--- a/control-plane/src/main/java/io/agentteams/controlplane/ControlPlaneConfiguration.java
++++ b/control-plane/src/main/java/io/agentteams/controlplane/ControlPlaneConfiguration.java
+@@ -5,6 +5,7 @@ import io.agentteams.application.api.ConfigEventPort;
+ import io.agentteams.application.api.TaskExecutionObservationPort;
+ import io.agentteams.application.api.TaskCommandPort;
+ import io.agentteams.controlplane.application.ControlPlaneExecutionEventAdapter;
++import io.agentteams.controlplane.application.TaskEventScopeGuard;
+ import io.agentteams.controlplane.application.ControlPlaneTaskCommandAdapter;
+ import io.agentteams.controlplane.application.ControlPlaneConfigEventAdapter;
+ import io.agentteams.controlplane.outbox.EventPublisher;
+@@ -720,9 +721,10 @@ public class ControlPlaneConfiguration {
+     @Bean
+     @org.springframework.boot.autoconfigure.condition.ConditionalOnBean(ExecutionEventService.class)
+     ExecutionEventPort executionEventPort(ExecutionEventService executionEvents, DataSource dataSource,
+-            TaskExecutionObservationPort observations) {
++            TaskExecutionObservationPort observations, TaskEventScopeGuard taskEventScopeGuard) {
++        org.springframework.jdbc.core.JdbcTemplate jdbc = new org.springframework.jdbc.core.JdbcTemplate(dataSource);
+         return new ControlPlaneExecutionEventAdapter(executionEvents,
+-                new JdbcModelCallAuditRecorder(new org.springframework.jdbc.core.JdbcTemplate(dataSource)), observations);
++                new JdbcModelCallAuditRecorder(jdbc), observations, taskEventScopeGuard);
+     }
+ 
+     @Bean
+diff --git a/control-plane/src/main/java/io/agentteams/controlplane/application/ControlPlaneExecutionEventAdapter.java b/control-plane/src/main/java/io/agentteams/controlplane/application/ControlPlaneExecutionEventAdapter.java
+index dcc48ef..4568d23 100644
+--- a/control-plane/src/main/java/io/agentteams/controlplane/application/ControlPlaneExecutionEventAdapter.java
++++ b/control-plane/src/main/java/io/agentteams/controlplane/application/ControlPlaneExecutionEventAdapter.java
+@@ -23,6 +23,7 @@ public final class ControlPlaneExecutionEventAdapter implements ExecutionEventPo
+     private final ExecutionEventService executionEvents;
+     private final ModelCallAuditRecorder modelCallAudits;
+     private final TaskExecutionObservationPort observations;
++    private final TaskEventScopeGuard taskEventScopeGuard;
+ 
+     public ControlPlaneExecutionEventAdapter(ExecutionEventService executionEvents) {
+         this(executionEvents, ModelCallAuditRecorder.noop(), TaskExecutionObservationPort.noop());
+@@ -35,9 +36,16 @@ public final class ControlPlaneExecutionEventAdapter implements ExecutionEventPo
+ 
+     public ControlPlaneExecutionEventAdapter(ExecutionEventService executionEvents,
+             ModelCallAuditRecorder modelCallAudits, TaskExecutionObservationPort observations) {
++        this(executionEvents, modelCallAudits, observations, TaskEventScopeGuard.rejectAll());
++    }
++
++    public ControlPlaneExecutionEventAdapter(ExecutionEventService executionEvents,
++            ModelCallAuditRecorder modelCallAudits, TaskExecutionObservationPort observations,
++            TaskEventScopeGuard taskEventScopeGuard) {
+         this.executionEvents = Objects.requireNonNull(executionEvents, "executionEvents");
+         this.modelCallAudits = Objects.requireNonNull(modelCallAudits, "modelCallAudits");
+         this.observations = Objects.requireNonNull(observations, "observations");
++        this.taskEventScopeGuard = Objects.requireNonNull(taskEventScopeGuard, "taskEventScopeGuard");
+     }
+ 
+     @Override
+@@ -96,8 +104,9 @@ public final class ControlPlaneExecutionEventAdapter implements ExecutionEventPo
+         Objects.requireNonNull(command, "command");
+         // runId 与既有 observe(...) 相同：run == attempt。白名单与范围校验
+         // 由观测适配器二次校验（不信任上游）。
+-        observations.observed(taskId, command.attemptId(), command.eventId(), command.occurredAt(),
+-                command.correlationId(), command.eventType(), command.payloadJson());
++        taskEventScopeGuard.runIfActive(taskId, command, () -> observations.observed(taskId,
++                command.attemptId(), command.eventId(), command.occurredAt(), command.correlationId(),
++                command.eventType(), command.payloadJson()));
+     }
+ 
+     private static ArtifactRecord toRecord(UUID taskId, UUID attemptId, UUID eventId, Instant at,
+diff --git a/control-plane/src/main/java/io/agentteams/controlplane/application/JdbcTaskEventScopeGuard.java b/control-plane/src/main/java/io/agentteams/controlplane/application/JdbcTaskEventScopeGuard.java
+new file mode 100644
+index 0000000..fafe4d9
+--- /dev/null
++++ b/control-plane/src/main/java/io/agentteams/controlplane/application/JdbcTaskEventScopeGuard.java
+@@ -0,0 +1,66 @@
++package io.agentteams.controlplane.application;
++
++import io.agentteams.application.api.ExecutionEventPort.TaskEventReportCommand;
++import java.util.Objects;
++import java.util.UUID;
++import org.springframework.jdbc.core.JdbcTemplate;
++import org.springframework.stereotype.Service;
++import org.springframework.transaction.annotation.Transactional;
++
++/** Validates a TASK_EVENT against the active assignment while holding its rows stable through projection. */
++@Service
++public class JdbcTaskEventScopeGuard implements TaskEventScopeGuard {
++    private static final String ACTIVE_ASSIGNMENT_SQL = """
++            SELECT 1
++              FROM public.task_assignments AS assignment
++              JOIN public.task_attempts AS attempt
++                ON attempt.id = assignment.attempt_id
++               AND attempt.task_id = assignment.task_id
++              JOIN public.agent_leases AS lease
++                ON lease.id = attempt.lease_id
++               AND lease.task_attempt_id = attempt.id
++               AND lease.agent_id = assignment.agent_id
++              JOIN public.resource_scopes AS worker_scope
++                ON worker_scope.resource_type = 'WORKER'
++               AND worker_scope.resource_id = assignment.agent_id
++              JOIN public.resource_scopes AS task_scope
++                ON task_scope.resource_type = 'TASK'
++               AND task_scope.resource_id = assignment.task_id
++             WHERE assignment.task_id = ?
++               AND assignment.attempt_id = ?
++               AND assignment.agent_id = ?::uuid
++               AND assignment.phase IN ('ASSIGNED', 'ACCEPTED', 'RUNNING')
++               AND assignment.released_at IS NULL
++               AND attempt.phase IN ('ASSIGNED', 'ACCEPTED', 'RUNNING')
++               AND attempt.lease_expires_at > statement_timestamp()
++               AND lease.id = ?
++               AND lease.status = 'ACTIVE'
++               AND lease.released_at IS NULL
++               AND lease.expires_at > statement_timestamp()
++               AND worker_scope.tenant_id = task_scope.tenant_id
++               AND worker_scope.project_id = task_scope.project_id
++               AND worker_scope.team = task_scope.team
++             LIMIT 1
++             FOR SHARE OF assignment, attempt, lease, worker_scope, task_scope
++            """;
++
++    private final JdbcTemplate jdbc;
++
++    public JdbcTaskEventScopeGuard(JdbcTemplate jdbc) {
++        this.jdbc = Objects.requireNonNull(jdbc, "jdbc");
++    }
++
++    @Override
++    @Transactional
++    public boolean runIfActive(UUID taskId, TaskEventReportCommand command, Runnable projection) {
++        Objects.requireNonNull(taskId, "taskId");
++        Objects.requireNonNull(command, "command");
++        Objects.requireNonNull(projection, "projection");
++        Boolean active = jdbc.query(ACTIVE_ASSIGNMENT_SQL,
++                (org.springframework.jdbc.core.ResultSetExtractor<Boolean>) rs -> rs.next(), taskId,
++                command.attemptId(), command.agentId(), command.leaseId());
++        if (!Boolean.TRUE.equals(active)) return false;
++        projection.run();
++        return true;
++    }
++}
+diff --git a/control-plane/src/main/java/io/agentteams/controlplane/application/TaskEventScopeGuard.java b/control-plane/src/main/java/io/agentteams/controlplane/application/TaskEventScopeGuard.java
+new file mode 100644
+index 0000000..b563fdc
+--- /dev/null
++++ b/control-plane/src/main/java/io/agentteams/controlplane/application/TaskEventScopeGuard.java
+@@ -0,0 +1,15 @@
++package io.agentteams.controlplane.application;
++
++import io.agentteams.application.api.ExecutionEventPort.TaskEventReportCommand;
++import java.util.UUID;
++
++/** Checks the live task/attempt/lease/agent relation before projecting a Worker event. */
++@FunctionalInterface
++public interface TaskEventScopeGuard {
++    boolean runIfActive(UUID taskId, TaskEventReportCommand command, Runnable projection);
++
++    /** Safe default for tests and any unconfigured adapter: never project unverified Worker events. */
++    static TaskEventScopeGuard rejectAll() {
++        return (taskId, command, projection) -> false;
++    }
++}
+diff --git a/control-plane/src/test/java/io/agentteams/controlplane/application/ControlPlaneExecutionEventAdapterTest.java b/control-plane/src/test/java/io/agentteams/controlplane/application/ControlPlaneExecutionEventAdapterTest.java
+index b576d6e..22dd0b4 100644
+--- a/control-plane/src/test/java/io/agentteams/controlplane/application/ControlPlaneExecutionEventAdapterTest.java
++++ b/control-plane/src/test/java/io/agentteams/controlplane/application/ControlPlaneExecutionEventAdapterTest.java
+@@ -4,6 +4,8 @@ import static org.mockito.ArgumentMatchers.any;
+ import static org.mockito.ArgumentMatchers.eq;
+ import static org.mockito.Mockito.mock;
+ import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.when;
+ 
+ import io.agentteams.application.api.ExecutionEventPort;
+ import io.agentteams.application.api.TaskExecutionObservationPort;
+@@ -15,6 +17,44 @@ import java.util.UUID;
+ import org.junit.jupiter.api.Test;
+ 
+ class ControlPlaneExecutionEventAdapterTest {
++    @Test
++    void dropsTaskEventWhenActiveExecutionScopeDoesNotMatch() {
++        UUID taskId = UUID.randomUUID();
++        ExecutionEventService executionEvents = mock(ExecutionEventService.class);
++        TaskExecutionObservationPort observations = mock(TaskExecutionObservationPort.class);
++        TaskEventScopeGuard guard = mock(TaskEventScopeGuard.class);
++        ExecutionEventPort.TaskEventReportCommand command = taskEventCommand();
++        when(guard.runIfActive(eq(taskId), eq(command), any())).thenReturn(false);
++        ControlPlaneExecutionEventAdapter adapter = new ControlPlaneExecutionEventAdapter(
++                executionEvents, ModelCallAuditRecorder.noop(), observations, guard);
++
++        adapter.taskEventReport(taskId, command);
++
++        verify(guard).runIfActive(eq(taskId), eq(command), any());
++        verify(observations, never()).observed(any(), any(), any(), any(), any(), any(), any());
++    }
++
++    @Test
++    void projectsTaskEventOnlyInsideValidatedActiveExecutionScope() {
++        UUID taskId = UUID.randomUUID();
++        ExecutionEventService executionEvents = mock(ExecutionEventService.class);
++        TaskExecutionObservationPort observations = mock(TaskExecutionObservationPort.class);
++        TaskEventScopeGuard guard = mock(TaskEventScopeGuard.class);
++        ExecutionEventPort.TaskEventReportCommand command = taskEventCommand();
++        when(guard.runIfActive(eq(taskId), eq(command), any())).thenAnswer(invocation -> {
++            invocation.<Runnable>getArgument(2).run();
++            return true;
++        });
++        ControlPlaneExecutionEventAdapter adapter = new ControlPlaneExecutionEventAdapter(
++                executionEvents, ModelCallAuditRecorder.noop(), observations, guard);
++
++        adapter.taskEventReport(taskId, command);
++
++        verify(observations).observed(eq(taskId), eq(command.attemptId()), eq(command.eventId()),
++                eq(command.occurredAt()), eq(command.correlationId()), eq(command.eventType()),
++                eq(command.payloadJson()));
++    }
++
+     @Test
+     void publishesTerminalSuccessToTheTaskExecutionObservationProjection() {
+         UUID taskId = UUID.randomUUID();
+@@ -39,4 +79,10 @@ class ControlPlaneExecutionEventAdapterTest {
+         verify(observations).completed(eq(taskId), eq(attemptId), eq(eventId), eq(occurredAt), eq("corr-1"),
+                 eq(""), eq(List.of(artifact)));
+     }
++
++    private static ExecutionEventPort.TaskEventReportCommand taskEventCommand() {
++        return new ExecutionEventPort.TaskEventReportCommand(UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID(),
++                Instant.parse("2026-09-07T00:00:00Z"), UUID.randomUUID().toString(), "tool.started", "{}", 1,
++                "corr-1");
++    }
+ }
+diff --git a/control-plane/src/test/java/io/agentteams/controlplane/application/JdbcTaskEventScopeGuardPostgresTest.java b/control-plane/src/test/java/io/agentteams/controlplane/application/JdbcTaskEventScopeGuardPostgresTest.java
+new file mode 100644
+index 0000000..da9d31b
+--- /dev/null
++++ b/control-plane/src/test/java/io/agentteams/controlplane/application/JdbcTaskEventScopeGuardPostgresTest.java
+@@ -0,0 +1,135 @@
++package io.agentteams.controlplane.application;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++
++import io.agentteams.application.api.ExecutionEventPort.TaskEventReportCommand;
++import io.agentteams.application.api.TaskExecutionObservationPort;
++import io.agentteams.controlplane.audit.ModelCallAuditRecorder;
++import io.agentteams.controlplane.service.ExecutionEventService;
++import java.time.Instant;
++import java.util.UUID;
++import javax.sql.DataSource;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.postgresql.ds.PGSimpleDataSource;
++import org.springframework.jdbc.core.JdbcTemplate;
++import org.springframework.jdbc.datasource.DataSourceTransactionManager;
++import org.springframework.transaction.support.TransactionTemplate;
++import org.testcontainers.containers.PostgreSQLContainer;
++import org.testcontainers.junit.jupiter.Container;
++import org.testcontainers.junit.jupiter.Testcontainers;
++
++@Testcontainers(disabledWithoutDocker = true)
++class JdbcTaskEventScopeGuardPostgresTest {
++    @Container
++    static final PostgreSQLContainer<?> POSTGRES = new PostgreSQLContainer<>("postgres:16-alpine");
++    private static JdbcTemplate jdbc;
++    private static TransactionTemplate transactions;
++    private static JdbcTaskEventScopeGuard guard;
++
++    private static final UUID TASK_A = UUID.fromString("10000000-0000-0000-0000-000000000001");
++    private static final UUID ATTEMPT_A = UUID.fromString("20000000-0000-0000-0000-000000000001");
++    private static final UUID LEASE_A = UUID.fromString("30000000-0000-0000-0000-000000000001");
++    private static final UUID AGENT_A = UUID.fromString("40000000-0000-0000-0000-000000000001");
++    private static final UUID TASK_B = UUID.fromString("10000000-0000-0000-0000-000000000002");
++    private static final UUID ATTEMPT_B = UUID.fromString("20000000-0000-0000-0000-000000000002");
++    private static final UUID LEASE_B = UUID.fromString("30000000-0000-0000-0000-000000000002");
++    private static final UUID AGENT_B = UUID.fromString("40000000-0000-0000-0000-000000000002");
++
++    @BeforeAll
++    static void createSchema() {
++        DataSource dataSource = dataSource();
++        jdbc = new JdbcTemplate(dataSource);
++        transactions = new TransactionTemplate(new DataSourceTransactionManager(dataSource));
++        guard = new JdbcTaskEventScopeGuard(jdbc);
++        jdbc.execute("CREATE TABLE task_assignments (task_id uuid, attempt_id uuid, agent_id uuid, phase text, released_at timestamptz)");
++        jdbc.execute("CREATE TABLE task_attempts (id uuid, task_id uuid, lease_id uuid, phase text, lease_expires_at timestamptz)");
++        jdbc.execute("CREATE TABLE agent_leases (id uuid, agent_id uuid, task_attempt_id uuid, expires_at timestamptz, released_at timestamptz, status text)");
++        jdbc.execute("CREATE TABLE resource_scopes (resource_type text, resource_id uuid, tenant_id text, project_id text, team text)");
++    }
++
++    @BeforeEach
++    void seedTenants() {
++        jdbc.execute("TRUNCATE task_assignments, task_attempts, agent_leases, resource_scopes");
++        insertExecution(TASK_A, ATTEMPT_A, LEASE_A, AGENT_A, "tenant-a", "project-a", "team-a");
++        insertExecution(TASK_B, ATTEMPT_B, LEASE_B, AGENT_B, "tenant-b", "project-b", "team-b");
++    }
++
++    @Test
++    void acceptsOnlyLiveAttemptAndLeaseOwnedByTheAgentInTheSameScope() {
++        assertThat(run(TASK_A, ATTEMPT_A, LEASE_A, AGENT_A)).isTrue();
++        assertThat(run(TASK_B, ATTEMPT_B, LEASE_B, AGENT_A)).isFalse();
++        assertThat(run(TASK_A, ATTEMPT_B, LEASE_B, AGENT_B)).isFalse();
++        assertThat(run(TASK_A, ATTEMPT_A, LEASE_B, AGENT_A)).isFalse();
++    }
++
++    @Test
++    void rejectsExpiredOrReleasedExecutionAndDoesNotProjectTheEvent() {
++        jdbc.update("UPDATE agent_leases SET expires_at = now() - interval '1 second' WHERE id = ?", LEASE_A);
++        assertThat(run(TASK_A, ATTEMPT_A, LEASE_A, AGENT_A)).isFalse();
++        jdbc.update("UPDATE agent_leases SET expires_at = now() + interval '1 hour', released_at = now() WHERE id = ?",
++                LEASE_A);
++        assertThat(run(TASK_A, ATTEMPT_A, LEASE_A, AGENT_A)).isFalse();
++    }
++
++    @Test
++    void rejectsCrossTenantTaskEvenWhenAttemptAndLeaseAreInternallyConsistent() {
++        jdbc.update("UPDATE resource_scopes SET tenant_id = 'tenant-b', project_id = 'project-b', team = 'team-b' "
++                + "WHERE resource_type = 'TASK' AND resource_id = ?", TASK_A);
++        assertThat(run(TASK_A, ATTEMPT_A, LEASE_A, AGENT_A)).isFalse();
++    }
++
++    @Test
++    void taskEventAdapterProjectsOnlyInsideTheDatabaseValidatedActiveScope() {
++        TaskExecutionObservationPort observations = mock(TaskExecutionObservationPort.class);
++        ControlPlaneExecutionEventAdapter adapter = new ControlPlaneExecutionEventAdapter(
++                mock(ExecutionEventService.class), ModelCallAuditRecorder.noop(), observations, guard);
++        TaskEventReportCommand command = new TaskEventReportCommand(UUID.randomUUID(), ATTEMPT_A, LEASE_A,
++                Instant.now(), AGENT_A.toString(), "tool.started", "{}", 1, "correlation");
++
++        transactions.execute(status -> {
++            adapter.taskEventReport(TASK_B, command);
++            adapter.taskEventReport(TASK_A, command);
++            return null;
++        });
++
++        verify(observations, never()).observed(eq(TASK_B), any(), any(), any(), any(), any(), any());
++        verify(observations).observed(eq(TASK_A), eq(ATTEMPT_A), eq(command.eventId()), eq(command.occurredAt()),
++                eq(command.correlationId()), eq(command.eventType()), eq(command.payloadJson()));
++    }
++
++    private static boolean run(UUID taskId, UUID attemptId, UUID leaseId, UUID agentId) {
++        TaskEventReportCommand command = new TaskEventReportCommand(UUID.randomUUID(), attemptId, leaseId,
++                Instant.now(), agentId.toString(), "tool.started", "{}", 1, "correlation");
++        boolean[] projected = {false};
++        boolean accepted = transactions.execute(status -> guard.runIfActive(taskId, command,
++                () -> projected[0] = true));
++        assertThat(projected[0]).isEqualTo(accepted);
++        return accepted;
++    }
++
++    private static void insertExecution(UUID task, UUID attempt, UUID lease, UUID agent, String tenant,
++            String project, String team) {
++        jdbc.update("INSERT INTO task_assignments VALUES (?, ?, ?, 'RUNNING', NULL)", task, attempt, agent);
++        jdbc.update("INSERT INTO task_attempts VALUES (?, ?, ?, 'RUNNING', now() + interval '1 hour')",
++                attempt, task, lease);
++        jdbc.update("INSERT INTO agent_leases VALUES (?, ?, ?, now() + interval '1 hour', NULL, 'ACTIVE')",
++                lease, agent, attempt);
++        jdbc.update("INSERT INTO resource_scopes VALUES ('WORKER', ?, ?, ?, ?)", agent, tenant, project, team);
++        jdbc.update("INSERT INTO resource_scopes VALUES ('TASK', ?, ?, ?, ?)", task, tenant, project, team);
++    }
++
++    private static DataSource dataSource() {
++        PGSimpleDataSource dataSource = new PGSimpleDataSource();
++        dataSource.setURL(POSTGRES.getJdbcUrl());
++        dataSource.setUser(POSTGRES.getUsername());
++        dataSource.setPassword(POSTGRES.getPassword());
++        return dataSource;
++    }
++}
+diff --git a/deploy/docker/control-plane.Dockerfile b/deploy/docker/control-plane.Dockerfile
+index 66e64ff..4981640 100644
+--- a/deploy/docker/control-plane.Dockerfile
++++ b/deploy/docker/control-plane.Dockerfile
+@@ -1,13 +1,13 @@
+ # Java bytecode is platform independent; compile on BUILDPLATFORM and keep
+ # only the runtime image on TARGETPLATFORM.
+-FROM --platform=$BUILDPLATFORM maven:3.9.16-eclipse-temurin-21 AS build
++FROM --platform=$BUILDPLATFORM dockerproxy.net/library/maven@sha256:99e61abcff91a9b1333463bd8451fb18495d6eba9250ac66a338b518f8278320 AS build
+ WORKDIR /workspace
+ COPY deploy/docker/maven-settings.xml /root/.m2/settings.xml
+ COPY . .
+ RUN mvn -q -pl control-plane -am -DskipTests install
+ RUN mvn -q -pl control-plane -DskipTests package spring-boot:repackage
+ 
+-FROM eclipse-temurin:21-jre
++FROM dockerproxy.net/library/eclipse-temurin@sha256:0b99b3376fbb50dbf9c0af8535fdd5b8eb0d3fdfc8b1e4967f383b6919f6901a
+ WORKDIR /app
+ COPY --from=build /workspace/control-plane/target/agentteams-control-plane-0.1.0-SNAPSHOT.jar /app/app.jar
+ USER 10001

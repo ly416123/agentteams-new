@@ -73,3 +73,11 @@ Control Plane observation adapter 也缺少跨 Tenant Task ID + 任意 Run/Attem
   此异步写入边界。按仓库边界，本轮只在 `agentteams-new` 记录并门禁，不修改
   `agentteams-java`；解除阻断需要换用已修复且经固定镜像负向测试验证的上游版本，或
   将该观测处理路径迁入新项目并纳入新的执行身份授权边界。
+
+## `agentteams-new` 派生 Control Plane 加固进展（2026-11-06）
+
+没有修改 `agentteams-java` 工作树。`agentteams-new` 新增固定补丁 `deploy/compose/patches/control-plane-v0.1.5-task-event-scope.patch`，由 `deploy/compose/build-control-plane-hardening.py` 从 v0.1.5 源码 commit `0156f2c1fecdc868cb4a0f4f13fb068bb4162834` 构建派生镜像。补丁在 Control Plane 的 TASK_EVENT 观测适配器前加入数据库守卫：联合检查 Assignment、Attempt、Lease、Agent 及 WORKER/TASK Tenant/Project/Team scope；只接受仍有效的状态，并在同一事务中对关系行加共享锁，随后执行既有 best-effort 观测投影。失配事件不会调用观测投影；数据库故障继续向消费者传播，避免将基础设施错误当成授权拒绝。
+
+构建脚本执行两个必需测试套件：事件适配器单测 3/3；PostgreSQL 集成测试 4/4、0 skipped。PostgreSQL 用例覆盖有效同 scope Attempt、跨 Tenant Task、Attempt/Lease/Agent 不匹配、过期或已释放 Lease，并将真实 JDBC 守卫接入适配器，确认跨 Tenant 事件不触发投影而有效同 Tenant 事件会触发。补丁同时把上游 Control Plane Dockerfile 的 Maven/JRE 基础镜像固定到 Docker proxy 镜像 digest；派生镜像标签记录上游 commit `0156f2c1fecdc868cb4a0f4f13fb068bb4162834` 与补丁 SHA-256 `29fe4dd56ae4c8ac714e9b5c9b8d7805d01081edaa7a25777f127ecf7515115a`。`self-hosted-small` 配置门禁只接受这个固定派生镜像，启动脚本会先构建或复用本地校验标签匹配的镜像；`local-dev` 零 Worker POC 仍可使用原固定镜像。
+
+该派生镜像已在 `agentteams-new-validation` Compose POC 替换 Control Plane 容器，复用原 PostgreSQL/NATS 数据，`/actuator/health` 返回 `UP`，容器运行且无重启。此运行态验证只证明新镜像能连接现有 v121 数据库和启动；**尚未**通过真实 Gateway→NATS→Control Plane 事件链发送跨 Tenant 事件，也未对数据库 Run、Process Event、Webhook delivery 做端到端前后行数断言。因而修复进入可构建、可运行状态，但多租户任务启用门槛仍需完成这项负向端到端验收及真实 HTTPS OIDC/A-B Tenant 请求。

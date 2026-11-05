@@ -40,6 +40,15 @@ if [ "$deployment_mode" != "local-dev" ] && [ "$api_auth_enabled" != "true" ]; t
   echo "API_AUTH_ENABLED=true is required outside local-dev" >&2
   exit 2
 fi
+if [ "$deployment_mode" = "self-hosted-small" ]; then
+  control_plane_source_build=$(value CONTROL_PLANE_BUILD_FROM_SOURCE)
+  control_plane_image=$(value CONTROL_PLANE_IMAGE)
+  if [ "$control_plane_source_build" != "true" ] \
+      || [ "$control_plane_image" != "agentteams-new/control-plane:v0.1.5-task-event-scope-guard-0156f2c" ]; then
+    echo "self-hosted-small requires the pinned TASK_EVENT-hardened Control Plane source build" >&2
+    exit 2
+  fi
+fi
 if [ "$replicas" -gt 0 ]; then
   enrollment_port=$(value ENROLLMENT_PORT)
   enrollment_port=${enrollment_port:-8090}
@@ -104,6 +113,12 @@ fi
 
 for key in CONTROL_PLANE_IMAGE GATEWAY_IMAGE WORKER_IMAGE; do
   image=$(value "$key")
+  if [ "$key" = "CONTROL_PLANE_IMAGE" ] \
+      && [ "$deployment_mode" = "self-hosted-small" ] \
+      && [ "$(value CONTROL_PLANE_BUILD_FROM_SOURCE)" = "true" ] \
+      && [ "$image" = "agentteams-new/control-plane:v0.1.5-task-event-scope-guard-0156f2c" ]; then
+    continue
+  fi
   case "$image" in ghcr.io/ly416123/*@sha256:*) ;; *) echo "$key must reference ghcr.io/ly416123 by digest" >&2; exit 2 ;; esac
   digest=${image##*@sha256:}
   if [ "$image" = "$digest" ] || [ "${#digest}" -ne 64 ]; then

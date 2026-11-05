@@ -20,6 +20,7 @@ class ComposeFixedWorkerCapacityTest(unittest.TestCase):
         provider_secret_mode: int = 0o600,
         expected_error: str | None = None,
         project_name: str | None = None,
+        deployment_mode: str = "local-dev",
     ) -> list[str]:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
@@ -39,6 +40,7 @@ class ComposeFixedWorkerCapacityTest(unittest.TestCase):
             (provider_root / "tenant-a/project-a/team-a").chmod(0o700)
             provider_file.chmod(provider_secret_mode)
             values.update({
+                "DEPLOYMENT_MODE": deployment_mode,
                 "API_AUTH_ENABLED": "true",
                 "OIDC_ISSUER_URI": "https://id.example.test/issuer",
                 "OIDC_JWK_SET_URI": "https://id.example.test/keys",
@@ -52,6 +54,11 @@ class ComposeFixedWorkerCapacityTest(unittest.TestCase):
                 "PROVIDER_CREDENTIALS_DIR": str(provider_root),
                 "WORKER_REPLICAS": str(replicas),
             })
+            if deployment_mode == "self-hosted-small":
+                values["CONTROL_PLANE_BUILD_FROM_SOURCE"] = "true"
+                values["CONTROL_PLANE_IMAGE"] = (
+                    "agentteams-new/control-plane:v0.1.5-task-event-scope-guard-0156f2c"
+                )
 
             for slot in range(1, replicas + 1):
                 slot_proxy_token = temp / f"worker-{slot}.model-proxy-token"
@@ -72,13 +79,29 @@ class ComposeFixedWorkerCapacityTest(unittest.TestCase):
             mock_bin = temp / "bin"
             mock_bin.mkdir()
             call_log = temp / "docker-call.txt"
+            call_order_log = temp / "call-order.txt"
             docker = mock_bin / "docker"
-            docker.write_text("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$DOCKER_CALL_LOG\"\n")
+            docker.write_text(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$DOCKER_CALL_LOG\"\n"
+                "printf 'docker\\n' >> \"$CALL_ORDER_LOG\"\n"
+            )
             docker.chmod(0o700)
+            if deployment_mode == "self-hosted-small":
+                python = mock_bin / "python3"
+                python.write_text(
+                    "#!/bin/sh\n"
+                    "if [ \"$1\" = \"-\" ]; then\n"
+                    "  sed -n 's/^CONTROL_PLANE_IMAGE=//p' \"$2\" | tail -1\n"
+                    "else\n"
+                    "  printf 'builder\\n' >> \"$CALL_ORDER_LOG\"\n"
+                    "fi\n"
+                )
+                python.chmod(0o700)
 
             environment = os.environ.copy()
             environment["PATH"] = f"{mock_bin}:{environment['PATH']}"
             environment["DOCKER_CALL_LOG"] = str(call_log)
+            environment["CALL_ORDER_LOG"] = str(call_order_log)
             if project_name is not None:
                 environment["COMPOSE_PROJECT_NAME"] = project_name
             result = subprocess.run(
@@ -95,6 +118,8 @@ class ComposeFixedWorkerCapacityTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             calls = call_log.read_text().splitlines()
             self.assertEqual(len(calls), 1, calls)
+            if deployment_mode == "self-hosted-small":
+                self.assertEqual(call_order_log.read_text().splitlines(), ["builder", "docker"])
             return shlex.split(calls[0])
 
     @staticmethod
@@ -114,6 +139,13 @@ class ComposeFixedWorkerCapacityTest(unittest.TestCase):
     def test_can_target_an_isolated_restored_compose_project(self) -> None:
         args = self.invoke_startup(0, project_name="agentteams-restore")
         self.assertEqual(args[1:3], ["-p", "agentteams-restore"])
+
+    def test_builds_hardened_control_plane_before_self_hosted_startup(self) -> None:
+        args = self.invoke_startup(0, deployment_mode="self-hosted-small")
+        self.assertEqual(
+            self.services_after_up(args),
+            ["postgres", "nats", "nats-bootstrap", "control-plane", "gateway"],
+        )
 
     def test_starts_exactly_the_configured_worker_slots(self) -> None:
         args = self.invoke_startup(2)

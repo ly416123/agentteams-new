@@ -138,6 +138,11 @@ jobs:
             verification.test_fixed_capacity_estimator \
             verification.test_compose_state_recovery -v
 
+      - name: Build and test the TASK_EVENT-hardened Control Plane
+        run: python3 deploy/compose/build-control-plane-hardening.py
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Build Credential Proxy container
         run: docker build --secret id=maven_settings,src="$HOME/.m2/settings.xml" --tag agentteams-credential-proxy:ci --file credential-proxy/Dockerfile .
 
