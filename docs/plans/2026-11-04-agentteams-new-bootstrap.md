@@ -82,6 +82,8 @@
 
 **批次 2A 固定 Control Plane API/scope 首轮清单（2026-11-05）：** 从 GitHub tag `v0.1.5` 对应固定源码 commit `0156f2c1fecdc868cb4a0f4f13fb068bb4162834` 只读列出主要 API Controller 路由族、资源表、Outbox/NATS 与后台作业类别，见 [v0.1.5 API 与 scope 闭环盘点](../audits/2026-11-05-v015-api-scope-closure-inventory.md)。首轮发现 HTTP 入口覆盖 Task lifecycle/execution/Event、Artifact/File/Result、Subtask、Scheduled Task、Team、Conversation/Memory、MCP、Evaluation/Quality/Webhook、Organization/Management、Sandbox 和内部服务接口；异步边界包括 Outbox Relay、NATS execution consumer、recovery/checkpoint、scheduled/deployment/quality 等作业。源码可见部分 Controller 直接调用 Principal scope guard，其他路由可能在 Service/Repository/过滤器或内部身份层授权；未追完调用链和负向测试，因此不将“Controller 无直接调用”判成漏洞或已通过。该审计只完成 2A 的第一轮范围列举，不构成运行时隔离证明。旧仓库当前本机 checkout 与该 tag 不同且含用户未提交改动；本轮未写入或切换旧仓库。
 
+**批次 2A scope 闭环跟踪更新（2026-11-05）：** 后续只读追踪补入 Conversation/Message、Memory governance、Artifact/File、Task Event、NATS execution/ConfigApplied、Scheduled Task、Team、MCP、组织管理、Audit/Usage/Webhook 与内部服务主要边界。确认 Task Event 查询在 SQL 中结合 `resource_scopes`、Tenant/Project/Team 与 active membership；execution events 由 Task/Attempt/Lease/Agent 关系校验；ConfigApplied 按 binding/Agent/snapshot/version/apply record 关联；Conversation/Memory 以 `ExecutionContext` 做服务级过滤。固定 tag 迁移目录未发现业务表 RLS policy，scope 存储混合直接租户列、`resource_scopes` 和仅父 ID 三类；业务访问目前靠应用层授权。完整证据与剩余逐方法/测试缺口见上方审计文档。本阶段只是源码调用链闭环的推进，尚未实现或完成运行时 A/B Tenant 端到端隔离验收。
+
 ## 批次 1：无 Kubernetes 固定容量 Compose POC
 
 1. 先从旧仓库构建并发布 Control Plane、Gateway、Worker 的固定版本 OCI 镜像；记录镜像 digest 和源 commit。
@@ -96,13 +98,14 @@
 
 ## 批次 2：租户与会话隔离
 
-1. 以[多租户与会话隔离验收矩阵](../specs/2026-11-05-tenant-session-isolation-matrix.md)和[v0.1.5 API 与 scope 闭环盘点](../audits/2026-11-05-v015-api-scope-closure-inventory.md)为资源基线，逐资源族补全真实 Controller → Service → Repository → 表/事件消费者调用链；再定义新路径不可变 `ExecutionContext` 的 protobuf 字段、签发方、验证方、版本及过期规则。首轮路由列举已完成，授权链与负向验收仍未完成；scope 不由 Worker/客户端自行选择。
-2. 先建立按 Task、Attempt、Conversation、Memory、Artifact、MCP binding、workspace 和后台 Job 划分的 scope 矩阵，统一 scope-aware 数据访问入口；跨租户 ID 猜测、伪造上下文、无 scope 的后台操作默认拒绝。
-3. 实现 Attempt 独立会话状态、目录、缓存键和 MCP 客户端生命周期；完成/取消/失败/租约过期均执行清理。
-4. [部分完成] `worker_enrollment` 的 `agents`、`agent_sessions` 已采用独立非绕过 RLS 角色和事务局部 scope；应用层 scope 校验保持强制。其余 Task、Attempt、Conversation/Memory、Artifact/File、Tool/MCP、Outbox/Audit 表需先完成真实 schema/调用链盘点，再逐表加入策略和负向验收。
-5. 实现租户级并发、速率和模型预算；支持共享池与专属固定池路由，高敏租户不能落入共享池。
+1. [进行中] 以[多租户与会话隔离验收矩阵](../specs/2026-11-05-tenant-session-isolation-matrix.md)和[v0.1.5 API 与 scope 闭环盘点](../audits/2026-11-05-v015-api-scope-closure-inventory.md)为基线，补完剩余 API/后台 Job 的逐方法调用图、真实表和负向测试证据。已追 Task/Attempt 主路径、Conversation/Memory、Artifact/File、Task Event、NATS 主执行事件、Scheduled Task、Team/MCP 与管理面主要路径；Task Event/ConfigApplied 的核心父子验证已看到，尚缺 TASK_EVENT/配置 ACK 伪造关联、recovery/checkpoint、Quality/Outbox、Skill/Audit/Usage 汇总和所有内部接口的集成负向验收。
+2. 固化新路径不可变 `ExecutionContext` 的 protobuf 字段、签发方、验证方、版本、audience 和过期规则；身份始终由已验证 Principal 或 Enrollment 记录派生，Worker/客户端不能自选 Tenant/Project/Team。以 Task、Attempt、Conversation、Memory、Artifact、MCP、workspace 和后台 Job 建立 scope 真源、父子关系、拒绝行为及状态清理矩阵。
+3. 对复用的 v0.1.5 固定镜像，先在隔离 Compose 环境跑受认证的 Tenant A/B 负向验收：Task/Timeline/Result、Conversation/Memory、Artifact/File 下载、Team/MCP 与审计查询；同时测试 membership 撤销及内部路由不可从 Worker 网络访问。该门槛依赖可验证的 OIDC issuer/audience/claims；当前 L5 旧 Keycloak issuer/JWKS 为 HTTP，暂不能作为该验收 IdP。
+4. 实现 Attempt 独立会话状态、workspace 目录、缓存键与 MCP 客户端生命周期；新 Attempt 必须使用新隔离单元，完成/取消/失败/租约过期/进程退出均回收；固定 Worker 连续运行不同 Tenant/Attempt 的残留读取必须拒绝。先以现有 JDBC/RLS Enrollment 子集、scope-aware代理和目录隔离证明新仓库自有边界，不把旧 Worker 的 AgentScope 实现证据当作 POC 组合已通过。
+5. 数据库采用渐进式纵深防御，而不是在旧 schema 上一次性开启全表 RLS：第一阶段拆 Control Plane migration 与运行角色，应用角色必须非 superuser、非表 owner、无 `BYPASSRLS`；第二阶段在统一事务过滤器中仅从受验证身份设置事务局部 scope；第三阶段挑选具有稳定 Tenant 列/父子键的 Enrollment、代理凭据、Conversation、MCP/Artifact 等资源族逐表加 RLS 和 `WITH CHECK` 负向测试。Task/Agent/Team 等依赖 `resource_scopes` 的资源先建立不可伪造父子复合关系，再决定 RLS policy；后台全局作业使用明确系统角色和逐行父资源回查，不以空 scope 表示全租户。应用层查询检查始终保留。
+6. 实现租户级并发、速率和模型预算；支持共享池与专属固定池路由，高敏租户不能落入共享池。容量预估用于决定固定 Worker 槽位数，不据此动态创建/扩缩 Worker；租户间调度仍需公平队列、配额和专属槽位策略。
 
-**门槛：** 先完成真实 Worker Attempt、注册/心跳、drain、租约过期恢复和重启重连。随后验证同一 Tenant/Project/Team 内连续复用 Worker 不残留会话/文件/工具状态，并由不同固定 Worker 并发处理 A/B Tenant；跨 Tenant Assignment 必须拒绝。越权和伪造 scope 均拒绝。通过前部署档位必须明确限制为单租户/受信 Worker 试验，不对外宣称强隔离。
+**门槛：** 先完成真实 Worker Attempt、注册/心跳、drain、租约过期恢复和重启重连；在 Compose 上验证同一固定 Worker 连续执行不同 Attempt 无会话/文件/工具残留，Tenant A/B 使用不同固定 Worker 并发运行且 ID 猜测、跨租户 Assignment、伪造/过期 scope 均拒绝；重启后 Outbox/命令/ACK 与租约恢复正确。API OIDC 必须从可信 HTTPS issuer 验签并实时检查 membership。未完成运行时隔离和身份验收前，档位明确限制为单租户/受信 Worker 试验，不宣称多租户强隔离；业务表 RLS 作为按资源族推进的纵深防御，不能替代先行应用授权验收。
 
 ## 批次 3：凭证源与凭证代理
 
