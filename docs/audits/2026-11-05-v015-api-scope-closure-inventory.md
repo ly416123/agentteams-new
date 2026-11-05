@@ -22,13 +22,14 @@ Controller 源码中能直接看到 `PrincipalContext`、`ProjectApiAuthorizatio
 | Task Event 流 | `/api/v1/tasks/{taskId}/events` | Controller 未见直接调用；`TaskService.events()` 先调用 `get()`，再向 Repository 传入已认证 Principal | 代码路径有 Task scope 过滤；需补充/确认事件路由的跨 Tenant 负向验收与重放边界 |
 | Artifact、Task File 与结果审查 | `/api/v1/tasks/{taskId}/attempts/{attemptId}/artifacts/**`、`/api/v1/tasks/{taskId}/files/**`、`/api/v1/tasks/{id}/results/**`、`/api/v1/artifacts` | Artifact/File 可见父资源检查；结果服务检查 Task scope | 已追踪父 Task/Attempt 的主要调用链；仍需验证每个读写端点、租户冗余列一致性、URL 签发与对象 key 猜测 |
 | Scheduled Task | `/api/v1/scheduled-tasks/**` | Controller 未见直接调用 | 待追踪创建者/Project scope、派生 Task 与后台触发身份 |
-| Team、membership、policy、revision 与 deployment | `/api/v1/teams/**` | Controller 未见直接调用 | 待逐路由核验管理者角色、成员授权、revision 与 deployment 的 Team scope |
+| Team、membership、policy、revision 与 deployment | `/api/v1/teams/**` | Controller 部分检查项目 scope；Service 使用 `resource_scopes` 检查 Team/Worker 可见性 | 已追踪主要 service 边界；需核验管理角色、未认证开发模式及缺 scope 配置时的 fail-closed |
 | Conversation 与 Memory | Conversation 由 Task/Timeline 服务访问；`/api/v1/memory/**` | Conversation Service 显式接收 `ExecutionContext`；Memory Controller 从 Principal 解析上下文 | 已追踪核心服务/查询链；仍需核对所有调用入口、检索路径与后台写入 |
-| MCP Server、Connection 与 Route | `/api/v1/mcp-servers/**`、`/api/v1/mcp/connections/**` | Controller 未见直接调用 | 待区分项目级配置管理与 Attempt 级调用；核对凭据访问、server/tool allowlist 与 Route 心跳身份 |
+| MCP Server、Connection 与 Route | `/api/v1/mcp-servers/**`、`/api/v1/mcp/connections/**` | Server 通过 `resource_scopes`；Connection 使用 `ExecutionContext` ownership；Route 要求上下文 | 已追踪管理主路径；需核对 discovery/probe 的 outbound 与凭据边界、Attempt 调用授权和 Route 租户绑定 |
 | Evaluation、Artifact Quality 与 Webhook | `/api/v1/evaluations/**`、`/api/v1/artifact-quality/**`、`/api/v1/webhooks/**` | Controller 未见直接调用 | 待确认数据归属、导出可见范围、投递/查询过滤及租户配置授权 |
 | Organization / Tenant 管理 | `/api/v1/management/organizations/**`、`tenants/**`、`memberships/**`、`integrations/**`、`users/**`、`authorizations/**` | 管理授权另有入口 | 待分别验证 Platform Admin、Organization Admin、Tenant Admin 与普通 Project member 的边界 |
 | 配置与 Matrix Room binding | `/api/v1/config/**`、Matrix binding 回调 | Controller 直接 scope 调用不完整 | 待判明 public/runtime 配置与租户配置，验证 Matrix room 与 Tenant/Project 映射不可伪造 |
 | Sandbox 与内部服务接口 | `/api/v1/sandboxes/**`、`/internal/v1/artifacts/**`、`/internal/v1/token-ledger/**`、`/internal/v1/task-state-consistency/**` | Sandbox 有直接调用；其余为内部入口 | 待验证网络/服务身份、内部路由是否可从宿主公开入口访问、后台任务的显式 scope 与最小权限 |
+| Skills、审计、用量与配额 | `/api/v1/skills/**`、`/api/v1/audit-events`、`/api/v1/usage/**`、`/api/v1/projects/**/quota` | Skill 通过可见性 scope；Project/Quota 有项目授权服务；Audit/Usage 需在服务层按 principal 过滤 | 待逐读写、导出和汇总查询确认 scope 聚合与最小权限 |
 
 入口名称来自固定 tag 中的 `control-plane/.../api`、`artifact`、`memory`、`mcp`、`organization`、`sandbox`、`token`、`quality` 与 `task` 源码目录。上表是路由族清单，不代替逐方法的调用图与负向测试。
 
@@ -72,10 +73,18 @@ Controller 源码中能直接看到 `PrincipalContext`、`ProjectApiAuthorizatio
 - Scheduled Task HTTP 创建/列表/读取/暂停/恢复/触发等入口从当前 Principal 校验 tenant/project；配置 Repository 的查询与更新按 organization/tenant/project 条件过滤。后台 `ScheduledTaskScheduler` 通过单活 Scheduler lease 领取全局 due schedule，再从每条 schedule 的持久化 scope 构造受限 Principal，写入 Task spec 并调用正常 `TaskService.create`，run ID/Task ID 通过 schedule occurrence 做幂等关联。该后台角色是系统调度身份，须单独测试伪造/损坏 schedule scope、跨 Tenant 查询输入、lease 并发和重复触发恢复。
 - Task recovery checkpoint/state repository 多按 Task ID 查询，授权边界依赖触发者先通过 Task scope，或后台恢复器仅基于数据库事实执行。尚未确认所有恢复/一致性/质量消费者都在执行写入前验证父 Task/Attempt scope；这些消费者及其幂等/重试边界仍是 2A 未闭环项。
 
+## 已追踪的 Team、MCP 与管理/内部边界
+
+- `TeamController` 对带 Project 的操作委托 `TeamService.requireProjectScope`；`TeamService` 在资源创建时把 `TEAM` scope 绑定到当前 Principal，读取和修改再通过 `resource_scopes.requireVisible("TEAM", id)`，Worker 成员可见性也单独检查 `WORKER` scope。源码还为 `api.enabled=false` 的本地/开发模式保留无 Principal 路径，所以该模式不能拿来证明多租户隔离；生产 Compose 必须开启认证并验证缺失 scope repository 时拒绝受保护操作。成员角色与 Team 管理动作仍需逐项映射并补跨 Project/Tenant 负向测试。
+- `McpServerService` 对创建的 Server 绑定 `MCP_SERVER` scope，列表/读取按 scope 可见性过滤；它与 tenant-owned MCP Connection 不是同一权限模型。`McpConnectionController` 的管理读写从 Principal 解析 `ExecutionContext`；Service 校验 Connection 的 organization/tenant 和 connector ID 前缀归属与上下文相符，查询带上下文。Route 列表、注册和心跳要求上下文。Discovery、连接探测、凭据引用解析及 Agent/Attempt 运行时调用仍需追出单独的网络与密钥边界。
+- `ProjectController` 委托 `ProjectAuthorizationService` 与 invitation service；组织管理服务按 Platform Admin、Organization Admin 与显式 permission 检查入口。需要用普通项目成员、Tenant Admin、Organization Admin、Platform Admin 四类身份建立矩阵，不能只用 Controller route coverage 测试代替角色验证。
+- Internal Quota、Token Ledger、Task State Consistency 等端点使用 `X-AgentTeams-Internal-Token`，其中 Task State Consistency 使用常量时间比较；该共享 bearer token 不是 Tenant 身份。部署上必须通过私有网络入口隔离、各服务独立轮换凭据、严禁 worker-facing ingress 暴露这些路由，并在应用层验证请求中的 Task/Run scope 与真实父记录一致。
+- Skill 列表/读写通过 `SKILL` resource scope 可见性过滤；创建时允许全局或 Tenant/Organization ownership，须继续确认创建者权限、发布/扫描审批、包下载 URL 与后台扫描任务的 Tenant 归属。Audit、Usage 和 quota 的查询/汇总也需要确认先绑定 caller 可见项目集合，再做聚合，避免通过计数或筛选侧信道泄露其他 Tenant 信息。
+
 ## 证据级别与后续门槛
 
 - **源码发现：** v0.1.5 有 Project membership、`resource_scopes` 和应用层授权路径；`tasks` 等核心实体并非都直接存 Tenant/Project/Team 列。已有 Enrollment RLS 仅保护 `agents` 与 `agent_sessions` 的受限路径。
-- **尚未证明：** 上表所有 Controller 与服务调用链均无越权；MCP、Team 与管理 API 的所有写入/读取均执行 Tenant/Project/Team 检查；NATS TASK_EVENT/CONFIG_APPLIED 与所有恢复/一致性/质量消费者对篡改关联 ID 一律拒绝；固定 Compose 中 A/B Tenant 并发与同 Worker 连续 Attempt 的 Conversation/Workspace/Tool/Artifact 无残留；全业务表 RLS 可强制执行。
-- **下一步 2A：** Conversation/Memory、Artifact/File、NATS 主执行事件和 Scheduled Task 主路径已追踪，但尚未形成逐方法仓储/迁移/测试闭环。继续完成 Task Event/Config event、恢复与其他后台消费者，再审 MCP、Team/Management/Internal；为每族记录有效身份、scope 来源、拒绝响应、现有测试和缺失测试。
+- **尚未证明：** 上表所有 Controller 与服务调用链均无越权；MCP、Team、Skill、Audit/Usage 和管理 API 的所有读写、汇总及下载路径均执行正确 Tenant/Project/Team 检查；NATS TASK_EVENT/CONFIG_APPLIED 与所有恢复/一致性/质量消费者对篡改关联 ID 一律拒绝；固定 Compose 中 A/B Tenant 并发与同 Worker 连续 Attempt 的 Conversation/Workspace/Tool/Artifact 无残留；全业务表 RLS 可强制执行。
+- **下一步 2A：** Conversation/Memory、Artifact/File、NATS 主执行事件、Scheduled Task、Team/MCP 与组织管理主路径已追踪，但尚未形成逐方法仓储/迁移/测试闭环。继续完成 Task Event/Config event、恢复/质量/其他后台消费者、Skill/Audit/Usage 和内部端点的父级校验，再按身份矩阵核验角色；为每族记录有效身份、scope 来源、拒绝响应、现有测试和缺失测试。
 - **2A 出口条件：** 所有可访问 API 与异步消费者都映射到真实表和 scope 来源；每项未授权路径有可复现负向用例或明确的修复任务；任何尚未被证明的共享 Control Plane 能力继续标记为未验收。
 - **环境边界：** L5 的 v0.1.5 IdP issuer/JWKS 是 HTTP，当前只读 RBAC 不能确认 HTTPS Ingress；不能用 L5 旧 Worker Secret 替代新项目 Provider 凭据。上述源码盘点不宣称运行时多租户验收。
