@@ -319,6 +319,29 @@ class JdbcActiveAttemptRepositoryPostgresTest {
         assertThat(fixture.upstreamCalls().get()).isZero();
     }
 
+    @Test
+    void httpRequestRejectsAmbiguousConcurrentAttemptsBeforeCallingProvider() throws Exception {
+        insertScope("WORKER", AGENT, "tenant-a", "project-a", "team-a");
+        insertScope("TASK", TASK, "tenant-a", "project-a", "team-a");
+        UUID secondTask = id("88000000-0000-0000-0000-000000000052");
+        insertScope("TASK", secondTask, "tenant-a", "project-a", "team-a");
+        insertProxyCredential();
+        insertActive(AGENT, TASK, ATTEMPT, LEASE);
+        insertActive(AGENT, secondTask, id("88000000-0000-0000-0000-000000000053"),
+                id("88000000-0000-0000-0000-000000000054"));
+        Path providerToken = createProviderCredential("tenant-a", "project-a", "team-a", "provider-token-a");
+        HttpProxyFixture fixture = startHttpProxy(providerToken);
+
+        fixture.mvc().perform(post("/v1/responses")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .header("Authorization", "Bearer " + PROXY_TOKEN)
+                        .content("{\"model\":\"gpt-5.6-luna\",\"input\":[]}"))
+                .andExpect(status().isForbidden())
+                .andExpect(content().json("{\"error\":\"model_proxy_request_denied\"}"));
+
+        assertThat(fixture.upstreamCalls().get()).isZero();
+    }
+
     private Path createProviderCredential(String tenant, String project, String team, String value) throws Exception {
         providerCredentialRoot = Files.createTempDirectory("credential-proxy-provider-");
         Path token = providerCredentialRoot.resolve(tenant).resolve(project).resolve(team).resolve("provider-token");
