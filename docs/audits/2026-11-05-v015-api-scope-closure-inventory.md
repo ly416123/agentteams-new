@@ -89,6 +89,17 @@ Controller 源码中能直接看到 `PrincipalContext`、`ProjectApiAuthorizatio
 - `JdbcAuditQueryService` 在有 Principal 时把 audit 查询限定为 Principal 的 tenant/project；Organization/Platform management 权限由 `ManagementAuthorizationService` 单独检查角色。Tenant/Organization 管理数据允许对应管理角色跨 Project 查询，这是有意的管理面权限，必须与普通 Project member 的响应集合做区分验收。
 - Usage Budget Repository 对单租户写读使用 tenant/project 复合条件；周期任务由单活 lease 领取所有 active policy 时，需要确认每个 event 保留 policy 的 Tenant/Project 且告警 delivery 无跨 scope 汇总。Webhook Repository 的订阅查询按 organization/tenant/project 过滤；delivery worker 是系统身份，发送前要以 delivery row 所属订阅/secretRef 做一致性校验和 SSRF 保护。
 
+## 已确认的 Skill 私有包跨 scope 路由缺口
+
+**证据级别：** v0.1.5 发布源码调用链确认；尚未在运行中的 Control Plane 上重放跨 Tenant 请求。
+
+- `SkillController.preparePackageUpload()`、`completePackageUpload()` 与 `downloadPackage()` 直接调用 `SkillPackageStorageService`，没有先调用 `SkillService.getSkill()` 或 `ResourceScopeRepository.requireVisible()`。
+- `SkillPackageStorageService.versionForSkill()` 只按 `versionId` 读取版本并比较路径中的 `skillId` 与 `version.skillId()`；它没有读取 `PrincipalContext`、Tenant/Project membership 或 `SKILL` scope。知道有效 Skill/Version ID 的已认证用户因此可以请求私有包的 presigned upload/download URL 或确认上传。
+- 同一 `SkillService` 的 `getSkill()`、版本列表、publish/review/disable 会执行 Skill scope 检查，因此这是包对象入口与其余 Skill API 授权不一致，不是证明所有 Skill API 均无授权。
+- `SkillControllerTest.preparesAndCompletesPackageUploadWithoutAcceptingCallerStorageKey()` 只验证忽略客户端 storage key 并返回 URL；该测试使用 standalone Controller，没有身份、Tenant A/B 或 scope 拒绝断言。
+
+**影响与处理要求：** 在 v0.1.5 复用路径中，Skill 私有包 upload/complete/download 必须列入跨 Tenant 负向 API 门禁。`agentteams-new` 尚无自己的 Skill Controller，不能把该缺口标记为已修复；应用组件迁移到新仓库时，授权必须在签发任何对象存储 URL 前完成，并验证 A/B Tenant 对已知 Skill/Version ID 的请求均 fail-closed。当前不得把复用 v0.1.5 的整套 API 描述为已满足多租户隔离。
+
 ## 证据级别与后续门槛
 
 - **源码发现：** v0.1.5 有 Project membership、`resource_scopes` 和应用层授权路径；`tasks` 等核心实体并非都直接存 Tenant/Project/Team 列。已有 Enrollment RLS 仅保护 `agents` 与 `agent_sessions` 的受限路径。
