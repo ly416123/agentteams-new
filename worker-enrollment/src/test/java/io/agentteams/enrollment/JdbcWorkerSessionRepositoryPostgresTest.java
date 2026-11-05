@@ -21,6 +21,8 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 class JdbcWorkerSessionRepositoryPostgresTest {
     private static final UUID AGENT_ID = UUID.fromString("66000000-0000-0000-0000-000000000001");
     private static final UUID SESSION_ID = UUID.fromString("66000000-0000-0000-0000-000000000002");
+    private static final UUID OTHER_AGENT_ID = UUID.fromString("66000000-0000-0000-0000-000000000007");
+    private static final UUID OTHER_SESSION_ID = UUID.fromString("66000000-0000-0000-0000-000000000008");
     private static final String TOKEN_HASH = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     @Container
@@ -37,6 +39,7 @@ class JdbcWorkerSessionRepositoryPostgresTest {
         var dataSource = new DriverManagerDataSource(POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword());
         jdbc = new JdbcTemplate(dataSource);
         removeTestRoleIfPresent();
+        jdbc.execute("DROP TABLE IF EXISTS worker_model_proxy_credentials CASCADE");
         jdbc.execute("DROP TABLE IF EXISTS agent_sessions");
         jdbc.execute("DROP TABLE IF EXISTS agents");
         jdbc.execute("DROP TABLE IF EXISTS platform_identities");
@@ -136,17 +139,56 @@ class JdbcWorkerSessionRepositoryPostgresTest {
             assertThat(restrictedRepository.findAgent(AGENT_ID)).isPresent();
             restrictedRepository.insert(new WorkerSessionRepository.WorkerSessionRecord(
                     SESSION_ID, AGENT_ID, TOKEN_HASH, Instant.now().plusSeconds(3600), Instant.now()));
+            restrictedRepository.insertModelProxyCredential(new ModelProxyCredentialRecord(
+                    UUID.fromString("66000000-0000-0000-0000-000000000004"), SESSION_ID, AGENT_ID,
+                    new WorkerScope("tenant-a", "project-a", "team-a"),
+                    "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                    "vault://tenant-a/project-a/chatgpt", Instant.now().plusSeconds(3600), Instant.now()));
             assertThat(restrictedRepository.revoke(AGENT_ID, SESSION_ID, Instant.now())).isTrue();
         });
+        assertThat(jdbc.queryForObject("SELECT token_sha256 FROM worker_model_proxy_credentials WHERE session_id = ?",
+                String.class, SESSION_ID)).isEqualTo(
+                        "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+        assertThat(jdbc.queryForObject("SELECT revoked_at IS NOT NULL FROM worker_model_proxy_credentials WHERE session_id = ?",
+                Boolean.class, SESSION_ID)).isTrue();
         assertThatThrownBy(
                 () -> restrictedJdbc.queryForObject("SELECT count(*) FROM platform_identities", Long.class))
                 .isInstanceOf(org.springframework.dao.DataAccessException.class);
         assertThatThrownBy(
                 () -> restrictedJdbc.queryForObject("SELECT token_sha256 FROM agent_sessions", String.class))
                 .isInstanceOf(org.springframework.dao.DataAccessException.class);
+        assertThatThrownBy(() -> restrictedJdbc.queryForObject(
+                "SELECT token_sha256 FROM worker_model_proxy_credentials", String.class))
+                .isInstanceOf(org.springframework.dao.DataAccessException.class);
         assertThatThrownBy(
                 () -> restrictedJdbc.update("UPDATE agents SET phase = 'TERMINATED' WHERE id = ?", AGENT_ID))
                 .isInstanceOf(org.springframework.dao.DataAccessException.class);
+    }
+
+    @Test
+    void enrollmentRoleCannotIssueModelProxyCredentialOutsideCallerScope() {
+        insertAgent(AGENT_ID, "READY", "{\"scope\":{\"tenant\":\"tenant-a\",\"project\":\"project-a\",\"team\":\"team-a\"}}");
+        insertAgent(OTHER_AGENT_ID, "READY", "{\"scope\":{\"tenant\":\"tenant-b\",\"project\":\"project-b\",\"team\":\"team-b\"}}");
+        repository.insert(new WorkerSessionRepository.WorkerSessionRecord(OTHER_SESSION_ID, OTHER_AGENT_ID,
+                "1111111111111111111111111111111111111111111111111111111111111111",
+                Instant.now().plusSeconds(3600), Instant.now()));
+        grantEnrollmentAgentColumns();
+        grantEnrollmentAgentScopeColumns();
+        grantEnrollmentSessionColumns();
+
+        var restrictedDataSource = new DriverManagerDataSource(
+                POSTGRES.getJdbcUrl(), "worker_enrollment", "enrollment-test-password");
+        JdbcWorkerSessionRepository restrictedRepository = new JdbcWorkerSessionRepository(
+                new JdbcTemplate(restrictedDataSource));
+        TransactionTemplate transaction = new TransactionTemplate(new DataSourceTransactionManager(restrictedDataSource));
+        assertThatThrownBy(() -> transaction.executeWithoutResult(status -> {
+            restrictedRepository.setExecutionScope(new WorkerScope("tenant-a", "project-a", "team-a"));
+            restrictedRepository.insertModelProxyCredential(new ModelProxyCredentialRecord(
+                    UUID.fromString("66000000-0000-0000-0000-000000000009"), OTHER_SESSION_ID, OTHER_AGENT_ID,
+                    new WorkerScope("tenant-b", "project-b", "team-b"),
+                    "2222222222222222222222222222222222222222222222222222222222222222",
+                    "vault://tenant-b/project-b/chatgpt", Instant.now().plusSeconds(3600), Instant.now()));
+        })).isInstanceOf(org.springframework.dao.DataAccessException.class);
     }
 
     @Test
@@ -311,14 +353,20 @@ class JdbcWorkerSessionRepositoryPostgresTest {
         if (Boolean.TRUE.equals(exists)) {
             jdbc.execute("DROP POLICY IF EXISTS worker_enrollment_agents_scope ON agents");
             jdbc.execute("DROP POLICY IF EXISTS worker_enrollment_sessions_scope ON agent_sessions");
+            jdbc.execute("DROP POLICY IF EXISTS worker_enrollment_model_proxy_credentials_insert_scope "
+                    + "ON worker_model_proxy_credentials");
+            jdbc.execute("DROP POLICY IF EXISTS worker_enrollment_model_proxy_credentials_update_scope "
+                    + "ON worker_model_proxy_credentials");
             jdbc.execute("DROP POLICY IF EXISTS worker_enrollment_agent_scopes_scope "
                     + "ON worker_enrollment_agent_scopes");
             jdbc.execute("ALTER TABLE agents DISABLE ROW LEVEL SECURITY");
             jdbc.execute("ALTER TABLE agent_sessions DISABLE ROW LEVEL SECURITY");
+            jdbc.execute("ALTER TABLE worker_model_proxy_credentials DISABLE ROW LEVEL SECURITY");
             jdbc.execute("DROP TRIGGER IF EXISTS worker_enrollment_sync_agent_scope ON agents");
             jdbc.execute("DROP FUNCTION IF EXISTS worker_enrollment_sync_agent_scope()");
             jdbc.execute("DROP OWNED BY worker_enrollment");
             jdbc.execute("DROP ROLE worker_enrollment");
+            jdbc.execute("DROP TABLE IF EXISTS worker_model_proxy_credentials CASCADE");
             jdbc.execute("DROP TABLE IF EXISTS worker_enrollment_agent_scopes");
             jdbc.execute("DROP OWNED BY worker_enrollment_scope_owner");
             jdbc.execute("DROP ROLE worker_enrollment_scope_owner");

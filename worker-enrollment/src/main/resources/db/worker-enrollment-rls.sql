@@ -7,6 +7,31 @@ CREATE TABLE IF NOT EXISTS worker_enrollment_agent_scopes (
     team_id TEXT NOT NULL
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS agent_sessions_id_agent_id_key
+    ON agent_sessions (id, agent_id);
+
+CREATE TABLE IF NOT EXISTS worker_model_proxy_credentials (
+    id UUID PRIMARY KEY,
+    session_id UUID NOT NULL,
+    agent_id UUID NOT NULL,
+    tenant_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    team_id TEXT NOT NULL,
+    token_sha256 CHAR(64) NOT NULL UNIQUE,
+    model_credential_ref TEXT NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    revoked_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL,
+    CONSTRAINT worker_model_proxy_ref_valid CHECK (
+        length(model_credential_ref) BETWEEN 1 AND 256
+        AND length(btrim(model_credential_ref)) = length(model_credential_ref)
+        AND model_credential_ref !~ '[[:cntrl:]]'
+    ),
+    CONSTRAINT worker_model_proxy_session_agent_fk
+        FOREIGN KEY (session_id, agent_id) REFERENCES agent_sessions(id, agent_id) ON DELETE CASCADE,
+    CONSTRAINT worker_model_proxy_session_unique UNIQUE (session_id)
+);
+
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'worker_enrollment_scope_owner') THEN
@@ -76,18 +101,24 @@ ON CONFLICT (agent_id) DO UPDATE SET tenant_id = EXCLUDED.tenant_id,
 ALTER TABLE worker_enrollment_agent_scopes ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agents ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agent_sessions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE worker_model_proxy_credentials ENABLE ROW LEVEL SECURITY;
 
 REVOKE ALL ON TABLE worker_enrollment_agent_scopes FROM worker_enrollment;
 REVOKE ALL ON TABLE agents FROM worker_enrollment;
 REVOKE ALL ON TABLE agent_sessions FROM worker_enrollment;
+REVOKE ALL ON TABLE worker_model_proxy_credentials FROM worker_enrollment;
 
 GRANT SELECT (agent_id, tenant_id, project_id, team_id)
     ON TABLE worker_enrollment_agent_scopes TO worker_enrollment;
 GRANT SELECT (id, phase) ON TABLE agents TO worker_enrollment;
-GRANT SELECT (id, agent_id, revoked_at) ON TABLE agent_sessions TO worker_enrollment;
+GRANT SELECT (id, agent_id, expires_at, revoked_at) ON TABLE agent_sessions TO worker_enrollment;
 GRANT INSERT (id, agent_id, token_sha256, expires_at, revoked_at, created_at)
     ON TABLE agent_sessions TO worker_enrollment;
 GRANT UPDATE (revoked_at) ON TABLE agent_sessions TO worker_enrollment;
+GRANT INSERT (id, session_id, agent_id, tenant_id, project_id, team_id, token_sha256,
+              model_credential_ref, expires_at, created_at)
+    ON TABLE worker_model_proxy_credentials TO worker_enrollment;
+GRANT UPDATE (revoked_at) ON TABLE worker_model_proxy_credentials TO worker_enrollment;
 
 DROP POLICY IF EXISTS worker_enrollment_agent_scopes_scope ON worker_enrollment_agent_scopes;
 CREATE POLICY worker_enrollment_agent_scopes_scope ON worker_enrollment_agent_scopes
@@ -117,3 +148,42 @@ CREATE POLICY worker_enrollment_sessions_scope ON agent_sessions
         SELECT 1 FROM worker_enrollment_agent_scopes scoped
          WHERE scoped.agent_id = agent_sessions.agent_id
     ));
+
+DROP POLICY IF EXISTS worker_enrollment_model_proxy_credentials_insert_scope
+    ON worker_model_proxy_credentials;
+CREATE POLICY worker_enrollment_model_proxy_credentials_insert_scope
+    ON worker_model_proxy_credentials FOR INSERT TO worker_enrollment
+    WITH CHECK (
+        tenant_id = NULLIF(current_setting('agentteams.tenant_id', true), '')
+        AND project_id = NULLIF(current_setting('agentteams.project_id', true), '')
+        AND team_id = NULLIF(current_setting('agentteams.team_id', true), '')
+        AND EXISTS (
+            SELECT 1 FROM worker_enrollment_agent_scopes scoped
+             WHERE scoped.agent_id = worker_model_proxy_credentials.agent_id
+               AND scoped.tenant_id = worker_model_proxy_credentials.tenant_id
+               AND scoped.project_id = worker_model_proxy_credentials.project_id
+               AND scoped.team_id = worker_model_proxy_credentials.team_id
+        )
+        AND EXISTS (
+            SELECT 1 FROM agent_sessions session
+             WHERE session.id = worker_model_proxy_credentials.session_id
+               AND session.agent_id = worker_model_proxy_credentials.agent_id
+               AND session.revoked_at IS NULL
+               AND session.expires_at > statement_timestamp()
+        )
+    );
+
+DROP POLICY IF EXISTS worker_enrollment_model_proxy_credentials_update_scope
+    ON worker_model_proxy_credentials;
+CREATE POLICY worker_enrollment_model_proxy_credentials_update_scope
+    ON worker_model_proxy_credentials FOR UPDATE TO worker_enrollment
+    USING (
+        tenant_id = NULLIF(current_setting('agentteams.tenant_id', true), '')
+        AND project_id = NULLIF(current_setting('agentteams.project_id', true), '')
+        AND team_id = NULLIF(current_setting('agentteams.team_id', true), '')
+    )
+    WITH CHECK (
+        tenant_id = NULLIF(current_setting('agentteams.tenant_id', true), '')
+        AND project_id = NULLIF(current_setting('agentteams.project_id', true), '')
+        AND team_id = NULLIF(current_setting('agentteams.team_id', true), '')
+    );

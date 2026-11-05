@@ -34,8 +34,10 @@ public class WorkerSessionController {
         WorkerScope caller = callerScope(jwt);
         Duration ttl = request == null || request.ttlSeconds() == null
                 ? null : Duration.ofSeconds(request.ttlSeconds());
-        IssuedWorkerSession issued = sessions.issue(agentId, caller, permissions(jwt), ttl);
-        return new IssueSessionResponse(issued.sessionId(), issued.agentId(), issued.accessToken(), issued.expiresAt());
+        IssuedWorkerSession issued = sessions.issue(agentId, caller, permissions(jwt), ttl,
+                request == null ? null : request.modelCredentialRef());
+        return new IssueSessionResponse(issued.sessionId(), issued.agentId(), issued.accessToken(), issued.expiresAt(),
+                issued.modelProxyCredentialId(), issued.modelProxyToken());
     }
 
     @DeleteMapping("/{sessionId}")
@@ -70,7 +72,8 @@ public class WorkerSessionController {
         return text;
     }
 
-    public record IssueSessionRequest(Long ttlSeconds) { }
+    public record IssueSessionRequest(Long ttlSeconds, String modelCredentialRef) { }
 
-    public record IssueSessionResponse(UUID sessionId, UUID agentId, String accessToken, Instant expiresAt) { }
+    public record IssueSessionResponse(UUID sessionId, UUID agentId, String accessToken, Instant expiresAt,
+            UUID modelProxyCredentialId, String modelProxyToken) { }
 }

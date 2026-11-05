@@ -57,7 +57,7 @@ NATS JetStream ──► Agent Gateway ◄─────┘ command persistence
 
 ## 5. 凭证流
 
-Enrollment 只解决 Worker 到 Gateway 的身份凭据，不是模型/MCP 上游凭证代理。短期兼容模式允许受信任 Worker 从容器 Secret 文件读取上游密钥，但不能称为零信任凭证隔离。目标模式由凭证代理验证短期消费令牌，检查租户、项目、Attempt、模型/工具 allowlist、过期和撤销状态，再由代理解析上游密钥并转发。模型与 MCP 分别定义适配协议；代理不可用时 fail-closed，日志/事件/Trace 不记录密钥。
+Enrollment 可为一个 Gateway session 签发单独的模型代理 Token，数据库只存该 Token 的哈希，并绑定 Agent scope、Session 和模型凭证引用；撤销 Gateway session 会同步撤销此 Token。Enrollment 本身不充当模型/MCP 上游代理。短期兼容模式允许受信任 Worker 从容器 Secret 文件读取上游密钥，但不能称为零信任凭证隔离。目标模式由凭证代理验证短期消费令牌，检查租户、项目、Attempt、模型/工具 allowlist、过期和撤销状态，再由代理解析上游密钥并转发。模型与 MCP 分别定义适配协议；代理不可用时 fail-closed，日志/事件/Trace 不记录密钥。
 
 固定 Worker 并发为 1 时，模型代理凭据只标识 Agent 和其租户 scope；每次上游调用前，代理从 PostgreSQL 解析该 Agent 唯一的活动 Assignment/Attempt/Lease 和 Task `resource_scopes`。客户端提供的 Tenant/Task/Attempt 字段不参与授权。无活动执行、多条活动执行、租约过期或 scope 不一致均拒绝。`credential-proxy` 已有通过 `SECURITY DEFINER` 窄函数执行的 JDBC 查询；非登录函数 owner 只读所需列，运行角色只获函数执行权。安装脚本为 [credential-proxy.sql](../credential-proxy/src/main/resources/db/credential-proxy.sql)，须在共享 schema v121 迁移完成后由数据库管理员应用。身份凭据查验、函数 DB 登录角色配置、Provider Secret 解析和上游转发仍未接入。
 

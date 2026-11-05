@@ -103,6 +103,7 @@ class OidcJwtIntegrationTest {
 
     @BeforeEach
     void createSchemaAndScopedWorker() {
+        jdbc.execute("DROP TABLE IF EXISTS worker_model_proxy_credentials CASCADE");
         jdbc.execute("DROP TABLE IF EXISTS agent_sessions");
         jdbc.execute("DROP TABLE IF EXISTS worker_enrollment_agent_scopes CASCADE");
         jdbc.execute("DROP TABLE IF EXISTS agents");
@@ -136,24 +137,35 @@ class OidcJwtIntegrationTest {
         MvcResult result = mvc.perform(post("/api/v1/agents/{agentId}/sessions", AGENT_ID)
                         .header("Authorization", "Bearer " + token(ISSUER, AUDIENCE))
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"ttlSeconds\":3600}"))
+                        .content("{\"ttlSeconds\":3600,\"modelCredentialRef\":\"vault://tenant-a/project-a/chatgpt\"}"))
                 .andExpect(status().isOk())
                 .andReturn();
 
         JsonNode body = objectMapper.readTree(result.getResponse().getContentAsString());
         String accessToken = body.required("accessToken").asText();
+        String modelProxyToken = body.required("modelProxyToken").asText();
         UUID sessionId = UUID.fromString(body.required("sessionId").asText());
+        UUID modelProxyCredentialId = UUID.fromString(body.required("modelProxyCredentialId").asText());
         assertThat(accessToken).startsWith("ats_");
+        assertThat(modelProxyToken).startsWith("atp_").isNotEqualTo(accessToken);
         assertThat(jdbc.queryForObject("SELECT token_sha256 FROM agent_sessions WHERE id = ?", String.class, sessionId))
                 .isEqualTo(WorkerSessionService.sha256(accessToken));
         assertThat(jdbc.queryForObject("SELECT token_sha256 FROM agent_sessions WHERE id = ?", String.class, sessionId))
                 .isNotEqualTo(accessToken);
+        assertThat(jdbc.queryForObject("SELECT token_sha256 FROM worker_model_proxy_credentials WHERE id = ?",
+                String.class, modelProxyCredentialId)).isEqualTo(WorkerSessionService.sha256(modelProxyToken));
+        assertThat(jdbc.queryForObject("SELECT model_credential_ref FROM worker_model_proxy_credentials WHERE id = ?",
+                String.class, modelProxyCredentialId)).isEqualTo("vault://tenant-a/project-a/chatgpt");
+        assertThat(jdbc.queryForObject("SELECT token_sha256 FROM worker_model_proxy_credentials WHERE id = ?",
+                String.class, modelProxyCredentialId)).isNotEqualTo(modelProxyToken);
 
         mvc.perform(delete("/api/v1/agents/{agentId}/sessions/{sessionId}", AGENT_ID, sessionId)
                         .header("Authorization", "Bearer " + token(ISSUER, AUDIENCE)))
                 .andExpect(status().isNoContent());
         assertThat(jdbc.queryForObject("SELECT revoked_at IS NOT NULL FROM agent_sessions WHERE id = ?",
                 Boolean.class, sessionId)).isTrue();
+        assertThat(jdbc.queryForObject("SELECT revoked_at IS NOT NULL FROM worker_model_proxy_credentials WHERE id = ?",
+                Boolean.class, modelProxyCredentialId)).isTrue();
     }
 
     @Test

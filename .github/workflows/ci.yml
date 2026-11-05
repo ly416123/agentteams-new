@@ -46,7 +46,7 @@ jobs:
               "worker-enrollment/target/surefire-reports/TEST-io.agentteams.enrollment.GatewaySessionHandshakeTest.xml"
           ).getroot()
           for name, suite, expected_count in (
-              ("repository", report, "6"),
+              ("repository", report, "7"),
               ("signed OIDC to PostgreSQL", oidc_report, "6"),
               ("pinned Gateway gRPC session handshake", gateway_report, "5"),
           ):
@@ -54,7 +54,7 @@ jobs:
               assert suite.attrib["skipped"] == "0", (name, suite.attrib)
               assert suite.attrib["failures"] == "0", (name, suite.attrib)
               assert suite.attrib["errors"] == "0", (name, suite.attrib)
-          print("All 17 PostgreSQL, OIDC, and pinned Gateway integration tests executed successfully.")
+          print("All 18 PostgreSQL, OIDC, and pinned Gateway integration tests executed successfully.")
           PY
 
       - name: Require Attempt context authorization tests to execute

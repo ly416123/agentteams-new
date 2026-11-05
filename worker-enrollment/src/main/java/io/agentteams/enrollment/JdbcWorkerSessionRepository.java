@@ -56,6 +56,19 @@ public class JdbcWorkerSessionRepository implements WorkerSessionRepository {
     }
 
     @Override
+    public void insertModelProxyCredential(ModelProxyCredentialRecord credential) {
+        jdbc.update("""
+                INSERT INTO worker_model_proxy_credentials(
+                    id, session_id, agent_id, tenant_id, project_id, team_id,
+                    token_sha256, model_credential_ref, expires_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, credential.id(), credential.sessionId(), credential.agentId(),
+                credential.scope().tenant(), credential.scope().project(), credential.scope().team(),
+                credential.tokenSha256(), credential.modelCredentialRef(),
+                Timestamp.from(credential.expiresAt()), Timestamp.from(credential.createdAt()));
+    }
+
+    @Override
     public Optional<WorkerSessionOwnership> findSessionForUpdate(UUID agentId, UUID sessionId) {
         return jdbc.query("""
                 SELECT session.revoked_at, scoped.tenant_id, scoped.project_id, scoped.team_id
@@ -72,11 +85,19 @@ public class JdbcWorkerSessionRepository implements WorkerSessionRepository {
 
     @Override
     public boolean revoke(UUID agentId, UUID sessionId, Instant revokedAt) {
-        return jdbc.update("""
+        int revoked = jdbc.update("""
                 UPDATE agent_sessions
                    SET revoked_at = COALESCE(revoked_at, ?)
                  WHERE agent_id = ? AND id = ?
-                """, Timestamp.from(revokedAt), agentId, sessionId) == 1;
+                """, Timestamp.from(revokedAt), agentId, sessionId);
+        if (revoked == 1) {
+            jdbc.update("""
+                    UPDATE worker_model_proxy_credentials
+                       SET revoked_at = COALESCE(revoked_at, ?)
+                     WHERE agent_id = ? AND session_id = ?
+                    """, Timestamp.from(revokedAt), agentId, sessionId);
+        }
+        return revoked == 1;
     }
 
     private WorkerRegistration registration(ResultSet rs, int row) throws SQLException {

@@ -36,6 +36,39 @@ class WorkerSessionServiceTest {
     }
 
     @Test
+    void issuesIndependentModelProxyTokenBoundToSessionAndScope() throws Exception {
+        InMemoryRepository repository = new InMemoryRepository();
+        WorkerSessionService service = service(repository);
+
+        IssuedWorkerSession issued = service.issue(AGENT_ID, SCOPE, PERMISSIONS,
+                Duration.ofHours(12), "vault://tenant-a/project-a/chatgpt");
+
+        assertThat(issued.accessToken()).isEqualTo("opaque-one-time-token");
+        assertThat(issued.modelProxyToken()).isEqualTo("atp_" + "A".repeat(43));
+        assertThat(repository.savedModelCredential.agentId()).isEqualTo(AGENT_ID);
+        assertThat(repository.savedModelCredential.sessionId()).isEqualTo(issued.sessionId());
+        assertThat(repository.savedModelCredential.scope()).isEqualTo(SCOPE);
+        assertThat(repository.savedModelCredential.modelCredentialRef())
+                .isEqualTo("vault://tenant-a/project-a/chatgpt");
+        assertThat(repository.savedModelCredential.expiresAt()).isEqualTo(issued.expiresAt());
+        assertThat(repository.savedModelCredential.tokenSha256()).isEqualTo(sha256(issued.modelProxyToken()));
+        assertThat(repository.savedModelCredential.tokenSha256()).isNotEqualTo(issued.modelProxyToken());
+    }
+
+    @Test
+    void rejectsUnsafeOrEmptyModelCredentialReferencesBeforeWritingSession() {
+        InMemoryRepository repository = new InMemoryRepository();
+        WorkerSessionService service = service(repository);
+
+        assertThatThrownBy(() -> service.issue(AGENT_ID, SCOPE, PERMISSIONS,
+                Duration.ofHours(1), "  ")).isInstanceOf(WorkerEnrollmentException.class);
+        assertThatThrownBy(() -> service.issue(AGENT_ID, SCOPE, PERMISSIONS,
+                Duration.ofHours(1), "vault://tenant-a/" + (char) 10 + "forged"))
+                .isInstanceOf(WorkerEnrollmentException.class);
+        assertThat(repository.saved).isNull();
+    }
+
+    @Test
     void refusesToIssueForAnotherTenantBeforePersistingAnything() {
         InMemoryRepository repository = new InMemoryRepository();
         WorkerSessionService service = service(repository);
@@ -80,6 +113,7 @@ class WorkerSessionServiceTest {
         assertThat(repository.revokedAgentId).isEqualTo(AGENT_ID);
         assertThat(repository.revokedSessionId).isEqualTo(sessionId);
         assertThat(repository.revokedAt).isEqualTo(NOW);
+        assertThat(repository.modelCredentialRevokedAt).isEqualTo(NOW);
     }
 
     @Test
@@ -97,7 +131,7 @@ class WorkerSessionServiceTest {
     }
 
     private static WorkerSessionService service(InMemoryRepository repository) {
-        return new WorkerSessionService(repository, () -> "opaque-one-time-token",
+        return new WorkerSessionService(repository, () -> "opaque-one-time-token", () -> "atp_" + "A".repeat(43),
                 Clock.fixed(NOW, ZoneOffset.UTC), Duration.ofDays(7));
     }
 
@@ -108,10 +142,12 @@ class WorkerSessionServiceTest {
 
     private static final class InMemoryRepository implements WorkerSessionRepository {
         private WorkerSessionRecord saved;
+        private ModelProxyCredentialRecord savedModelCredential;
         private WorkerSessionOwnership ownership;
         private UUID revokedAgentId;
         private UUID revokedSessionId;
         private Instant revokedAt;
+        private Instant modelCredentialRevokedAt;
         private WorkerScope executionScope;
 
         @Override
@@ -131,6 +167,11 @@ class WorkerSessionServiceTest {
         }
 
         @Override
+        public void insertModelProxyCredential(ModelProxyCredentialRecord credential) {
+            savedModelCredential = credential;
+        }
+
+        @Override
         public Optional<WorkerSessionOwnership> findSessionForUpdate(UUID agentId, UUID sessionId) {
             return Optional.ofNullable(ownership);
         }
@@ -140,6 +181,7 @@ class WorkerSessionServiceTest {
             this.revokedAgentId = agentId;
             this.revokedSessionId = sessionId;
             this.revokedAt = revokedAt;
+            this.modelCredentialRevokedAt = revokedAt;
             return ownership != null;
         }
     }

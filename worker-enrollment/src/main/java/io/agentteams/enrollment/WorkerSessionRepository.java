@@ -11,6 +11,8 @@ public interface WorkerSessionRepository {
 
     void insert(WorkerSessionRecord session);
 
+    void insertModelProxyCredential(ModelProxyCredentialRecord credential);
+
     Optional<WorkerSessionOwnership> findSessionForUpdate(UUID agentId, UUID sessionId);
 
     boolean revoke(UUID agentId, UUID sessionId, Instant revokedAt);

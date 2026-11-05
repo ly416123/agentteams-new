@@ -65,7 +65,16 @@ Agent scope 必须在 `metadata.scope` 中包含 enrollment 配置所使用的 `
 ./enroll-worker.sh http://127.0.0.1:8090 <agent-uuid> /secure/path/oidc-access-token ./secrets/worker-1.runtime.env
 ```
 
-脚本只把 Gateway token 写入槽位文件，不会打印；明文 token 仅在 Enrollment 响应和本机受限文件短暂出现，数据库存哈希。设置 `.env` 中对应的 `WORKER_1_CREDENTIALS_FILE` 路径（相对路径以本目录为准）、`WORKER_REPLICAS=1`，再启动：
+基础用法只把 Gateway token 写入槽位文件；明文仅在 Enrollment 响应和本机受限文件短暂出现，数据库存哈希。设置 `.env` 中对应的 `WORKER_1_CREDENTIALS_FILE` 路径（相对路径以本目录为准）、`WORKER_REPLICAS=1`，再启动：
+
+Enrollment 也支持为模型代理创建独立短期凭据。附加 `ttl-seconds`、非敏感 `model-credential-ref` 和代理 Token 文件路径：
+
+```sh
+./enroll-worker.sh http://127.0.0.1:8090 <agent-uuid> /secure/path/oidc-access-token \
+  ./secrets/worker-1.runtime.env 604800 vault://tenant/project/chatgpt ./secrets/worker-1.model-proxy-token
+```
+
+Gateway Token 和模型代理 Token 互不通用；数据库只存两者的 SHA-256，模型代理凭据绑定 Gateway session、Agent scope 和模型凭据引用，撤销 session 会一并撤销模型代理凭据。输出文件均设置为 `0600`。当前 Compose 尚未运行 HTTP 模型代理；完成代理部署并把 Worker 的模型 endpoint 指向代理前，不要将该 `atp_` Token 配置成直接访问模型供应商的凭据。它不是上游 Provider Secret。
 
 ```sh
 ./start-workers.sh
@@ -82,7 +91,7 @@ Agent scope 必须在 `metadata.scope` 中包含 enrollment 配置所使用的 `
 ./revoke-worker-session.sh http://127.0.0.1:8090 <agent-uuid> <old-session-uuid> /secure/path/oidc-access-token
 ```
 
-撤销只阻止后续 Gateway 握手；v0.1.5 不会主动断开已建立的连接。Worker 还会通过各自的模型 token 文件调用模型服务，这与 Gateway session 是两类凭据。每个活动槽位必须使用不同文件；配置校验会拒绝指向同一个底层文件的槽位。当前模型 Token 仍可被对应 Worker 进程读取，因此这项隔离不能替代后续凭证代理，也不提供 Attempt 级授权。
+撤销会阻止后续 Gateway 握手，并同步撤销关联的模型代理 Token；v0.1.5 不会主动断开已建立的 Gateway 连接。兼容模式下 Worker 仍可从各自模型 token 文件读取供应商凭据，这与 Gateway session 是两类凭据。每个活动槽位必须使用不同文件；配置校验会拒绝指向同一个底层文件的槽位。当前模型代理尚未提供 HTTP 转发，兼容模式仍不提供 Attempt 级授权或上游凭据隔离。
 
 ## 状态与运维
 
