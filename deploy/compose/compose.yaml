@@ -78,7 +78,7 @@ services:
       AGENTTEAMS_STORAGE_BUCKET: agentteams
       AGENTTEAMS_STORAGE_ACCESS_KEY: ${OBJECT_STORE_ACCESS_KEY:-}
       AGENTTEAMS_STORAGE_SECRET_KEY: ${OBJECT_STORE_SECRET_KEY:-}
-      # The currently pinned 0.1.4 Control Plane binds storage credentials through these names.
+      # The currently pinned 0.1.5 Control Plane binds storage credentials through these names.
       MINIO_ACCESS_KEY: ${OBJECT_STORE_ACCESS_KEY:-}
       MINIO_SECRET_KEY: ${OBJECT_STORE_SECRET_KEY:-}
     depends_on:
