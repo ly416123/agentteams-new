@@ -53,12 +53,11 @@ DROP POLICY IF EXISTS credential_proxy_owner_agent_scopes_read
 CREATE POLICY credential_proxy_owner_agent_scopes_read
     ON public.worker_enrollment_agent_scopes FOR SELECT TO credential_proxy_query_owner USING (true);
 
-CREATE OR REPLACE FUNCTION public.credential_proxy_active_attempts(
-    p_agent_id UUID,
-    p_tenant_id TEXT,
-    p_project_id TEXT,
-    p_team_id TEXT
-)
+-- Remove the older caller-scoped overload. Runtime scope must be derived from
+-- the active credential/session, never supplied as authorization parameters.
+DROP FUNCTION IF EXISTS public.credential_proxy_active_attempts(UUID, TEXT, TEXT, TEXT);
+
+CREATE OR REPLACE FUNCTION public.credential_proxy_active_attempts(p_proxy_credential_id UUID)
 RETURNS TABLE (
     agent_id UUID,
     tenant_id TEXT,
@@ -102,13 +101,28 @@ AS $$
       JOIN public.resource_scopes AS task_scope
         ON task_scope.resource_type = 'TASK'
        AND task_scope.resource_id = assignment.task_id
-     WHERE assignment.agent_id = p_agent_id
-       AND worker_scope.tenant_id = p_tenant_id
-       AND worker_scope.project_id = p_project_id
-       AND worker_scope.team = p_team_id
-       AND task_scope.tenant_id = p_tenant_id
-       AND task_scope.project_id = p_project_id
-       AND task_scope.team = p_team_id
+      JOIN public.worker_model_proxy_credentials AS credential
+        ON credential.agent_id = assignment.agent_id
+      JOIN public.agent_sessions AS session
+        ON session.id = credential.session_id
+       AND session.agent_id = credential.agent_id
+      JOIN public.worker_enrollment_agent_scopes AS current_scope
+        ON current_scope.agent_id = credential.agent_id
+       AND current_scope.tenant_id = credential.tenant_id
+       AND current_scope.project_id = credential.project_id
+       AND current_scope.team_id = credential.team_id
+     WHERE credential.id = p_proxy_credential_id
+       AND credential.revoked_at IS NULL
+       AND credential.expires_at > statement_timestamp()
+       AND session.revoked_at IS NULL
+       AND session.expires_at > statement_timestamp()
+       AND worker_scope.tenant_id = credential.tenant_id
+       AND worker_scope.project_id = credential.project_id
+       AND worker_scope.team = credential.team_id
+       AND task_scope.tenant_id = credential.tenant_id
+       AND task_scope.project_id = credential.project_id
+       AND task_scope.team = credential.team_id
+       AND assignment.agent_id = credential.agent_id
        AND assignment.phase IN ('ASSIGNED', 'ACCEPTED', 'RUNNING')
        AND assignment.released_at IS NULL
        AND attempt.phase IN ('ASSIGNED', 'ACCEPTED', 'RUNNING')
@@ -118,10 +132,10 @@ AS $$
        AND lease.expires_at > statement_timestamp()
 $$;
 
-ALTER FUNCTION public.credential_proxy_active_attempts(UUID, TEXT, TEXT, TEXT)
+ALTER FUNCTION public.credential_proxy_active_attempts(UUID)
     OWNER TO credential_proxy_query_owner;
-REVOKE ALL ON FUNCTION public.credential_proxy_active_attempts(UUID, TEXT, TEXT, TEXT) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION public.credential_proxy_active_attempts(UUID, TEXT, TEXT, TEXT)
+REVOKE ALL ON FUNCTION public.credential_proxy_active_attempts(UUID) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.credential_proxy_active_attempts(UUID)
     TO credential_proxy_query;
 
 CREATE OR REPLACE FUNCTION public.credential_proxy_authenticate(p_token_sha256 TEXT)

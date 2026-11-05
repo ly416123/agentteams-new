@@ -41,6 +41,7 @@ class JdbcActiveAttemptRepositoryPostgresTest {
                 POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword()));
         jdbc.execute("DROP FUNCTION IF EXISTS credential_proxy_revalidate(UUID) CASCADE");
         jdbc.execute("DROP FUNCTION IF EXISTS credential_proxy_authenticate(TEXT) CASCADE");
+        jdbc.execute("DROP FUNCTION IF EXISTS credential_proxy_active_attempts(UUID) CASCADE");
         jdbc.execute("DROP FUNCTION IF EXISTS credential_proxy_active_attempts(UUID, TEXT, TEXT, TEXT) CASCADE");
         jdbc.execute("DROP ROLE IF EXISTS credential_proxy_test");
         jdbc.execute("DROP TABLE IF EXISTS worker_model_proxy_credentials, agent_sessions, worker_enrollment_agent_scopes CASCADE");
@@ -65,9 +66,10 @@ class JdbcActiveAttemptRepositoryPostgresTest {
     }
 
     @Test
-    void resolvesOnlyActiveAttemptInsideAuthenticatedWorkerAndTaskScope() {
+    void resolvesOnlyActiveAttemptInsideAuthenticatedWorkerAndTaskScope() throws Exception {
         insertScope("WORKER", AGENT, "tenant-a", "project-a", "team-a");
         insertScope("TASK", TASK, "tenant-a", "project-a", "team-a");
+        insertProxyCredential();
         insertActive(AGENT, TASK, ATTEMPT, LEASE);
         insertScope("TASK", id("88000000-0000-0000-0000-000000000012"), "tenant-b", "project-a", "team-a");
         insertActive(AGENT, id("88000000-0000-0000-0000-000000000012"),
@@ -82,8 +84,9 @@ class JdbcActiveAttemptRepositoryPostgresTest {
     }
 
     @Test
-    void returnsEveryConcurrentAttemptSoResolverCanFailClosed() {
+    void returnsEveryConcurrentAttemptSoResolverCanFailClosed() throws Exception {
         insertScope("WORKER", AGENT, "tenant-a", "project-a", "team-a");
+        insertProxyCredential();
         UUID secondTask = id("88000000-0000-0000-0000-000000000032");
         insertScope("TASK", TASK, "tenant-a", "project-a", "team-a");
         insertScope("TASK", secondTask, "tenant-a", "project-a", "team-a");
@@ -95,14 +98,45 @@ class JdbcActiveAttemptRepositoryPostgresTest {
     }
 
     @Test
-    void mismatchedWorkerScopeHasNoVisibleActiveAttempts() {
+    void mismatchedWorkerScopeHasNoVisibleActiveAttempts() throws Exception {
         insertScope("WORKER", AGENT, "tenant-a", "project-a", "team-a");
         insertScope("TASK", TASK, "tenant-a", "project-a", "team-a");
+        insertProxyCredential();
         insertActive(AGENT, TASK, ATTEMPT, LEASE);
 
         var otherTenantWorker = new AuthenticatedWorker(id("88000000-0000-0000-0000-000000000099"), AGENT,
                 "tenant-b", "project-a", "team-a", "model-credential-a");
         assertThat(repository.findActiveAttempts(otherTenantWorker)).isEmpty();
+    }
+
+    @Test
+    void attemptLookupDerivesScopeFromTheProxyCredentialInsteadOfCallerArguments() throws Exception {
+        insertScope("WORKER", AGENT, "tenant-a", "project-a", "team-a");
+        insertProxyCredential();
+        insertScope("TASK", TASK, "tenant-a", "project-a", "team-a");
+        insertActive(AGENT, TASK, ATTEMPT, LEASE);
+        UUID otherTask = id("88000000-0000-0000-0000-000000000042");
+        insertScope("WORKER", id("88000000-0000-0000-0000-000000000041"), "tenant-b", "project-b", "team-b");
+        insertScope("TASK", otherTask, "tenant-b", "project-b", "team-b");
+        insertActive(id("88000000-0000-0000-0000-000000000041"), otherTask,
+                id("88000000-0000-0000-0000-000000000043"), id("88000000-0000-0000-0000-000000000044"));
+        insertProxyCredentialForOtherAgent(id("88000000-0000-0000-0000-000000000041"),
+                id("88000000-0000-0000-0000-000000000045"), id("88000000-0000-0000-0000-000000000046"),
+                "tenant-b", "project-b", "team-b", "atp_" + "B".repeat(43));
+        jdbc.execute("CREATE ROLE credential_proxy_test LOGIN PASSWORD 'proxy-test-password'");
+        jdbc.execute("GRANT credential_proxy_query TO credential_proxy_test");
+        var restricted = new JdbcTemplate(new DriverManagerDataSource(
+                POSTGRES.getJdbcUrl(), "credential_proxy_test", "proxy-test-password"));
+
+        var rows = restricted.query("SELECT task_id FROM public.credential_proxy_active_attempts(?)",
+                (rs, row) -> rs.getObject("task_id", UUID.class), PROXY_CREDENTIAL_ID);
+
+        assertThat(rows).containsExactly(TASK);
+        assertThat(restricted.queryForObject("""
+                SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+                 WHERE n.nspname = 'public' AND p.proname = 'credential_proxy_active_attempts'
+                   AND pg_get_function_identity_arguments(p.oid) = 'p_proxy_credential_id uuid'
+                """, Long.class)).isEqualTo(1L);
     }
 
     @Test
@@ -178,6 +212,14 @@ class JdbcActiveAttemptRepositoryPostgresTest {
         jdbc.update("INSERT INTO agent_sessions VALUES (?, ?, now() + interval '10 minutes', NULL)", SESSION_ID, AGENT);
         jdbc.update("INSERT INTO worker_model_proxy_credentials VALUES (?, ?, ?, 'tenant-a', 'project-a', 'team-a', ?, 'vault://tenant-a/project-a/chatgpt', now() + interval '10 minutes', NULL, now())",
                 PROXY_CREDENTIAL_ID, SESSION_ID, AGENT, sha256(PROXY_TOKEN));
+    }
+
+    private void insertProxyCredentialForOtherAgent(UUID agent, UUID session, UUID credential,
+            String tenant, String project, String team, String token) throws Exception {
+        jdbc.update("INSERT INTO agent_sessions VALUES (?, ?, now() + interval '10 minutes', NULL)", session, agent);
+        jdbc.update("INSERT INTO worker_enrollment_agent_scopes VALUES (?, ?, ?, ?)", agent, tenant, project, team);
+        jdbc.update("INSERT INTO worker_model_proxy_credentials VALUES (?, ?, ?, ?, ?, ?, ?, 'vault://tenant-b/project-b/chatgpt', now() + interval '10 minutes', NULL, now())",
+                credential, session, agent, tenant, project, team, sha256(token));
     }
 
     private void insertActive(UUID agent, UUID task, UUID attempt, UUID lease) {

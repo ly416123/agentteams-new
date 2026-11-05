@@ -56,6 +56,7 @@ Task 与 Attempt 的事实源是 PostgreSQL。NATS、Gateway、Worker、对象�
 - 新项目没有复制 Task/Attempt/Artifact/Outbox 状态机，也没有为这些资源实现新的全系统 `ExecutionContext` 或 RLS。当前 Compose 复用旧应用镜像，因此不能宣称批次 2 已完成。
 - `worker_enrollment` 专用数据库角色现对 `agents` 与 `agent_sessions` 启用 RLS；授权/撤销事务将已验证的 tenant/project/team 写入事务局部 PostgreSQL 设置，策略缺 scope 默认拒绝，Agent 关联约束 Session 行，列级授权不允许读取 Token Hash。PostgreSQL 集成测试覆盖同一池连接跨 Tenant 复用、跨 scope 插入拒绝、事务结束后 scope 清除和角色无 `BYPASSRLS`。这项纵深防御仅覆盖 Enrollment。
 - Enrollment 读取 scope 的窄列索引由触发器维护。同步函数归属仅拥有该索引的 `NOLOGIN`、非 superuser、无 `BYPASSRLS` 角色；普通 Agent 写入角色无权直接写 scope 表。测试覆盖受限 Agent 写入触发 scope 新增、更新和不完整 scope 清理，以及 Enrollment 无权读取 `agents.metadata`。
+- Credential Proxy 的活动 Attempt 数据库函数不接受调用者提交的 Agent/Tenant/Project/Team 参数；只接收 Proxy Credential ID，并从仍有效的 Credential、Session、Enrollment 当前 scope 推导授权主体，再与 Worker/Task 的 `resource_scopes` 对照。运行角色只能执行窄函数，Java Repository 再要求结果与已验证 Worker 完全一致。PostgreSQL 集成测试覆盖 A/B Tenant 并存、A 凭据只返回 A Attempt、伪造的调用者 scope 返回空集及运行角色不能直接读业务表。
 - 固定 Control Plane v0.1.5 的数据模型和授权查询见[共享 Control Plane scope 与 RLS 就绪度审计](../audits/2026-11-05-shared-control-plane-scope-and-rls-readiness.md)：Task 等核心表通过 `resource_scopes` 多态映射归属；Conversation 保存自身 scope；子资源从父 Task/Attempt 继承。`agentteams-new` Compose 已把 Control Plane SQL 运行身份切换为非超级用户 `agentteams_runtime`，但 `agents`/`agent_sessions` 仍由全表 RLS policy 兼容旧应用层授权，业务请求也未设置事务级 scope GUC。因此不能宣称全系统 RLS 或多租户隔离已完成。
 - L5 有真实 Keycloak 和 Worker 凭据 Secret 引用，但 issuer/JWKS 使用 HTTP，当前新 Compose 强制 HTTPS；现有本机 Kubernetes context 只允许读取 Pod，不能读取 Secret/ConfigMap。L5 不作为本轮隔离验收环境，且其运行服务未被改动。
 

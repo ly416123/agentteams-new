@@ -11,7 +11,8 @@ public final class JdbcActiveAttemptRepository implements ActiveAttemptRepositor
     private static final String ACTIVE_ATTEMPTS_SQL = """
             SELECT agent_id, tenant_id, project_id, team_id, task_id, attempt_id,
                    lease_id, lease_expires_at, lease_active, attempt_active, assignment_active
-              FROM public.credential_proxy_active_attempts(?, ?, ?, ?)
+              FROM public.credential_proxy_active_attempts(?)
+             WHERE agent_id = ? AND tenant_id = ? AND project_id = ? AND team_id = ?
             """;
 
     private final JdbcTemplate jdbc;
@@ -24,7 +25,7 @@ public final class JdbcActiveAttemptRepository implements ActiveAttemptRepositor
     public List<ActiveAttemptCandidate> findActiveAttempts(AuthenticatedWorker worker) {
         Objects.requireNonNull(worker, "worker");
         return jdbc.query(ACTIVE_ATTEMPTS_SQL, JdbcActiveAttemptRepository::map,
-                worker.agentId(), worker.tenantId(), worker.projectId(), worker.teamId());
+                worker.proxyCredentialId(), worker.agentId(), worker.tenantId(), worker.projectId(), worker.teamId());
     }
 
     private static ActiveAttemptCandidate map(ResultSet rs, int row) throws SQLException {
