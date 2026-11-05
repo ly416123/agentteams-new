@@ -66,7 +66,6 @@ class JdbcWorkerSessionRepositoryPostgresTest {
         jdbc.execute("CREATE ROLE agentteams_runtime NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS");
         jdbc.execute("GRANT CONNECT ON DATABASE enrollment_test TO worker_enrollment");
         jdbc.execute("GRANT USAGE ON SCHEMA public TO worker_enrollment");
-        jdbc.execute("CREATE ROLE worker_enrollment_scope_owner LOGIN BYPASSRLS");
         applyEnrollmentRls();
         repository = new JdbcWorkerSessionRepository(jdbc);
     }
@@ -242,6 +241,76 @@ class JdbcWorkerSessionRepositoryPostgresTest {
         assertThat(jdbc.queryForObject("SELECT has_table_privilege('agent_writer', "
                         + "'worker_enrollment_agent_scopes', 'INSERT')", Boolean.class))
                 .isFalse();
+    }
+
+    @Test
+    void changingOrRemovingAgentScopeRevokesExistingSessionsAndModelCredentials() {
+        UUID writerAgentId = UUID.fromString("66000000-0000-0000-0000-000000000006");
+        UUID sessionId = UUID.fromString("66000000-0000-0000-0000-000000000010");
+        UUID credentialId = UUID.fromString("66000000-0000-0000-0000-000000000011");
+        jdbc.execute("CREATE ROLE agent_writer LOGIN PASSWORD 'agent-writer-test-password' NOSUPERUSER NOBYPASSRLS");
+        jdbc.execute("GRANT USAGE ON SCHEMA public TO agent_writer");
+        jdbc.execute("GRANT SELECT (id) ON agents TO agent_writer");
+        jdbc.execute("GRANT INSERT (id, name, phase, metadata) ON agents TO agent_writer");
+        jdbc.execute("GRANT UPDATE (metadata) ON agents TO agent_writer");
+        jdbc.execute("CREATE POLICY agent_writer_read ON agents FOR SELECT TO agent_writer USING (true)");
+        jdbc.execute("CREATE POLICY agent_writer_write ON agents FOR ALL TO agent_writer USING (true) WITH CHECK (true)");
+        JdbcTemplate writer = new JdbcTemplate(new DriverManagerDataSource(
+                POSTGRES.getJdbcUrl(), "agent_writer", "agent-writer-test-password"));
+
+        writer.update("INSERT INTO agents(id, name, phase, metadata) VALUES (?, ?, ?, ?::jsonb)",
+                writerAgentId, "agent-writer", "READY",
+                "{\"scope\":{\"tenant\":\"tenant-a\",\"project\":\"project-a\",\"team\":\"team-a\"}}");
+        jdbc.update("INSERT INTO agent_sessions(id, agent_id, token_sha256, expires_at, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?)", sessionId, writerAgentId,
+                "3123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                Instant.now().plusSeconds(3600), Instant.now());
+        jdbc.update("INSERT INTO worker_model_proxy_credentials(id, session_id, agent_id, tenant_id, project_id, "
+                        + "team_id, token_sha256, model_credential_ref, expires_at, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", credentialId, sessionId, writerAgentId,
+                "tenant-a", "project-a", "team-a",
+                "4123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "vault://tenant-a/project-a/model", Instant.now().plusSeconds(3600), Instant.now());
+
+        writer.update("UPDATE agents SET metadata = ?::jsonb WHERE id = ?",
+                "{\"scope\":{\"tenant\":\"tenant-a\",\"project\":\"project-a\",\"team\":\"team-a\"},\"label\":\"changed\"}",
+                writerAgentId);
+        assertThat(jdbc.queryForObject("SELECT revoked_at IS NULL FROM agent_sessions WHERE id = ?", Boolean.class,
+                sessionId)).isTrue();
+        assertThat(jdbc.queryForObject("SELECT revoked_at IS NULL FROM worker_model_proxy_credentials WHERE id = ?",
+                Boolean.class, credentialId)).isTrue();
+
+        writer.update("UPDATE agents SET metadata = ?::jsonb WHERE id = ?",
+                "{\"scope\":{\"tenant\":\"tenant-b\",\"project\":\"project-b\",\"team\":\"team-b\"}}",
+                writerAgentId);
+        assertThat(jdbc.queryForObject("SELECT revoked_at IS NOT NULL FROM agent_sessions WHERE id = ?", Boolean.class,
+                sessionId)).isTrue();
+        assertThat(jdbc.queryForObject("SELECT revoked_at IS NOT NULL FROM worker_model_proxy_credentials WHERE id = ?",
+                Boolean.class, credentialId)).isTrue();
+
+        UUID nextSessionId = UUID.fromString("66000000-0000-0000-0000-000000000012");
+        UUID nextCredentialId = UUID.fromString("66000000-0000-0000-0000-000000000013");
+        jdbc.update("INSERT INTO agent_sessions(id, agent_id, token_sha256, expires_at, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?)", nextSessionId, writerAgentId,
+                "5123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                Instant.now().plusSeconds(3600), Instant.now());
+        jdbc.update("INSERT INTO worker_model_proxy_credentials(id, session_id, agent_id, tenant_id, project_id, "
+                        + "team_id, token_sha256, model_credential_ref, expires_at, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", nextCredentialId, nextSessionId, writerAgentId,
+                "tenant-b", "project-b", "team-b",
+                "6123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "vault://tenant-b/project-b/model", Instant.now().plusSeconds(3600), Instant.now());
+        writer.update("UPDATE agents SET metadata = '{}'::jsonb WHERE id = ?", writerAgentId);
+        assertThat(jdbc.queryForObject("SELECT revoked_at IS NOT NULL FROM agent_sessions WHERE id = ?", Boolean.class,
+                nextSessionId)).isTrue();
+        assertThat(jdbc.queryForObject("SELECT revoked_at IS NOT NULL FROM worker_model_proxy_credentials WHERE id = ?",
+                Boolean.class, nextCredentialId)).isTrue();
+        assertThat(jdbc.queryForObject("SELECT has_column_privilege('worker_enrollment_scope_owner', "
+                + "'agent_sessions', 'revoked_at', 'UPDATE')", Boolean.class)).isTrue();
+        assertThat(jdbc.queryForObject("SELECT has_column_privilege('worker_enrollment_scope_owner', "
+                + "'agent_sessions', 'token_sha256', 'UPDATE')", Boolean.class)).isFalse();
+        assertThat(jdbc.queryForObject("SELECT rolsuper OR rolbypassrls OR rolcanlogin "
+                + "FROM pg_roles WHERE rolname = 'worker_enrollment_scope_owner'", Boolean.class)).isFalse();
     }
 
     @Test

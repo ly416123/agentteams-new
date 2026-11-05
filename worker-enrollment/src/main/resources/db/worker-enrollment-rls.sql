@@ -55,15 +55,34 @@ DECLARE
     tenant_value TEXT := NULLIF(BTRIM(agent_scope ->> 'tenant'), '');
     project_value TEXT := NULLIF(BTRIM(agent_scope ->> 'project'), '');
     team_value TEXT := NULLIF(BTRIM(agent_scope ->> 'team'), '');
+    scope_changed BOOLEAN := FALSE;
+    affected_rows BIGINT := 0;
 BEGIN
     IF tenant_value IS NULL OR project_value IS NULL OR team_value IS NULL THEN
         DELETE FROM public.worker_enrollment_agent_scopes WHERE agent_id = NEW.id;
+        GET DIAGNOSTICS affected_rows = ROW_COUNT;
+        scope_changed := affected_rows > 0;
     ELSE
         INSERT INTO public.worker_enrollment_agent_scopes(agent_id, tenant_id, project_id, team_id)
         VALUES (NEW.id, tenant_value, project_value, team_value)
         ON CONFLICT (agent_id) DO UPDATE SET tenant_id = EXCLUDED.tenant_id,
                                              project_id = EXCLUDED.project_id,
-                                             team_id = EXCLUDED.team_id;
+                                             team_id = EXCLUDED.team_id
+        WHERE (worker_enrollment_agent_scopes.tenant_id,
+               worker_enrollment_agent_scopes.project_id,
+               worker_enrollment_agent_scopes.team_id)
+              IS DISTINCT FROM (EXCLUDED.tenant_id, EXCLUDED.project_id, EXCLUDED.team_id);
+        GET DIAGNOSTICS affected_rows = ROW_COUNT;
+        scope_changed := affected_rows > 0;
+    END IF;
+
+    IF scope_changed THEN
+        UPDATE public.agent_sessions
+           SET revoked_at = COALESCE(revoked_at, statement_timestamp())
+         WHERE agent_id = NEW.id AND revoked_at IS NULL;
+        UPDATE public.worker_model_proxy_credentials
+           SET revoked_at = COALESCE(revoked_at, statement_timestamp())
+         WHERE agent_id = NEW.id AND revoked_at IS NULL;
     END IF;
     RETURN NEW;
 END;
@@ -136,6 +155,30 @@ GRANT INSERT (id, session_id, agent_id, tenant_id, project_id, team_id, token_sh
 GRANT SELECT (agent_id, session_id, revoked_at)
     ON TABLE worker_model_proxy_credentials TO worker_enrollment;
 GRANT UPDATE (revoked_at) ON TABLE worker_model_proxy_credentials TO worker_enrollment;
+
+-- The SECURITY DEFINER scope trigger gets only the columns needed to revoke
+-- credentials. Its policies intentionally cannot expose or mutate other rows.
+GRANT SELECT (agent_id), UPDATE (revoked_at) ON TABLE agent_sessions
+    TO worker_enrollment_scope_owner;
+GRANT SELECT (agent_id), UPDATE (revoked_at) ON TABLE worker_model_proxy_credentials
+    TO worker_enrollment_scope_owner;
+
+DROP POLICY IF EXISTS worker_enrollment_scope_owner_read_sessions ON agent_sessions;
+DROP POLICY IF EXISTS worker_enrollment_scope_owner_revoke_sessions ON agent_sessions;
+CREATE POLICY worker_enrollment_scope_owner_read_sessions ON agent_sessions
+    FOR SELECT TO worker_enrollment_scope_owner USING (true);
+CREATE POLICY worker_enrollment_scope_owner_revoke_sessions ON agent_sessions
+    FOR UPDATE TO worker_enrollment_scope_owner USING (true) WITH CHECK (true);
+
+DROP POLICY IF EXISTS worker_enrollment_scope_owner_revoke_model_credentials
+    ON worker_model_proxy_credentials;
+DROP POLICY IF EXISTS worker_enrollment_scope_owner_read_model_credentials
+    ON worker_model_proxy_credentials;
+CREATE POLICY worker_enrollment_scope_owner_read_model_credentials
+    ON worker_model_proxy_credentials FOR SELECT TO worker_enrollment_scope_owner USING (true);
+CREATE POLICY worker_enrollment_scope_owner_revoke_model_credentials
+    ON worker_model_proxy_credentials FOR UPDATE TO worker_enrollment_scope_owner
+    USING (true) WITH CHECK (true);
 
 DROP POLICY IF EXISTS worker_enrollment_agent_scopes_scope ON worker_enrollment_agent_scopes;
 CREATE POLICY worker_enrollment_agent_scopes_scope ON worker_enrollment_agent_scopes
