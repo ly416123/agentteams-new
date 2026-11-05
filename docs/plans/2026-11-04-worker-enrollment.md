@@ -47,8 +47,8 @@
 
 ## Task 4：验证与交付
 
-- [x] 运行 27 项 Enrollment 测试、Maven verify、Compose config 与 shell 静态校验；CI 已覆盖同样的 Java 21/Compose 检查。
-- [x] 使用 Testcontainers/PostgreSQL 验证 scope 查询、Token Hash 落库、撤销幂等和专用 DB role 仅能访问授权表；CI 明确要求 10 项 PostgreSQL 集成断言全部执行。
+- [x] 运行 29 项 Enrollment 测试；本机 24 项非 Gateway 测试通过，完整 Java 21 `verify`、17 项集成门禁、Compose config 与 shell 静态校验由 Ubuntu CI run `41987564292` 全部通过。
+- [x] 使用 Testcontainers/PostgreSQL 验证 scope 查询、Token Hash 落库、撤销幂等、scope owner 角色加固和受限 Agent 写入触发器同步；CI 要求 Repository 6、签名 OIDC→PostgreSQL 6、固定 Gateway 握手 5 项全部执行且无跳过。
 - [x] 使用进程内临时 RSA/JWKS 发行者通过真实 HTTP JWT 解码器与 PostgreSQL 验证签名、issuer、audience、Token Hash、撤销和 tenant/project/team scope 拒绝。
 - [x] 在本机使用固定 digest 的 v0.1.5 Gateway 与 PostgreSQL，以最小 protobuf/gRPC 客户端验证有效握手、Gateway/Agent 状态投影，以及未知、过期、撤销和 Agent 绑定不匹配的拒绝；本机共 5 项且未跳过。旧镜像失败见 CI `41953617348`；新镜像 digest `sha256:40c919d31b0fe7bdf876237c36fff405a16c2208420ad42374f6dd67491e055f` 的本机验收 5/5 通过。发布来源为 `agentteams-java v0.1.5` / commit `0156f2c1fecdc868cb4a0f4f13fb068bb4162834`。
 - [x] 只读盘点 L5：Keycloak OIDC discovery/JWKS 可达，部署配置使用 `agentteams-api` audience 和 `tenant`/`project`/`team`/`permissions` claims；现有 Worker Pod 引用模型 Token Secret，未读取或输出 Secret 内容。
