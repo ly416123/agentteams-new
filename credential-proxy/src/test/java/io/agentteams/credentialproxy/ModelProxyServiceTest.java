@@ -18,6 +18,11 @@ import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -41,6 +46,9 @@ class ModelProxyServiceTest {
     private final AtomicReference<String> upstreamAuthorization = new AtomicReference<>();
     private final AtomicReference<JsonNode> upstreamRequest = new AtomicReference<>();
     private final AtomicReference<Integer> upstreamStatus = new AtomicReference<>(200);
+    private final AtomicBoolean holdUpstreamHeaders = new AtomicBoolean();
+    private final CountDownLatch upstreamRequestReceived = new CountDownLatch(1);
+    private final CountDownLatch releaseUpstreamHeaders = new CountDownLatch(1);
     private HttpServer upstream;
     private ScheduledExecutorService streamMonitor;
     private Semaphore activeStreamPermits;
@@ -54,6 +62,19 @@ class ModelProxyServiceTest {
             upstreamCalls.incrementAndGet();
             upstreamAuthorization.set(exchange.getRequestHeaders().getFirst("Authorization"));
             upstreamRequest.set(json.readTree(exchange.getRequestBody()));
+            upstreamRequestReceived.countDown();
+            if (holdUpstreamHeaders.get()) {
+                try {
+                    if (!releaseUpstreamHeaders.await(10, TimeUnit.SECONDS)) {
+                        exchange.close();
+                        return;
+                    }
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    exchange.close();
+                    return;
+                }
+            }
             int status = upstreamStatus.get();
             byte[] response = (status == 200 ? "data: response.delta\n\n" : "provider detail with credentials")
                     .getBytes(java.nio.charset.StandardCharsets.UTF_8);
@@ -68,6 +89,7 @@ class ModelProxyServiceTest {
 
     @AfterEach
     void stopUpstream() {
+        releaseUpstreamHeaders.countDown();
         if (upstream != null) upstream.stop(0);
         if (streamMonitor != null) streamMonitor.shutdownNow();
     }
@@ -209,13 +231,84 @@ class ModelProxyServiceTest {
         assertThat(upstreamCalls).hasValue(0);
     }
 
+    @Test
+    void rejectsOverCapacityBeforeCallingProvider() {
+        ModelProxyService service = service(token -> Optional.of(worker()), activeAttempts(), context ->
+                "provider-secret".toCharArray(), new Semaphore(0));
+
+        assertThatThrownBy(() -> service.forward(PROXY_TOKEN, REQUEST.getBytes()))
+                .isInstanceOfSatisfying(ModelProxyException.class,
+                        error -> assertThat(error.statusCode()).isEqualTo(503));
+        assertThat(upstreamCalls).hasValue(0);
+    }
+
+    @Test
+    void cancelsProviderRequestWhenAttemptIsRevokedBeforeResponseHeaders() throws Exception {
+        holdUpstreamHeaders.set(true);
+        AtomicInteger attemptChecks = new AtomicInteger();
+        ActiveAttemptRepository revokeAfterDispatch = authenticatedWorker ->
+                attemptChecks.incrementAndGet() <= 2
+                        ? activeAttempts().findActiveAttempts(authenticatedWorker) : List.of();
+        ModelProxyService service = service(token -> Optional.of(worker()), revokeAfterDispatch,
+                context -> "provider-secret".toCharArray());
+        ExecutorService requestExecutor = java.util.concurrent.Executors.newSingleThreadExecutor();
+        Future<ModelProxyResponse> pending = requestExecutor.submit(
+                () -> service.forward(PROXY_TOKEN, REQUEST.getBytes()));
+
+        try {
+            assertThat(upstreamRequestReceived.await(2, TimeUnit.SECONDS)).isTrue();
+            assertThatThrownBy(() -> pending.get(5, TimeUnit.SECONDS))
+                    .isInstanceOfSatisfying(ExecutionException.class, error ->
+                            assertThat(error.getCause()).isInstanceOfSatisfying(ModelProxyException.class,
+                                    denied -> assertThat(denied.statusCode()).isEqualTo(403)));
+        } finally {
+            releaseUpstreamHeaders.countDown();
+            requestExecutor.shutdownNow();
+            requestExecutor.awaitTermination(2, TimeUnit.SECONDS);
+        }
+
+        assertThat(attemptChecks).hasValue(3);
+        assertThat(upstreamCalls).hasValue(1);
+        assertThat(activeStreamPermits.availablePermits()).isEqualTo(64);
+    }
+
+    @Test
+    void releasesPermitAndDoesNotCallProviderWhenAuthorizationMonitorCannotStart() {
+        streamMonitor.shutdownNow();
+        ModelProxyService service = service(token -> Optional.of(worker()), activeAttempts(), context ->
+                "provider-secret".toCharArray());
+
+        assertThatThrownBy(() -> service.forward(PROXY_TOKEN, REQUEST.getBytes()))
+                .isInstanceOfSatisfying(ModelProxyException.class,
+                        error -> assertThat(error.statusCode()).isEqualTo(503));
+
+        assertThat(upstreamCalls).hasValue(0);
+        assertThat(activeStreamPermits.availablePermits()).isEqualTo(64);
+    }
+
     private ModelProxyService service(ModelProxyAuthenticator authenticator,
             ActiveAttemptRepository attempts, CredentialSource credentials) {
+        return service(authenticator, attempts, credentials, activeStreamPermits);
+    }
+
+    private ModelProxyService service(ModelProxyAuthenticator authenticator,
+            ActiveAttemptRepository attempts, CredentialSource credentials, Semaphore streamPermits) {
         URI endpoint = URI.create("http://127.0.0.1:" + upstream.getAddress().getPort() + "/v1/responses");
-        return new ModelProxyService(authenticator, new AttemptExecutionContextResolver(attempts,
+        ModelProxyAuthenticator revalidatingAuthenticator = new ModelProxyAuthenticator() {
+            @Override
+            public Optional<AuthenticatedWorker> authenticate(String token) {
+                return authenticator.authenticate(token);
+            }
+
+            @Override
+            public Optional<AuthenticatedWorker> revalidate(AuthenticatedWorker worker) {
+                return Optional.of(worker);
+            }
+        };
+        return new ModelProxyService(revalidatingAuthenticator, new AttemptExecutionContextResolver(attempts,
                 Clock.fixed(NOW, ZoneOffset.UTC)), credentials, endpoint,
                 Set.of("gpt-5.6-luna"), HttpClient.newHttpClient(),
-                Clock.fixed(NOW, ZoneOffset.UTC), streamMonitor, activeStreamPermits);
+                Clock.fixed(NOW, ZoneOffset.UTC), streamMonitor, streamPermits);
     }
 
     private static ActiveAttemptRepository activeAttempts() {

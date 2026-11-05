@@ -50,8 +50,9 @@ class LeaseGuardedInputStreamTest {
                 checks.incrementAndGet() == 1 ? List.of(active) : List.of(), Clock.fixed(NOW, ZoneOffset.UTC));
         AttemptExecutionContext original = contexts.resolve(worker);
         BlockingInputStream upstream = new BlockingInputStream();
+        Semaphore permits = acquiredPermit();
         LeaseGuardedInputStream guarded = new LeaseGuardedInputStream(upstream, activeAuthenticator(), contexts,
-                worker, original, Clock.fixed(NOW, ZoneOffset.UTC), scheduler, new Semaphore(1), 10);
+                worker, original, Clock.fixed(NOW, ZoneOffset.UTC), scheduler, permits, 10);
 
         var pendingRead = reader.submit(() -> guarded.read());
 
@@ -84,8 +85,9 @@ class LeaseGuardedInputStreamTest {
             }
         };
         BlockingInputStream upstream = new BlockingInputStream();
+        Semaphore permits = acquiredPermit();
         LeaseGuardedInputStream guarded = new LeaseGuardedInputStream(upstream, revoked, contexts,
-                worker, original, Clock.fixed(NOW, ZoneOffset.UTC), scheduler, new Semaphore(1), 10);
+                worker, original, Clock.fixed(NOW, ZoneOffset.UTC), scheduler, permits, 10);
 
         var pendingRead = reader.submit(() -> guarded.read());
 
@@ -96,27 +98,56 @@ class LeaseGuardedInputStreamTest {
     }
 
     @Test
-    void rejectsStreamsBeyondConfiguredActiveLimitAndReleasesSlotOnClose() throws Exception {
+    void closesBlockedUpstreamReadWhenAttemptRepositoryFails() throws Exception {
+        AuthenticatedWorker worker = worker();
+        ActiveAttemptCandidate active = activeCandidate(worker);
+        AtomicInteger checks = new AtomicInteger();
+        AttemptExecutionContextResolver contexts = new AttemptExecutionContextResolver(ignored -> {
+            if (checks.incrementAndGet() == 1) return List.of(active);
+            throw new IllegalStateException("database unavailable");
+        }, Clock.fixed(NOW, ZoneOffset.UTC));
+        AttemptExecutionContext original = contexts.resolve(worker);
+        BlockingInputStream upstream = new BlockingInputStream();
+        LeaseGuardedInputStream guarded = new LeaseGuardedInputStream(upstream, activeAuthenticator(), contexts,
+                worker, original, Clock.fixed(NOW, ZoneOffset.UTC), scheduler, acquiredPermit(), 10);
+
+        var pendingRead = reader.submit(() -> guarded.read());
+
+        assertThat(upstream.awaitClosed()).isTrue();
+        assertThatThrownBy(pendingRead::get).hasCauseInstanceOf(IOException.class);
+        assertThat(checks).hasValue(2);
+        assertThat(guarded.isInvalidated()).isTrue();
+    }
+
+    @Test
+    void releasesActiveStreamPermitOnClose() throws Exception {
         AuthenticatedWorker worker = worker();
         AttemptExecutionContextResolver contexts = new AttemptExecutionContextResolver(
                 ignored -> List.of(activeCandidate(worker)), Clock.fixed(NOW, ZoneOffset.UTC));
         AttemptExecutionContext original = contexts.resolve(worker);
         Semaphore capacity = new Semaphore(1);
+        assertThat(capacity.tryAcquire()).isTrue();
         LeaseGuardedInputStream first = new LeaseGuardedInputStream(InputStream.nullInputStream(),
                 activeAuthenticator(), contexts, worker, original, Clock.fixed(NOW, ZoneOffset.UTC),
                 scheduler, capacity, 10_000);
 
-        assertThatThrownBy(() -> new LeaseGuardedInputStream(InputStream.nullInputStream(),
-                activeAuthenticator(), contexts, worker, original, Clock.fixed(NOW, ZoneOffset.UTC),
-                scheduler, capacity, 10_000)).isInstanceOf(IllegalStateException.class);
+        assertThat(capacity.availablePermits()).isZero();
 
         first.close();
+        assertThat(capacity.availablePermits()).isEqualTo(1);
+        assertThat(capacity.tryAcquire()).isTrue();
         try (LeaseGuardedInputStream replacement = new LeaseGuardedInputStream(InputStream.nullInputStream(),
                 activeAuthenticator(), contexts, worker, original, Clock.fixed(NOW, ZoneOffset.UTC),
                 scheduler, capacity, 10_000)) {
             assertThat(replacement.isInvalidated()).isFalse();
         }
         assertThat(capacity.availablePermits()).isEqualTo(1);
+    }
+
+    private static Semaphore acquiredPermit() {
+        Semaphore permits = new Semaphore(1);
+        assertThat(permits.tryAcquire()).isTrue();
+        return permits;
     }
 
     private static ModelProxyAuthenticator activeAuthenticator() {

@@ -15,8 +15,16 @@ import java.time.Duration;
 import java.util.Arrays;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 /** Enforces Worker, active Attempt, model, and provider credential scope before forwarding. */
 public final class ModelProxyService {
@@ -81,18 +89,19 @@ public final class ModelProxyService {
         }
 
         byte[] normalizedBody = normalizeRequest(requestBody);
-        final char[] providerToken;
+        char[] providerToken = null;
+        boolean permitAcquired = false;
+        boolean streamTransferred = false;
+        InputStream responseBody = null;
+        ScheduledFuture<?> authorizationMonitor = null;
+        AtomicReference<CompletableFuture<HttpResponse<InputStream>>> pendingRequest = new AtomicReference<>();
+        AtomicReference<ModelProxyException> pendingDenial = new AtomicReference<>();
+        AtomicBoolean responseHeadersReceived = new AtomicBoolean();
         try {
+            if (!activeStreamPermits.tryAcquire()) throw new ModelProxyException(503);
+            permitAcquired = true;
             providerToken = credentials.resolve(context);
-        } catch (RuntimeException unavailable) {
-            throw new ModelProxyException(503);
-        }
-        if (providerToken == null || providerToken.length == 0) {
-            if (providerToken != null) Arrays.fill(providerToken, '\0');
-            throw new ModelProxyException(503);
-        }
-
-        try {
+            if (providerToken == null || providerToken.length == 0) throw new ModelProxyException(503);
             revalidateAttemptBeforeForward(worker, context);
             HttpRequest request = HttpRequest.newBuilder(upstreamEndpoint)
                     .timeout(REQUEST_TIMEOUT)
@@ -101,31 +110,71 @@ public final class ModelProxyService {
                     .header("Accept", "text/event-stream")
                     .POST(HttpRequest.BodyPublishers.ofByteArray(normalizedBody))
                     .build();
-            HttpResponse<java.io.InputStream> response = http.send(request,
+            authorizationMonitor = streamMonitor.scheduleWithFixedDelay(() -> {
+                if (responseHeadersReceived.get()) return;
+                try {
+                    revalidateAttemptBeforeForward(worker, context);
+                } catch (ModelProxyException denied) {
+                    pendingDenial.compareAndSet(null, denied);
+                    CompletableFuture<HttpResponse<InputStream>> requestFuture = pendingRequest.get();
+                    if (requestFuture != null) requestFuture.cancel(true);
+                }
+            }, LEASE_POLL_INTERVAL_MILLIS, LEASE_POLL_INTERVAL_MILLIS, TimeUnit.MILLISECONDS);
+            CompletableFuture<HttpResponse<InputStream>> requestFuture = http.sendAsync(request,
                     HttpResponse.BodyHandlers.ofInputStream());
+            pendingRequest.set(requestFuture);
+            if (pendingDenial.get() != null) requestFuture.cancel(true);
+            HttpResponse<InputStream> response;
+            try {
+                response = requestFuture.get(REQUEST_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            } catch (CancellationException canceled) {
+                ModelProxyException denied = pendingDenial.get();
+                if (denied != null) throw denied;
+                throw new ModelProxyException(503);
+            } catch (ExecutionException failed) {
+                ModelProxyException denied = pendingDenial.get();
+                if (denied != null) throw denied;
+                throw new ModelProxyException(502);
+            } catch (TimeoutException timeout) {
+                requestFuture.cancel(true);
+                throw new ModelProxyException(502);
+            }
+            responseHeadersReceived.set(true);
+            authorizationMonitor.cancel(false);
+            ModelProxyException denied = pendingDenial.get();
+            responseBody = response.body();
+            if (denied != null) throw denied;
+            revalidateAttemptBeforeForward(worker, context);
             if (response.statusCode() < 200 || response.statusCode() >= 300) {
-                response.body().close();
                 throw new ModelProxyException(502);
             }
             String contentType = response.headers().firstValue("Content-Type").orElse("");
             if (!contentType.toLowerCase(java.util.Locale.ROOT).startsWith("text/event-stream")
                     && !contentType.toLowerCase(java.util.Locale.ROOT).startsWith("application/json")) {
-                response.body().close();
                 throw new ModelProxyException(502);
             }
+            InputStream guarded = new LeaseGuardedInputStream(responseBody, authenticator, contexts,
+                    worker, context, clock, streamMonitor, activeStreamPermits, LEASE_POLL_INTERVAL_MILLIS);
+            ModelProxyResponse proxyResponse;
             try {
-                InputStream guarded = new LeaseGuardedInputStream(response.body(), authenticator, contexts,
-                        worker, context, clock, streamMonitor, activeStreamPermits, LEASE_POLL_INTERVAL_MILLIS);
-                return new ModelProxyResponse(response.statusCode(), contentType, guarded);
-            } catch (RuntimeException monitorUnavailable) {
-                response.body().close();
-                throw new ModelProxyException(503);
+                proxyResponse = new ModelProxyResponse(response.statusCode(), contentType, guarded);
+            } catch (RuntimeException invalidResponse) {
+                try {
+                    guarded.close();
+                } catch (IOException closeFailure) {
+                    invalidResponse.addSuppressed(closeFailure);
+                }
+                responseBody = null;
+                permitAcquired = false;
+                throw invalidResponse;
             }
+            responseBody = null;
+            permitAcquired = false;
+            streamTransferred = true;
+            return proxyResponse;
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
             throw new ModelProxyException(503);
-        } catch (IOException transportFailure) {
-            throw new ModelProxyException(502);
         } catch (IllegalArgumentException malformedProviderCredential) {
             throw new ModelProxyException(503);
         } catch (ModelProxyException denied) {
@@ -133,15 +182,35 @@ public final class ModelProxyService {
         } catch (RuntimeException unavailable) {
             throw new ModelProxyException(503);
         } finally {
-            Arrays.fill(providerToken, '\0');
+            responseHeadersReceived.set(true);
+            if (authorizationMonitor != null) authorizationMonitor.cancel(false);
+            CompletableFuture<HttpResponse<InputStream>> requestFuture = pendingRequest.get();
+            if (requestFuture != null && !streamTransferred && responseBody == null) {
+                requestFuture.cancel(true);
+                requestFuture.thenAccept(response -> closeQuietly(response.body()));
+            }
+            if (responseBody != null) closeQuietly(responseBody);
+            if (permitAcquired) activeStreamPermits.release();
+            if (providerToken != null) Arrays.fill(providerToken, '\0');
             Arrays.fill(normalizedBody, (byte) 0);
         }
     }
 
     private void revalidateAttemptBeforeForward(AuthenticatedWorker worker, AttemptExecutionContext original) {
+        final AuthenticatedWorker currentWorker;
+        try {
+            currentWorker = authenticator.revalidate(worker).orElseThrow(() -> new ModelProxyException(403));
+        } catch (ModelProxyException denied) {
+            throw denied;
+        } catch (RuntimeException unavailable) {
+            throw new ModelProxyException(503);
+        }
+        if (!worker.equals(currentWorker) || !clock.instant().isBefore(original.expiresAt())) {
+            throw new ModelProxyException(403);
+        }
         final AttemptExecutionContext current;
         try {
-            current = contexts.resolve(worker);
+            current = contexts.resolve(currentWorker);
         } catch (AttemptExecutionDeniedException denied) {
             throw new ModelProxyException(403);
         } catch (RuntimeException unavailable) {
@@ -149,6 +218,14 @@ public final class ModelProxyService {
         }
         if (!original.sameExecutionAs(current)) {
             throw new ModelProxyException(403);
+        }
+    }
+
+    private static void closeQuietly(InputStream stream) {
+        try {
+            stream.close();
+        } catch (IOException ignored) {
+            // The request is already being rejected; closing is best-effort cleanup.
         }
     }
 

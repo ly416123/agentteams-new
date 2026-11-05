@@ -37,14 +37,8 @@ final class LeaseGuardedInputStream extends InputStream {
         Objects.requireNonNull(scheduler, "scheduler");
         this.activeStreamPermits = Objects.requireNonNull(activeStreamPermits, "activeStreamPermits");
         if (pollIntervalMillis < 1) throw new IllegalArgumentException("poll interval must be positive");
-        if (!activeStreamPermits.tryAcquire()) throw new IllegalStateException("active stream limit reached");
-        try {
-            this.monitor = scheduler.scheduleWithFixedDelay(this::checkAuthorization,
-                    pollIntervalMillis, pollIntervalMillis, TimeUnit.MILLISECONDS);
-        } catch (RuntimeException rejected) {
-            activeStreamPermits.release();
-            throw rejected;
-        }
+        this.monitor = scheduler.scheduleWithFixedDelay(this::checkAuthorization,
+                pollIntervalMillis, pollIntervalMillis, TimeUnit.MILLISECONDS);
     }
 
     boolean isInvalidated() {

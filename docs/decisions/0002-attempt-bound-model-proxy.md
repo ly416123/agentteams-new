@@ -12,7 +12,7 @@
 
 Credential Proxy 使用独立于 Gateway Session 的 Worker 模型代理凭据识别 Agent。凭据仅存 SHA-256；认证结果绑定 Agent 与 Tenant/Project/Team scope。代理对每个模型请求按该 Agent 查询 PostgreSQL 当前 Assignment、Attempt、Lease 和 Task `resource_scopes`，不接受客户端指定的租户或 Attempt。
 
-只有查询结果恰好包含一条有效执行时才创建内部 `AttemptExecutionContext`。Assignment、Attempt 和 Lease 必须处于活动状态，Lease 未过期，Task scope 必须与代理凭据绑定的 Agent scope 完全一致，并且存在对应的模型凭证引用。无活动执行、多条活动执行、撤销/过期凭据、缺 scope 或关系不一致时均拒绝请求。内部上下文最多有效 5 分钟，且不能晚于数据库 Lease 到期时间。流式响应期间同时按代理凭据 ID 重新验证代理凭据、Gateway Session 和当前 Tenant/Project/Team scope；身份、凭据引用或 Attempt/Lease 有变化时关闭上游流。活动流默认限制为 64 条，可通过 `AGENTTEAMS_CREDENTIAL_PROXY_MAX_ACTIVE_STREAMS` 配置，超限时拒绝新的代理流。
+只有查询结果恰好包含一条有效执行时才创建内部 `AttemptExecutionContext`。Assignment、Attempt 和 Lease 必须处于活动状态，Lease 未过期，Task scope 必须与代理凭据绑定的 Agent scope 完全一致，并且存在对应的模型凭证引用。无活动执行、多条活动执行、撤销/过期凭据、缺 scope 或关系不一致时均拒绝请求。内部上下文最多有效 5 分钟，且不能晚于数据库 Lease 到期时间。请求等待 Provider 响应头期间及流式传输期间，都按代理凭据 ID 重新验证代理凭据、Gateway Session 和当前 Tenant/Project/Team scope；身份、凭据引用或 Attempt/Lease 有变化时取消上游请求或关闭上游流。活动流默认限制为 64 条，在发送请求前获取名额，可通过 `AGENTTEAMS_CREDENTIAL_PROXY_MAX_ACTIVE_STREAMS` 配置，超限时拒绝新请求。
 
 代理自身解析上游模型 Secret 并转发请求。Worker 只持有代理凭据，不持有模型供应商 Secret。代理凭据与 Gateway Session 使用不同 audience、哈希记录和撤销路径；撤销 Gateway Session 同时使其关联的模型代理凭据失效。日志、事件和 Trace 不保存请求 Authorization、上游 Secret、提示词或模型响应正文。
 
@@ -25,7 +25,7 @@ Credential Proxy 使用独立于 Gateway Session 的 Worker 模型代理凭据�
 1. Enrollment 签发独立模型代理凭据，数据库只保存哈希，并与 Gateway Session、Agent scope 关联。
 2. Credential Proxy 以无登录函数/最小数据库角色验证凭据，并解析唯一有效的 Assignment/Attempt/Lease 与 Task scope。
 3. Credential Source 按数据库授权的 Tenant/Project 解析上游 Secret；Worker 网络只允许访问代理端点。
-4. Responses API 代理支持流式转发、超时、取消、限流和模型 allowlist；流式期间每秒复核活动代理凭据、Gateway Session 与 Attempt/Lease，并限制同时活动流数量；授权变化、到期或数据库不可用时关闭上游流；数据库或 Secret 解析失败时 fail-closed。
+4. Responses API 代理支持流式转发、超时、取消、限流和模型 allowlist；发送前获取有界活动流名额，并在等待响应头及流式期间每秒复核活动代理凭据、Gateway Session 与 Attempt/Lease；授权变化、到期或数据库不可用时取消上游请求或关闭上游流；数据库或 Secret 解析失败时 fail-closed。
 5. 在隔离 PostgreSQL 和固定 digest Worker 上验收签发、Attempt 归属、租约过期、撤销、Tenant A/B 交叉访问、流式响应和日志脱敏。
 
 ## 拒绝的授权输入

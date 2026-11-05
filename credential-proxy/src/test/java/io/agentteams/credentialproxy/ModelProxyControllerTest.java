@@ -53,8 +53,19 @@ class ModelProxyControllerTest {
                 UUID.fromString("88000000-0000-0000-0000-000000000005"),
                 UUID.fromString("88000000-0000-0000-0000-000000000001"),
                 "tenant-a", "project-a", "team-a", "file:provider_credential_worker_1");
+        ModelProxyAuthenticator authenticator = new ModelProxyAuthenticator() {
+            @Override
+            public Optional<AuthenticatedWorker> authenticate(String token) {
+                return PROXY_TOKEN.equals(token) ? Optional.of(worker) : Optional.empty();
+            }
+
+            @Override
+            public Optional<AuthenticatedWorker> revalidate(AuthenticatedWorker authenticated) {
+                return Optional.of(worker);
+            }
+        };
         ModelProxyService service = new ModelProxyService(
-                token -> PROXY_TOKEN.equals(token) ? Optional.of(worker) : Optional.empty(),
+                authenticator,
                 new AttemptExecutionContextResolver(ignored -> List.of(new ActiveAttemptCandidate(
                         worker.agentId(), worker.tenantId(), worker.projectId(), worker.teamId(),
                         UUID.fromString("88000000-0000-0000-0000-000000000002"),
