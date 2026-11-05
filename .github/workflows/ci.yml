@@ -47,7 +47,7 @@ jobs:
               "worker-enrollment/target/surefire-reports/TEST-io.agentteams.enrollment.GatewaySessionHandshakeTest.xml"
           ).getroot()
           for name, suite, expected_count in (
-              ("repository", report, "7"),
+              ("repository", report, "8"),
               ("signed OIDC to PostgreSQL", oidc_report, "6"),
               ("pinned Gateway gRPC session handshake", gateway_report, "5"),
           ):
