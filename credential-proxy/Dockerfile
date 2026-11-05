@@ -2,6 +2,8 @@ FROM maven:3.9.9-eclipse-temurin-21 AS build
 WORKDIR /workspace
 
 COPY pom.xml ./pom.xml
+COPY worker-enrollment/pom.xml ./worker-enrollment/pom.xml
+COPY worker-enrollment/src ./worker-enrollment/src
 COPY credential-proxy/pom.xml ./credential-proxy/pom.xml
 COPY credential-proxy/src ./credential-proxy/src
 RUN mvn --batch-mode --no-transfer-progress -f pom.xml -pl credential-proxy -am package -DskipTests
