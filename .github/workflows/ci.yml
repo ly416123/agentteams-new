@@ -109,7 +109,7 @@ jobs:
           import xml.etree.ElementTree as ET
 
           for class_name, expected in (
-              ("ModelProxyServiceTest", "7"),
+              ("ModelProxyServiceTest", "8"),
               ("ModelProxyControllerTest", "3"),
           ):
               report = ET.parse(

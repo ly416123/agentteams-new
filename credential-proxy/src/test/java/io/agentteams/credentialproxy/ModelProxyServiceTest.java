@@ -104,6 +104,32 @@ class ModelProxyServiceTest {
     }
 
     @Test
+    void rechecksAttemptAuthorizationAfterResolvingProviderCredential() {
+        AtomicInteger attemptChecks = new AtomicInteger();
+        AtomicBoolean credentialRead = new AtomicBoolean();
+        char[] providerToken = "provider-secret".toCharArray();
+        ActiveAttemptRepository changesDuringResolution = authenticatedWorker -> {
+            if (attemptChecks.incrementAndGet() == 1) {
+                return activeAttempts().findActiveAttempts(authenticatedWorker);
+            }
+            return List.of();
+        };
+        ModelProxyService service = service(token -> Optional.of(worker()), changesDuringResolution, context -> {
+            credentialRead.set(true);
+            return providerToken;
+        });
+
+        assertThatThrownBy(() -> service.forward(PROXY_TOKEN, REQUEST.getBytes()))
+                .isInstanceOfSatisfying(ModelProxyException.class,
+                        error -> assertThat(error.statusCode()).isEqualTo(403));
+
+        assertThat(attemptChecks).hasValue(2);
+        assertThat(credentialRead).isTrue();
+        assertThat(providerToken).containsOnly('\0');
+        assertThat(upstreamCalls).hasValue(0);
+    }
+
+    @Test
     void rejectsOversizedRequestBeforeAuthenticatingWorker() {
         AtomicBoolean authenticated = new AtomicBoolean();
         ModelProxyService service = service(token -> {

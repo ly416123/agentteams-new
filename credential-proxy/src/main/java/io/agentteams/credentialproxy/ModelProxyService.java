@@ -79,6 +79,7 @@ public final class ModelProxyService {
         }
 
         try {
+            revalidateAttemptBeforeForward(worker, context);
             HttpRequest request = HttpRequest.newBuilder(upstreamEndpoint)
                     .timeout(REQUEST_TIMEOUT)
                     .header("Authorization", "Bearer " + new String(providerToken))
@@ -109,6 +110,28 @@ public final class ModelProxyService {
         } finally {
             Arrays.fill(providerToken, '\0');
             Arrays.fill(normalizedBody, (byte) 0);
+        }
+    }
+
+    private void revalidateAttemptBeforeForward(AuthenticatedWorker worker, AttemptExecutionContext original) {
+        final AttemptExecutionContext current;
+        try {
+            current = contexts.resolve(worker);
+        } catch (AttemptExecutionDeniedException denied) {
+            throw new ModelProxyException(403);
+        } catch (RuntimeException unavailable) {
+            throw new ModelProxyException(503);
+        }
+        if (current.version() != original.version()
+                || !current.tenantId().equals(original.tenantId())
+                || !current.projectId().equals(original.projectId())
+                || !current.teamId().equals(original.teamId())
+                || !current.agentId().equals(original.agentId())
+                || !current.taskId().equals(original.taskId())
+                || !current.attemptId().equals(original.attemptId())
+                || !current.leaseId().equals(original.leaseId())
+                || !current.modelCredentialRef().equals(original.modelCredentialRef())) {
+            throw new ModelProxyException(403);
         }
     }
 
