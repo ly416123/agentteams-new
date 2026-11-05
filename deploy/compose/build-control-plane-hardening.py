@@ -75,9 +75,9 @@ def require_tests(source: Path) -> None:
 
     report = source / "integration-tests/target/failsafe-reports/TEST-io.agentteams.it.TaskEventScopeEndToEndIT.xml"
     suite = ET.parse(report).getroot()
-    if (suite.attrib["tests"] != "1" or suite.attrib["skipped"] != "0"
+    if (suite.attrib["tests"] != "2" or suite.attrib["skipped"] != "0"
             or suite.attrib["failures"] != "0" or suite.attrib["errors"] != "0"):
-        raise RuntimeError(f"required Gateway-to-Control-Plane tenant-scope test gate failed: {suite.attrib}")
+        raise RuntimeError(f"required Gateway/NATS-to-Control-Plane tenant-scope tests failed: {suite.attrib}")
 
 
 def main() -> int:
