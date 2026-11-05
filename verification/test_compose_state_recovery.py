@@ -104,7 +104,11 @@ networks:
 
                 compose(source, "exec", "-T", "postgres", "psql", "-U", "agentteams", "-d", "agentteams",
                         "-v", "ON_ERROR_STOP=1", "-c",
-                        "CREATE TABLE recovery_marker (value text PRIMARY KEY); INSERT INTO recovery_marker VALUES ('pg-marker');")
+                        "CREATE ROLE recovery_app LOGIN PASSWORD 'source-secret' NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS; "
+                        "CREATE TABLE recovery_marker (value text PRIMARY KEY); INSERT INTO recovery_marker VALUES ('pg-marker'); "
+                        "ALTER TABLE recovery_marker ENABLE ROW LEVEL SECURITY; "
+                        "CREATE POLICY recovery_app_policy ON recovery_marker TO recovery_app USING (true) WITH CHECK (true); "
+                        "GRANT SELECT ON recovery_marker TO recovery_app;")
                 for stream, subject in STREAMS.items():
                     nats(source, "stream", "add", stream, "--subjects", subject, "--defaults")
                     nats(source, "pub", subject, f"marker-{stream}")
@@ -133,6 +137,7 @@ networks:
                     capture_output=True, text=True, timeout=300,
                 )
                 self.assertEqual(backup_result.returncode, 0, backup_result.stderr)
+                self.assertNotIn(b"PASSWORD", (bundle / "roles.sql").read_bytes())
                 nats_backups = list((bundle / "nats").glob("*"))
                 for path in nats_backups:
                     self.assertEqual(path.stat().st_uid, os.geteuid(), f"backup owner mismatch: {path}")
@@ -160,6 +165,13 @@ networks:
                     capture_output=True, text=True, timeout=300,
                 )
                 self.assertEqual(restore_result.returncode, 0, restore_result.stderr)
+
+                restored_role = compose(target, "exec", "-T", "postgres", "psql", "-U", "agentteams", "-d", "agentteams",
+                                        "-At", "-c", "SELECT rolname || ':' || rolsuper || ':' || rolbypassrls || ':' || (rolpassword IS NULL) FROM pg_authid WHERE rolname='recovery_app'")
+                self.assertEqual(restored_role.strip(), "recovery_app:false:false:true")
+                restored_policy = compose(target, "exec", "-T", "postgres", "psql", "-U", "agentteams", "-d", "agentteams",
+                                          "-At", "-c", "SELECT count(*) FROM pg_policies WHERE tablename='recovery_marker' AND policyname='recovery_app_policy'")
+                self.assertEqual(restored_policy.strip(), "1")
 
                 restored = compose(target, "exec", "-T", "postgres", "psql", "-U", "agentteams", "-d", "agentteams",
                                    "-At", "-c", "SELECT value FROM recovery_marker")

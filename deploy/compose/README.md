@@ -125,7 +125,7 @@ docker compose --env-file .env --profile secure-api --profile worker-pool stop \
 ./start-workers.sh .env
 ```
 
-恢复只允许写入全新的 Compose 项目及空命名卷。脚本会校验 bundle SHA-256，恢复 PostgreSQL、NATS Stream 和可选对象存储；失败时删除本次创建的隔离项目卷。先验证恢复出的数据库/Stream/对象，再用同一个项目名启动应用：
+恢复只允许写入全新的 Compose 项目及空命名卷。脚本会校验 bundle SHA-256，先恢复不含密码哈希的 PostgreSQL 全局角色，再恢复 PostgreSQL、NATS Stream 和可选对象存储；Compose 初始化用户/角色 setup 会在应用启动前建立并重置运行账号。失败时删除本次创建的隔离项目卷。先验证恢复出的数据库/Stream/对象，再用同一个项目名启动应用：
 
 ```sh
 ./restore-state.sh .env /secure/backup/agentteams-2026-11-05 agentteams-restore-2026-11-05

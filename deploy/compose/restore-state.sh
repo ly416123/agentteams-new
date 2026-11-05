@@ -14,7 +14,7 @@ compose_file=${COMPOSE_FILE:-$script_dir/compose.yaml}
 case "$target" in ''|[!a-z0-9]*|*[!a-z0-9_-]*) echo "Invalid Compose project name" >&2; exit 2 ;; esac
 manifest="$bundle/manifest.json"
 if [ ! -r "$manifest" ] || [ ! -s "$bundle/MANIFEST.SHA256" ] \
-  || [ ! -s "$bundle/postgres.dump" ] || [ ! -s "$bundle/SHA256SUMS" ]; then
+  || [ ! -s "$bundle/postgres.dump" ] || [ ! -s "$bundle/roles.sql" ] || [ ! -s "$bundle/SHA256SUMS" ]; then
   echo "Backup bundle is incomplete" >&2
   exit 2
 fi
@@ -23,6 +23,10 @@ if command -v sha256sum >/dev/null 2>&1; then
 else
   (cd "$bundle" && shasum -a 256 -c MANIFEST.SHA256)
 fi
+if ! grep -q 'roles.sql' "$bundle/SHA256SUMS"; then
+  echo "Backup bundle is missing its global-role checksum" >&2
+  exit 2
+fi
 python3 - "$manifest" <<'PY'
 import json
 import sys
@@ -30,7 +34,7 @@ from pathlib import Path
 
 manifest = json.loads(Path(sys.argv[1]).read_text())
 expected = {"TASK_EVENTS", "AGENT_EVENTS", "CONTROL_EVENTS", "DEADLETTER_EVENTS"}
-if manifest.get("format_version") != 1 or set(manifest.get("nats_streams", [])) != expected:
+if manifest.get("format_version") != 1 or manifest.get("postgres_roles") != "roles.sql" or set(manifest.get("nats_streams", [])) != expected:
     raise SystemExit("Unsupported or incomplete backup manifest")
 archive = manifest.get("seaweedfs_archive")
 if archive not in (None, "seaweedfs.tar.gz"):
@@ -100,6 +104,9 @@ until compose exec -T postgres pg_isready -U agentteams -d agentteams >/dev/null
   if [ "$attempt" -ge 60 ]; then echo "Fresh PostgreSQL/NATS did not become ready" >&2; exit 1; fi
   sleep 2
 done
+compose exec -T postgres sh -ec \
+  'PGPASSWORD="$POSTGRES_PASSWORD" psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d postgres' \
+  < "$bundle/roles.sql"
 compose exec -T postgres sh -ec \
   'PGPASSWORD="$POSTGRES_PASSWORD" pg_restore --clean --if-exists --no-owner --no-privileges --exit-on-error -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
   < "$bundle/postgres.dump"

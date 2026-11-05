@@ -53,6 +53,26 @@ compose exec -T postgres sh -ec \
   'PGPASSWORD="$POSTGRES_PASSWORD" pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" --format=custom --no-owner --no-privileges' \
   > "$bundle/postgres.dump"
 chmod 600 "$bundle/postgres.dump"
+compose exec -T postgres sh -ec \
+  'PGPASSWORD="$POSTGRES_PASSWORD" pg_dumpall -U "$POSTGRES_USER" --roles-only' \
+  > "$bundle/roles.raw.sql"
+python3 - "$bundle/roles.raw.sql" "$bundle/roles.sql" <<'PY'
+import sys
+from pathlib import Path
+
+source, destination = map(Path, sys.argv[1:])
+lines = source.read_text().splitlines()
+roles = []
+for line in lines:
+    if line.startswith(("CREATE ROLE postgres;", "ALTER ROLE postgres ", "CREATE ROLE agentteams;", "ALTER ROLE agentteams ")):
+        continue
+    if line.startswith("ALTER ROLE ") and " PASSWORD " in line:
+        line = line[:line.index(" PASSWORD ")] + ";"
+    roles.append(line)
+destination.write_text("\n".join(roles) + "\n")
+source.unlink()
+PY
+chmod 600 "$bundle/roles.sql"
 
 network="${project}_data"
 docker network inspect "$network" >/dev/null
@@ -80,15 +100,15 @@ fi
 
 if command -v sha256sum >/dev/null 2>&1; then
   if [ "$storage_archive" = true ]; then
-    (cd "$bundle" && find postgres.dump nats seaweedfs.tar.gz -type f -exec sha256sum {} + > SHA256SUMS)
+    (cd "$bundle" && find postgres.dump roles.sql nats seaweedfs.tar.gz -type f -exec sha256sum {} + > SHA256SUMS)
   else
-    (cd "$bundle" && find postgres.dump nats -type f -exec sha256sum {} + > SHA256SUMS)
+    (cd "$bundle" && find postgres.dump roles.sql nats -type f -exec sha256sum {} + > SHA256SUMS)
   fi
 else
   if [ "$storage_archive" = true ]; then
-    (cd "$bundle" && find postgres.dump nats seaweedfs.tar.gz -type f -exec shasum -a 256 {} + > SHA256SUMS)
+    (cd "$bundle" && find postgres.dump roles.sql nats seaweedfs.tar.gz -type f -exec shasum -a 256 {} + > SHA256SUMS)
   else
-    (cd "$bundle" && find postgres.dump nats -type f -exec shasum -a 256 {} + > SHA256SUMS)
+    (cd "$bundle" && find postgres.dump roles.sql nats -type f -exec shasum -a 256 {} + > SHA256SUMS)
   fi
 fi
 chmod 600 "$bundle/SHA256SUMS"
@@ -104,6 +124,7 @@ manifest = {
     "source_compose_project": sys.argv[2],
     "created_at": datetime.now(timezone.utc).isoformat(),
     "postgres_dump": "postgres.dump",
+    "postgres_roles": "roles.sql",
     "nats_streams": ["TASK_EVENTS", "AGENT_EVENTS", "CONTROL_EVENTS", "DEADLETTER_EVENTS"],
     "seaweedfs_archive": "seaweedfs.tar.gz" if sys.argv[3] == "true" else None,
     "consistency_requirement": "application producers and consumers were quiesced during backup",
