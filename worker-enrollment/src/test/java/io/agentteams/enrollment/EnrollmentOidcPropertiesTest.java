@@ -68,5 +68,9 @@ class EnrollmentOidcPropertiesTest {
 
         properties.setAllowInsecureLoopback(true);
         assertThatCode(properties::validate).doesNotThrowAnyException();
+
+        properties.setIssuerUri("http://localhost:18080/issuer");
+        properties.setJwkSetUri("http://127.0.0.1:18080/keys");
+        assertThatCode(properties::validate).doesNotThrowAnyException();
     }
 }
