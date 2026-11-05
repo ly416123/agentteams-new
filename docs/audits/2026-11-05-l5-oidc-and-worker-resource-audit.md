@@ -57,3 +57,9 @@ JWKS 当前返回 2 个元数据项：`RS256/sig` 与 `RSA-OAEP/enc`。只检查
 2. 在取得受控测试主体前，只能完成 Discovery/JWKS 和配置契约核对；不能声称完成真实 OIDC 登录或多租户 Worker 验收。
 3. 模型代理需要专用、最小权限的 Provider 凭据或受信任代理接入。旧 Worker 的 ChatGPT Plan OAuth Secret 不作为替代品。
 4. 凭据值不应通过聊天、命令行参数、日志、仓库或 Compose `.env` 传递；仅记录文件路径与 Secret 引用名。
+
+## 2026-11-06 Worker Pod 归属复核
+
+使用 `readonly-pod-logs` 只读读取 `worker-*` Pod 元数据，没有读取任何 Secret 值。当前可见 Worker 均带有 `app.kubernetes.io/managed-by=agentteams-operator`、`app.kubernetes.io/name=agentteams-worker` 与 `agentteams.io/runtime=AGENTSCOPE` 标签，镜像为旧版 `agentteams-agent-worker:l5-gpt56-20261022-amd64`。Pod 环境变量引用旧 Gateway 与 MCP Secret。由此可将这些 Pod 判定为旧 `agentteams-java`/Operator 工作负载，不能计作 `agentteams-new` Worker 验收资源，也不能将其 Gateway/MCP 凭据当作新 Credential Proxy 的模型凭据。
+
+Keycloak Pod 使用 `quay.io/keycloak/keycloak:25.0.6`。当前 RBAC 不允许读取 Deployment、Service、Ingress、ConfigMap 或 Secret，因此专用 HTTPS 入口、Issuer Claim 映射以及是否另有 `agentteams-new` 资源仍未核实。本机搜索没有发现真实模型代理 Token 文件。L5 真实验收仍需要可信 HTTPS OIDC 配置和受控测试主体，以及专供新项目使用的模型凭据与独立 Worker Enrollment Token 文件；Secret 正文无需开放给审计账号。
