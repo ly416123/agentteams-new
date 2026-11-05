@@ -139,6 +139,8 @@ Enrollment OIDC 传输安全加固（2026-11-05）：配置类拒绝远程 HTTP 
 
 恢复演练 CI 跨平台修正（2026-11-05）：首次运行 `42035500129` 通过 Java/Maven、PostgreSQL 与凭据代理门禁，但发现 Runner 无法清理 NATS 容器 root 所有的备份树；测试 teardown 已改由临时 Alpine 容器清理。运行 `42036455339` 揭示 Linux 权限问题：NATS root 写出的 `0600` 文件不能被宿主 Runner 读取以生成 SHA-256 清单；运行 `42037397825` 又发现 GitHub API 更新文件时必须显式保留 `100755` 可执行模式。现由备份脚本在 NATS 快照完成后将文件所有权交还调用用户，测试 teardown 使用容器清理 root 文件。最终 macOS 完整 verification 21 项通过，Linux CI `42037756844` 全绿（Java/PostgreSQL/凭据代理门禁、恢复集成、Compose/shell 校验和 Credential Proxy 镜像构建）。NATS 快照恢复及文件权限校验通过。
 
+Agent scope 生命周期闭环（2026-11-05）：新增 PostgreSQL 集成测试验证 Agent scope 不变时保留会话、scope tuple 改变或删除时撤销现存 Gateway Session 与关联模型代理凭据。`worker_enrollment_scope_owner` 仍为 `NOLOGIN/NOBYPASSRLS`，仅能读取 `agent_id/revoked_at` 并更新 `revoked_at`；Writer 不获 scope 表直接写权限。CI `42044993010` 暴露缺少 `revoked_at` 读取权限，`42045339661` 验证触发器逻辑后暴露测试 JDBC 时间参数类型问题；随后修正并把 PostgreSQL 门禁用例数从 7 调整为 8。CI `42046157692` 全绿，PostgreSQL 集成用例确实执行，Attempt 隔离、凭证代理、OIDC/Gateway、Compose 和容器构建门禁均通过。本机未配置 Docker socket，因此本地 Testcontainers 用例被跳过；以 Linux CI 容器执行结果作为该集成测试证据。L5 只读身份仍无法枚举 Service/Ingress/Deployment，未确认 agentteams-new 的 Worker/Provider 凭据文件；现有可见组件属于旧 agentteams-java 环境。
+
 ## 批次 5：解除旧应用镜像的长期依赖
 
 1. 依据批次 1–4 的真实任务和安全验收结果，列出新路径实际需要的 Control Plane、Gateway、Worker 能力及稳定 API/事件/数据库边界。
