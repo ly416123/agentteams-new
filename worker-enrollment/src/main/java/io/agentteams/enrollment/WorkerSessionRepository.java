@@ -7,6 +7,8 @@ import java.util.UUID;
 public interface WorkerSessionRepository {
     void setExecutionScope(WorkerScope scope);
 
+    boolean hasActiveProjectManagementMembership(String subject, WorkerScope scope);
+
     Optional<WorkerRegistration> findAgent(UUID agentId);
 
     void insert(WorkerSessionRecord session);

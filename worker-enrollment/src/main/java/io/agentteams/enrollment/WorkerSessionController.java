@@ -34,7 +34,7 @@ public class WorkerSessionController {
         WorkerScope caller = callerScope(jwt);
         Duration ttl = request == null || request.ttlSeconds() == null
                 ? null : Duration.ofSeconds(request.ttlSeconds());
-        IssuedWorkerSession issued = sessions.issue(agentId, caller, permissions(jwt), ttl,
+        IssuedWorkerSession issued = sessions.issue(agentId, jwt.getSubject(), caller, permissions(jwt), ttl,
                 request == null ? null : request.modelCredentialRef());
         return new IssueSessionResponse(issued.sessionId(), issued.agentId(), issued.accessToken(), issued.expiresAt(),
                 issued.modelProxyCredentialId(), issued.modelProxyToken());
@@ -44,7 +44,7 @@ public class WorkerSessionController {
     public ResponseEntity<Void> revoke(@PathVariable("agentId") UUID agentId,
             @PathVariable("sessionId") UUID sessionId,
             @AuthenticationPrincipal Jwt jwt) {
-        sessions.revoke(agentId, sessionId, callerScope(jwt), permissions(jwt));
+        sessions.revoke(agentId, sessionId, jwt.getSubject(), callerScope(jwt), permissions(jwt));
         return ResponseEntity.noContent().build();
     }
 

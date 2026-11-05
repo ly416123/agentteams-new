@@ -28,7 +28,7 @@ NATS JetStream ──► Agent Gateway ◄─────┘ command persistence
 - PostgreSQL 保存任务、Attempt、Assignment、Lease、授权关系、Outbox 和可恢复状态，是业务事实源。
 - NATS JetStream 承载持久事件。Gateway 持久化命令并按序号、ACK 游标处理断线恢复。
 - Worker 静态部署并主动注册。控制面不接触 Docker Socket，不持有创建容器的权限。
-- 固定 Worker 的 Gateway 会话由独立 `worker-enrollment` 服务签发：调用者须通过 OIDC issuer、签名、audience 验证，并持有 `worker:session:manage` 权限；调用 scope 必须与 Agent 注册元数据中的 tenant/project/team 完全一致。明文随机 token 只返回一次，数据库仅保存 SHA-256，TTL 限制在 1 小时至 30 天。
+- 固定 Worker 的 Gateway 会话由独立 `worker-enrollment` 服务签发：调用者须通过 OIDC issuer、签名、audience 验证，并持有 `worker:session:manage` 权限；调用 scope 必须与 Agent 注册元数据中的 tenant/project/team 完全一致，且 JWT subject 在该 Tenant/Project 中必须仍有 ACTIVE 的 OWNER/ADMIN/OPERATOR Membership，Tenant 与 Project 也必须为 ACTIVE。每次签发和撤销时都实时查验当前数据库状态，因此已禁用成员不能凭未过期 JWT 管理会话。明文随机 token 只返回一次，数据库仅保存 SHA-256，TTL 限制在 1 小时至 30 天。
 - Enrollment 数据库帐号只拥有读取 `agents`、读取/插入/更新 `agent_sessions` 的权限；Compose 为每个 Worker 槽位单独加载 `0600` 凭据文件。v0.1.5 Gateway 在握手时校验 session，撤销不主动断开现有连接。
 - Matrix 是可选的人机协作适配器；不能作为调度总线或任务状态库。
 - Artifact 正文存储在隔离的对象存储命名空间，通过租户授权后的短期 URL 访问。

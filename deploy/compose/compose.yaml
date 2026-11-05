@@ -146,7 +146,7 @@ services:
         ready=0
         attempt=0
         while [ "$$attempt" -lt 90 ]; do
-          if psql -Atqc "SELECT to_regclass('public.agents') IS NOT NULL AND to_regclass('public.agent_sessions') IS NOT NULL AND to_regclass('public.task_attempts') IS NOT NULL AND to_regclass('public.task_assignments') IS NOT NULL AND to_regclass('public.agent_leases') IS NOT NULL AND to_regclass('public.resource_scopes') IS NOT NULL" | grep -qx t; then ready=1; break; fi
+          if psql -Atqc "SELECT to_regclass('public.agents') IS NOT NULL AND to_regclass('public.agent_sessions') IS NOT NULL AND to_regclass('public.task_attempts') IS NOT NULL AND to_regclass('public.task_assignments') IS NOT NULL AND to_regclass('public.agent_leases') IS NOT NULL AND to_regclass('public.resource_scopes') IS NOT NULL AND to_regclass('public.tenants') IS NOT NULL AND to_regclass('public.projects') IS NOT NULL AND to_regclass('public.project_memberships') IS NOT NULL" | grep -qx t; then ready=1; break; fi
           attempt=$$((attempt + 1))
           sleep 2
         done

@@ -47,7 +47,7 @@ class WorkerSessionControllerSecurityTest {
     @Test
     void rejectsAuthenticatedOperatorsWithoutTheEnrollmentPermission() throws Exception {
         doThrow(WorkerEnrollmentException.forbidden("worker session management permission is required"))
-                .when(sessions).issue(any(), any(), anySet(), isNull(), isNull());
+                .when(sessions).issue(any(), any(), any(), anySet(), isNull(), isNull());
         Jwt jwt = Jwt.withTokenValue("test-token").header("alg", "none")
                 .claim("tenant", "tenant-a").claim("project", "project-a").claim("team", "team-a")
                 .subject("operator").build();

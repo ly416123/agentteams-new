@@ -34,6 +34,16 @@ public class JdbcWorkerSessionRepository implements WorkerSessionRepository {
     }
 
     @Override
+    public boolean hasActiveProjectManagementMembership(String subject, WorkerScope scope) {
+        Objects.requireNonNull(subject, "subject");
+        Objects.requireNonNull(scope, "scope");
+        Boolean allowed = jdbc.queryForObject(
+                "SELECT public.worker_enrollment_has_active_project_management_membership(?, ?, ?)",
+                Boolean.class, subject, scope.tenant(), scope.project());
+        return Boolean.TRUE.equals(allowed);
+    }
+
+    @Override
     public Optional<WorkerRegistration> findAgent(UUID agentId) {
         return jdbc.query("""
                 SELECT agent.phase, scoped.tenant_id, scoped.project_id, scoped.team_id

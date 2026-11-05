@@ -44,6 +44,55 @@ ALTER ROLE worker_enrollment_scope_owner
     WITH NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
 ALTER TABLE worker_enrollment_agent_scopes OWNER TO worker_enrollment_scope_owner;
 
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'worker_enrollment_membership_owner') THEN
+        CREATE ROLE worker_enrollment_membership_owner
+            NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+    END IF;
+END;
+$$;
+ALTER ROLE worker_enrollment_membership_owner
+    WITH NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+GRANT USAGE ON SCHEMA public TO worker_enrollment_membership_owner;
+GRANT SELECT (tenant_id, project_id, subject, role, status)
+    ON TABLE project_memberships TO worker_enrollment_membership_owner;
+GRANT SELECT (id, tenant_id, status) ON TABLE projects TO worker_enrollment_membership_owner;
+GRANT SELECT (id, status) ON TABLE tenants TO worker_enrollment_membership_owner;
+
+CREATE OR REPLACE FUNCTION worker_enrollment_has_active_project_management_membership(
+    p_subject TEXT, p_tenant_id TEXT, p_project_id TEXT)
+RETURNS BOOLEAN
+LANGUAGE SQL
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+    SELECT EXISTS (
+        SELECT 1
+          FROM public.project_memberships membership
+          JOIN public.projects project
+            ON project.id = membership.project_id
+           AND project.tenant_id = membership.tenant_id
+          JOIN public.tenants tenant
+            ON tenant.id::TEXT = membership.tenant_id
+         WHERE membership.subject = p_subject
+           AND membership.tenant_id = p_tenant_id
+           AND membership.project_id::TEXT = p_project_id
+           AND membership.status = 'ACTIVE'
+           AND membership.role IN ('OWNER', 'ADMIN', 'OPERATOR')
+           AND project.status = 'ACTIVE'
+           AND tenant.status = 'ACTIVE'
+    );
+$$;
+ALTER FUNCTION worker_enrollment_has_active_project_management_membership(TEXT, TEXT, TEXT)
+    OWNER TO worker_enrollment_membership_owner;
+REVOKE ALL ON FUNCTION worker_enrollment_has_active_project_management_membership(TEXT, TEXT, TEXT)
+    FROM PUBLIC;
+REVOKE ALL ON TABLE project_memberships, projects, tenants FROM worker_enrollment;
+GRANT EXECUTE ON FUNCTION worker_enrollment_has_active_project_management_membership(TEXT, TEXT, TEXT)
+    TO worker_enrollment;
+
 CREATE OR REPLACE FUNCTION worker_enrollment_sync_agent_scope()
 RETURNS trigger
 LANGUAGE plpgsql

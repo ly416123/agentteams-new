@@ -44,6 +44,9 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 class OidcJwtIntegrationTest {
     private static final String ISSUER = "https://issuer.enrollment-test.invalid";
     private static final String AUDIENCE = "agentteams-enrollment-test";
+    private static final UUID TENANT_ID = UUID.fromString("55000000-0000-0000-0000-000000000010");
+    private static final UUID PROJECT_ID = UUID.fromString("55000000-0000-0000-0000-000000000011");
+    private static final String SUBJECT = "local-test-operator";
     private static final UUID AGENT_ID = UUID.fromString("55000000-0000-0000-0000-000000000001");
     private static final String KEY_ID = "enrollment-test-key";
     @Container
@@ -107,6 +110,9 @@ class OidcJwtIntegrationTest {
         jdbc.execute("DROP TABLE IF EXISTS worker_model_proxy_credentials CASCADE");
         jdbc.execute("DROP TABLE IF EXISTS agent_sessions");
         jdbc.execute("DROP TABLE IF EXISTS worker_enrollment_agent_scopes CASCADE");
+        jdbc.execute("DROP TABLE IF EXISTS project_memberships CASCADE");
+        jdbc.execute("DROP TABLE IF EXISTS projects CASCADE");
+        jdbc.execute("DROP TABLE IF EXISTS tenants CASCADE");
         jdbc.execute("DROP TABLE IF EXISTS agents");
         jdbc.execute("DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'worker_enrollment') THEN "
                 + "CREATE ROLE worker_enrollment LOGIN PASSWORD 'enrollment-test-password' "
@@ -132,8 +138,17 @@ class OidcJwtIntegrationTest {
                     created_at TIMESTAMPTZ NOT NULL
                 )
                 """);
+        jdbc.execute("CREATE TABLE tenants(id UUID PRIMARY KEY, status TEXT NOT NULL)");
+        jdbc.execute("CREATE TABLE projects(id UUID PRIMARY KEY, tenant_id TEXT NOT NULL, status TEXT NOT NULL)");
+        jdbc.execute("""
+                CREATE TABLE project_memberships(
+                    tenant_id TEXT NOT NULL, project_id UUID NOT NULL, subject TEXT NOT NULL,
+                    role TEXT NOT NULL, status TEXT NOT NULL,
+                    PRIMARY KEY (tenant_id, project_id, subject))
+                """);
         PostgresScriptRunner.run(jdbc, "db/worker-enrollment-rls.sql");
-        insertAgent("tenant-a", "project-a", "team-a");
+        insertAgent(TENANT_ID.toString(), PROJECT_ID.toString(), "team-a");
+        insertActiveProjectMembership();
     }
 
     @Test
@@ -197,6 +212,33 @@ class OidcJwtIntegrationTest {
     }
 
     @Test
+    void rejectsIssueAndRevocationImmediatelyAfterProjectMembershipIsDisabled() throws Exception {
+        MvcResult issueResult = mvc.perform(post("/api/v1/agents/{agentId}/sessions", AGENT_ID)
+                        .header("Authorization", "Bearer " + token(ISSUER, AUDIENCE))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"ttlSeconds\":3600}"))
+                .andExpect(status().isOk())
+                .andReturn();
+        UUID sessionId = UUID.fromString(objectMapper.readTree(issueResult.getResponse().getContentAsString())
+                .required("sessionId").asText());
+
+        jdbc.update("UPDATE project_memberships SET status = 'INACTIVE' WHERE tenant_id = ? AND project_id = ? AND subject = ?",
+                TENANT_ID.toString(), PROJECT_ID, SUBJECT);
+
+        mvc.perform(post("/api/v1/agents/{agentId}/sessions", AGENT_ID)
+                        .header("Authorization", "Bearer " + token(ISSUER, AUDIENCE))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"ttlSeconds\":3600}"))
+                .andExpect(status().isNotFound());
+        mvc.perform(delete("/api/v1/agents/{agentId}/sessions/{sessionId}", AGENT_ID, sessionId)
+                        .header("Authorization", "Bearer " + token(ISSUER, AUDIENCE)))
+                .andExpect(status().isNotFound());
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM agent_sessions", Long.class)).isEqualTo(1);
+        assertThat(jdbc.queryForObject("SELECT revoked_at IS NULL FROM agent_sessions WHERE id = ?",
+                Boolean.class, sessionId)).isTrue();
+    }
+
+    @Test
     void rejectsLocallySignedTokenWithWrongAudience() throws Exception {
         mvc.perform(post("/api/v1/agents/{agentId}/sessions", AGENT_ID)
                         .header("Authorization", "Bearer " + token(ISSUER, "other-api")))
@@ -235,7 +277,7 @@ class OidcJwtIntegrationTest {
     }
 
     private static String token(String issuer, String audience) throws Exception {
-        return token(issuer, audience, "tenant-a", "project-a", "team-a");
+        return token(issuer, audience, TENANT_ID.toString(), PROJECT_ID.toString(), "team-a");
     }
 
     private static String token(String issuer, String audience, String tenant, String project, String team)
@@ -244,7 +286,7 @@ class OidcJwtIntegrationTest {
         JWTClaimsSet claims = new JWTClaimsSet.Builder()
                 .issuer(issuer)
                 .audience(audience)
-                .subject("local-test-operator")
+                .subject(SUBJECT)
                 .issueTime(Date.from(now))
                 .expirationTime(Date.from(now.plusSeconds(300)))
                 .claim("tenant", tenant)
@@ -265,5 +307,14 @@ class OidcJwtIntegrationTest {
         jdbc.update("INSERT INTO agents(id, name, phase, metadata) VALUES (?, ?, ?, ?::jsonb)", AGENT_ID,
                 "enrollment-http-agent", "READY", "{\"scope\":{\"tenant\":\"" + tenant
                         + "\",\"project\":\"" + project + "\",\"team\":\"" + team + "\"}}");
+    }
+
+    private void insertActiveProjectMembership() {
+        jdbc.update("INSERT INTO tenants(id, status) VALUES (?, 'ACTIVE')", TENANT_ID);
+        jdbc.update("INSERT INTO projects(id, tenant_id, status) VALUES (?, ?, 'ACTIVE')",
+                PROJECT_ID, TENANT_ID.toString());
+        jdbc.update("INSERT INTO project_memberships(tenant_id, project_id, subject, role, status) "
+                        + "VALUES (?, ?, ?, 'ADMIN', 'ACTIVE')",
+                TENANT_ID.toString(), PROJECT_ID, SUBJECT);
     }
 }

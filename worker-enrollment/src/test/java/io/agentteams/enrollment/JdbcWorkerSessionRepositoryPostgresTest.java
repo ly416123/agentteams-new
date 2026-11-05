@@ -23,6 +23,8 @@ class JdbcWorkerSessionRepositoryPostgresTest {
     private static final UUID SESSION_ID = UUID.fromString("66000000-0000-0000-0000-000000000002");
     private static final UUID OTHER_AGENT_ID = UUID.fromString("66000000-0000-0000-0000-000000000007");
     private static final UUID OTHER_SESSION_ID = UUID.fromString("66000000-0000-0000-0000-000000000008");
+    private static final UUID MEMBERSHIP_TENANT_ID = UUID.fromString("66000000-0000-0000-0000-000000000020");
+    private static final UUID MEMBERSHIP_PROJECT_ID = UUID.fromString("66000000-0000-0000-0000-000000000021");
     private static final String TOKEN_HASH = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     @Container
@@ -41,6 +43,9 @@ class JdbcWorkerSessionRepositoryPostgresTest {
         removeTestRoleIfPresent();
         jdbc.execute("DROP TABLE IF EXISTS worker_model_proxy_credentials CASCADE");
         jdbc.execute("DROP TABLE IF EXISTS agent_sessions");
+        jdbc.execute("DROP TABLE IF EXISTS project_memberships CASCADE");
+        jdbc.execute("DROP TABLE IF EXISTS projects CASCADE");
+        jdbc.execute("DROP TABLE IF EXISTS tenants CASCADE");
         jdbc.execute("DROP TABLE IF EXISTS agents");
         jdbc.execute("DROP TABLE IF EXISTS platform_identities");
         jdbc.execute("""
@@ -62,6 +67,14 @@ class JdbcWorkerSessionRepositoryPostgresTest {
                 )
                 """);
         jdbc.execute("CREATE TABLE platform_identities (id UUID PRIMARY KEY, subject TEXT NOT NULL)");
+        jdbc.execute("CREATE TABLE tenants(id UUID PRIMARY KEY, status TEXT NOT NULL)");
+        jdbc.execute("CREATE TABLE projects(id UUID PRIMARY KEY, tenant_id TEXT NOT NULL, status TEXT NOT NULL)");
+        jdbc.execute("""
+                CREATE TABLE project_memberships(
+                    tenant_id TEXT NOT NULL, project_id UUID NOT NULL, subject TEXT NOT NULL,
+                    role TEXT NOT NULL, status TEXT NOT NULL,
+                    PRIMARY KEY (tenant_id, project_id, subject))
+                """);
         jdbc.execute("CREATE ROLE worker_enrollment LOGIN PASSWORD 'enrollment-test-password' NOSUPERUSER NOBYPASSRLS");
         jdbc.execute("CREATE ROLE agentteams_runtime NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS");
         jdbc.execute("GRANT CONNECT ON DATABASE enrollment_test TO worker_enrollment");
@@ -200,6 +213,40 @@ class JdbcWorkerSessionRepositoryPostgresTest {
                     "2222222222222222222222222222222222222222222222222222222222222222",
                     "vault://tenant-b/project-b/chatgpt", Instant.now().plusSeconds(3600), Instant.now()));
         })).isInstanceOf(org.springframework.dao.DataAccessException.class);
+    }
+
+    @Test
+    void membershipFunctionUsesCurrentActiveRoleAndDoesNotGrantDirectMembershipReads() {
+        jdbc.update("INSERT INTO tenants(id, status) VALUES (?, 'ACTIVE')", MEMBERSHIP_TENANT_ID);
+        jdbc.update("INSERT INTO projects(id, tenant_id, status) VALUES (?, ?, 'ACTIVE')",
+                MEMBERSHIP_PROJECT_ID, MEMBERSHIP_TENANT_ID.toString());
+        jdbc.update("INSERT INTO project_memberships(tenant_id, project_id, subject, role, status) "
+                        + "VALUES (?, ?, 'operator', 'ADMIN', 'ACTIVE')",
+                MEMBERSHIP_TENANT_ID.toString(), MEMBERSHIP_PROJECT_ID);
+        var restrictedDataSource = new DriverManagerDataSource(
+                POSTGRES.getJdbcUrl(), "worker_enrollment", "enrollment-test-password");
+        JdbcWorkerSessionRepository restrictedRepository = new JdbcWorkerSessionRepository(
+                new JdbcTemplate(restrictedDataSource));
+        WorkerScope scope = new WorkerScope(MEMBERSHIP_TENANT_ID.toString(), MEMBERSHIP_PROJECT_ID.toString(), "team-a");
+
+        assertThat(restrictedRepository.hasActiveProjectManagementMembership("operator", scope)).isTrue();
+        assertThatThrownBy(() -> new JdbcTemplate(restrictedDataSource).queryForObject(
+                "SELECT count(*) FROM project_memberships", Long.class))
+                .isInstanceOf(org.springframework.dao.DataAccessException.class);
+        assertThat(jdbc.queryForObject("SELECT rolbypassrls OR rolsuper OR rolcanlogin "
+                + "FROM pg_roles WHERE rolname = 'worker_enrollment_membership_owner'", Boolean.class)).isFalse();
+
+        jdbc.update("UPDATE project_memberships SET role = 'VIEWER' WHERE subject = 'operator'");
+        assertThat(restrictedRepository.hasActiveProjectManagementMembership("operator", scope)).isFalse();
+        jdbc.update("UPDATE project_memberships SET role = 'OPERATOR', status = 'INACTIVE' WHERE subject = 'operator'");
+        assertThat(restrictedRepository.hasActiveProjectManagementMembership("operator", scope)).isFalse();
+        jdbc.update("UPDATE project_memberships SET status = 'ACTIVE' WHERE subject = 'operator'");
+        jdbc.update("UPDATE tenants SET status = 'SUSPENDED' WHERE id = ?", MEMBERSHIP_TENANT_ID);
+        assertThat(restrictedRepository.hasActiveProjectManagementMembership("operator", scope)).isFalse();
+        jdbc.update("UPDATE tenants SET status = 'ACTIVE' WHERE id = ?", MEMBERSHIP_TENANT_ID);
+        jdbc.update("UPDATE projects SET status = 'ARCHIVED' WHERE id = ?", MEMBERSHIP_PROJECT_ID);
+        assertThat(restrictedRepository.hasActiveProjectManagementMembership("operator", scope)).isFalse();
+        assertThat(restrictedRepository.hasActiveProjectManagementMembership("other-subject", scope)).isFalse();
     }
 
     @Test
@@ -443,6 +490,7 @@ class JdbcWorkerSessionRepositoryPostgresTest {
         Boolean exists = jdbc.queryForObject(
                 "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'worker_enrollment')", Boolean.class);
         if (Boolean.TRUE.equals(exists)) {
+            jdbc.execute("DROP FUNCTION IF EXISTS worker_enrollment_has_active_project_management_membership(TEXT, TEXT, TEXT)");
             jdbc.execute("DROP POLICY IF EXISTS worker_enrollment_agents_scope ON agents");
             jdbc.execute("DROP POLICY IF EXISTS worker_enrollment_sessions_scope ON agent_sessions");
             jdbc.execute("DROP POLICY IF EXISTS worker_enrollment_model_proxy_credentials_insert_scope "
@@ -464,6 +512,8 @@ class JdbcWorkerSessionRepositoryPostgresTest {
             jdbc.execute("DROP TABLE IF EXISTS worker_enrollment_agent_scopes");
             jdbc.execute("DROP OWNED BY worker_enrollment_scope_owner");
             jdbc.execute("DROP ROLE worker_enrollment_scope_owner");
+            jdbc.execute("DROP OWNED BY worker_enrollment_membership_owner");
+            jdbc.execute("DROP ROLE worker_enrollment_membership_owner");
         }
     }
 }

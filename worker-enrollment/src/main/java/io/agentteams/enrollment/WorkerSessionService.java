@@ -38,17 +38,19 @@ public class WorkerSessionService {
     }
 
     @Transactional
-    public IssuedWorkerSession issue(UUID agentId, WorkerScope callerScope, Set<String> permissions,
+    public IssuedWorkerSession issue(UUID agentId, String subject, WorkerScope callerScope, Set<String> permissions,
             Duration requestedTtl) {
-        return issue(agentId, callerScope, permissions, requestedTtl, null);
+        return issue(agentId, subject, callerScope, permissions, requestedTtl, null);
     }
 
     @Transactional
-    public IssuedWorkerSession issue(UUID agentId, WorkerScope callerScope, Set<String> permissions,
+    public IssuedWorkerSession issue(UUID agentId, String subject, WorkerScope callerScope, Set<String> permissions,
             Duration requestedTtl, String modelCredentialRef) {
         requirePermission(permissions);
         Objects.requireNonNull(agentId, "agentId");
+        requireSubject(subject);
         Objects.requireNonNull(callerScope, "callerScope");
+        requireActiveMembership(subject, callerScope);
         if (modelCredentialRef != null) validateModelCredentialRef(modelCredentialRef);
         Duration ttl = requestedTtl == null ? defaultTtl : validateTtl(requestedTtl);
 
@@ -78,11 +80,13 @@ public class WorkerSessionService {
     }
 
     @Transactional
-    public void revoke(UUID agentId, UUID sessionId, WorkerScope callerScope, Set<String> permissions) {
+    public void revoke(UUID agentId, UUID sessionId, String subject, WorkerScope callerScope, Set<String> permissions) {
         requirePermission(permissions);
         Objects.requireNonNull(agentId, "agentId");
         Objects.requireNonNull(sessionId, "sessionId");
+        requireSubject(subject);
         Objects.requireNonNull(callerScope, "callerScope");
+        requireActiveMembership(subject, callerScope);
         repository.setExecutionScope(callerScope);
         Optional<WorkerSessionRepository.WorkerSessionOwnership> session =
                 repository.findSessionForUpdate(agentId, sessionId);
@@ -97,6 +101,18 @@ public class WorkerSessionService {
     private static void requirePermission(Set<String> permissions) {
         if (permissions == null || !permissions.contains(MANAGE_PERMISSION)) {
             throw WorkerEnrollmentException.forbidden("worker session management permission is required");
+        }
+    }
+
+    private void requireActiveMembership(String subject, WorkerScope scope) {
+        if (!repository.hasActiveProjectManagementMembership(subject, scope)) {
+            throw new WorkerEnrollmentException("Worker session is not available in caller scope");
+        }
+    }
+
+    private static void requireSubject(String subject) {
+        if (subject == null || subject.isBlank()) {
+            throw WorkerEnrollmentException.forbidden("authenticated subject is required");
         }
     }
 
