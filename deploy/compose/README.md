@@ -52,7 +52,14 @@ Control Plane 仅绑定到 `127.0.0.1:${CONTROL_PLANE_PORT}`；PostgreSQL、NATS
 
 `WORKER_REPLICAS` 取值为 0 到 8。每个槽位有固定且唯一的 `AGENTTEAMS_AGENT_ID`；不要使用 `docker compose --scale`，它会复制同一个槽位身份。启动脚本只选择前 N 个槽位，不会一并拉起全部 Worker。
 
-先启动基础服务并注册 Agent。Agent scope 必须在 `metadata.scope` 中包含 enrollment 配置所使用的 `tenant`、`project`、`team` 值。申请 OIDC access token 的主体需带 `worker:session:manage` 权限。为每个要启用的槽位单独签发 token（bearer token 从安全的临时文件读取，不要放进 shell history）：
+先启动基础服务并注册 Agent。首次签发凭据前，单独启动启用了 OIDC 的 Control Plane 和 Enrollment（该命令不会启动 Worker；Enrollment DB setup 会在 schema 就绪后创建受限角色并应用 RLS）：
+
+```sh
+docker compose --env-file .env -f compose.yaml --profile secure-api up -d control-plane worker-enrollment
+docker compose --env-file .env -f compose.yaml ps
+```
+
+Agent scope 必须在 `metadata.scope` 中包含 enrollment 配置所使用的 `tenant`、`project`、`team` 值。申请 OIDC access token 的主体需带 `worker:session:manage` 权限。为每个要启用的槽位单独签发 token（bearer token 从安全的临时文件读取，不要放进 shell history）：
 
 ```sh
 ./enroll-worker.sh http://127.0.0.1:8090 <agent-uuid> /secure/path/oidc-access-token ./secrets/worker-1.runtime.env
