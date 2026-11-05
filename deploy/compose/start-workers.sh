@@ -3,9 +3,11 @@ set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 env_file=${1:-"$script_dir/.env"}
+compose_project=${COMPOSE_PROJECT_NAME:-agentteams}
+case "$compose_project" in ''|[!a-z0-9]*|*[!a-z0-9_-]*) echo "Invalid Compose project name" >&2; exit 2 ;; esac
 "$script_dir/validate-config.sh" "$env_file"
 compose() {
-  docker compose --env-file "$env_file" -f "$script_dir/compose.yaml" "$@"
+  docker compose -p "$compose_project" --env-file "$env_file" -f "$script_dir/compose.yaml" "$@"
 }
 replicas=$(awk -F= '$1 == "WORKER_REPLICAS" { value=$2 } END { gsub(/[[:space:]]/, "", value); print value }' "$env_file")
 storage_enabled=$(awk -F= '$1 == "AGENTTEAMS_STORAGE_ENABLED" { value=$2 } END { gsub(/[[:space:]]/, "", value); print value }' "$env_file")

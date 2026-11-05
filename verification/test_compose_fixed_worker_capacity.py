@@ -19,6 +19,7 @@ class ComposeFixedWorkerCapacityTest(unittest.TestCase):
         shared_proxy_tokens: bool = False,
         provider_secret_mode: int = 0o600,
         expected_error: str | None = None,
+        project_name: str | None = None,
     ) -> list[str]:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
@@ -78,6 +79,8 @@ class ComposeFixedWorkerCapacityTest(unittest.TestCase):
             environment = os.environ.copy()
             environment["PATH"] = f"{mock_bin}:{environment['PATH']}"
             environment["DOCKER_CALL_LOG"] = str(call_log)
+            if project_name is not None:
+                environment["COMPOSE_PROJECT_NAME"] = project_name
             result = subprocess.run(
                 [str(STARTER), str(env_file)],
                 capture_output=True,
@@ -107,6 +110,10 @@ class ComposeFixedWorkerCapacityTest(unittest.TestCase):
             ["postgres", "nats", "nats-bootstrap", "control-plane", "gateway"],
         )
         self.assertNotIn("--scale", args)
+
+    def test_can_target_an_isolated_restored_compose_project(self) -> None:
+        args = self.invoke_startup(0, project_name="agentteams-restore")
+        self.assertEqual(args[1:3], ["-p", "agentteams-restore"])
 
     def test_starts_exactly_the_configured_worker_slots(self) -> None:
         args = self.invoke_startup(2)

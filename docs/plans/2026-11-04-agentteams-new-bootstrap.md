@@ -133,6 +133,8 @@
 
 **固定容量估算工具（2026-11-05）：** 新增 `verification/fixed_capacity_estimator.py`，使用 Erlang C（M/M/c）按到达率、平均执行时长、排队等待 p95、利用率上限和槽位上限计算最小固定 Worker 数。上限仍为 Compose 支持的 8 槽；无可行解时返回容量不足，不创建或扩缩 Worker。4 项单元测试覆盖最小可行池、排队 SLO 约束、容量上限与非法输入；CI 已纳入此门禁。示例输入 6 task/min、平均 30 s、排队等待 p95 ≤5 s、利用率 ≤70%，建议 7 个槽位。该数值仅用于初始 sizing，仍需用真实到达和执行时长压测校准；共享池用合并流量估算，专属租户分别估算。L5 再次只读核验显示当前访问身份仍无权列出 Service/Ingress、Deployments 或读取 Secret；现有 HTTPS issuer/JWKS 及新 Compose 主机上的独立模型凭据文件仍无可验证证据，因此真实 OIDC/Provider 联调条件未满足。
 
+**固定容量状态备份与恢复演练（2026-11-05）：** 新增 `backup-state.sh`/`restore-state.sh`，备份 PostgreSQL custom dump、4 个 NATS JetStream Stream；启用对象存储时停止 SeaweedFS 并归档其持久卷。bundle 带 SHA-256 清单且收紧到 `0700/0600`。恢复只接受新的 Compose project 和空卷，先恢复 PostgreSQL、NATS 与对象数据，不自动启动应用；校验失败会清理新建目标资源。`start-workers.sh` 现支持 `COMPOSE_PROJECT_NAME`，便于确认状态后在恢复项目启动固定槽位。隔离 Docker Compose 演练使用随机项目验证 PostgreSQL 行、4 个 Stream 消息和对象文件恢复，并验证被篡改 dump 与已存在目标被拒绝；演练容器、网络和卷均清理。当前恢复脚本要求操作者在整个备份窗口暂停 Task/Artifact 写入；Compose POC 暂无专用 Worker drain 命令，仍需人工确认无活动 Attempt。该演练不包含外部 OIDC/Provider/数据库密钥恢复、不证明异机备份或生产对象存储恢复；这些仍是批次 4 验收项。
+
 ## 批次 5：解除旧应用镜像的长期依赖
 
 1. 依据批次 1–4 的真实任务和安全验收结果，列出新路径实际需要的 Control Plane、Gateway、Worker 能力及稳定 API/事件/数据库边界。

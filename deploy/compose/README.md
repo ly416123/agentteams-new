@@ -113,7 +113,24 @@ Gateway Token 和模型代理 Token 互不通用；数据库只存两者的 SHA-
 ## 状态与运维
 
 - PostgreSQL 与 NATS JetStream 数据存放于命名卷 `postgres-data`、`nats-data`。
-- 备份前暂停写入或使用一致性备份流程。生产部署需另外落实异机备份、恢复演练、升级/回滚和镜像签名校验。
+- 备份前先暂停新任务提交，并确认没有运行中 Attempt；随后停止全部任务生产者/消费者，保持整个备份窗口没有 Task 或 Artifact 写入。当前 POC 没有专用 Worker drain 命令，需由操作者确认 Attempt 已排空。`backup-state.sh` 生成 PostgreSQL custom dump、4 个 JetStream 持久 Stream 快照；启用对象存储时，还会停止 SeaweedFS 并归档 `seaweedfs-data` 卷。备份目录及文件权限收紧为 `0700/0600`，包含敏感租户数据；转移到异机后仍需加密和限制访问。
+
+```sh
+docker compose --env-file .env --profile secure-api --profile worker-pool stop \
+  worker-1 worker-2 worker-3 worker-4 worker-5 worker-6 worker-7 worker-8 \
+  gateway credential-proxy worker-enrollment control-plane
+./backup-state.sh .env /secure/backup/agentteams-2026-11-05
+./start-workers.sh .env
+```
+
+恢复只允许写入全新的 Compose 项目及空命名卷。脚本会校验 bundle SHA-256，恢复 PostgreSQL、NATS Stream 和可选对象存储；失败时删除本次创建的隔离项目卷。先验证恢复出的数据库/Stream/对象，再用同一个项目名启动应用：
+
+```sh
+./restore-state.sh .env /secure/backup/agentteams-2026-11-05 agentteams-restore-2026-11-05
+COMPOSE_PROJECT_NAME=agentteams-restore-2026-11-05 ./start-workers.sh .env
+```
+
+还需从独立 Secret Manager/安全介质恢复 OIDC、数据库和 Provider 凭据文件；这些机密不会打入备份 bundle。恢复目标未完成验证前，不要启动 Worker，也不要将流量切到目标项目。生产部署仍需异机备份、定期恢复演练、升级/回滚和镜像签名校验。
 - `docker compose down` 保留命名卷；`docker compose down -v` 会删除 PostgreSQL/NATS 数据，请谨慎操作。
 - `docker compose logs -f control-plane gateway` 查看应用日志。不得将凭证或租户敏感内容写入日志。
 - SeaweedFS 4.52 通过固定 digest 的可选 `storage` profile 提供单节点 S3 兼容存储；Matrix 适配器尚未加入 Compose。

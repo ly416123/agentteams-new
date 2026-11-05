@@ -125,13 +125,15 @@ jobs:
 
       - name: Validate Compose and shell scripts
         run: |
+          docker pull postgres:16-alpine nats:2.10-alpine natsio/nats-box:0.14.0 alpine:3.21
           docker compose --env-file deploy/compose/.env.example -f deploy/compose/compose.yaml config --quiet
           bash -n deploy/compose/*.sh
           python3 -m unittest \
             verification.test_compose_fixed_worker_capacity \
             verification.test_compose_oidc_url_contract \
             verification.test_compose_control_plane_database_roles \
-            verification.test_fixed_capacity_estimator -v
+            verification.test_fixed_capacity_estimator \
+            verification.test_compose_state_recovery -v
 
       - name: Build Credential Proxy container
         run: docker build --secret id=maven_settings,src="$HOME/.m2/settings.xml" --tag agentteams-credential-proxy:ci --file credential-proxy/Dockerfile .
