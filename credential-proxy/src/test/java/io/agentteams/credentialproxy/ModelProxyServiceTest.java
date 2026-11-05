@@ -130,6 +130,28 @@ class ModelProxyServiceTest {
     }
 
     @Test
+    void rejectsWhenTheActiveAttemptChangesDuringCredentialResolution() {
+        AtomicInteger attemptChecks = new AtomicInteger();
+        ActiveAttemptCandidate original = activeAttempts().findActiveAttempts(worker()).getFirst();
+        ActiveAttemptCandidate replacement = new ActiveAttemptCandidate(original.agentId(), original.tenantId(),
+                original.projectId(), original.teamId(), original.taskId(),
+                UUID.fromString("88000000-0000-0000-0000-000000000099"),
+                UUID.fromString("88000000-0000-0000-0000-000000000098"),
+                original.leaseExpiresAt(), true, true, true);
+        ActiveAttemptRepository changesDuringResolution = authenticatedWorker ->
+                List.of(attemptChecks.incrementAndGet() == 1 ? original : replacement);
+        ModelProxyService service = service(token -> Optional.of(worker()), changesDuringResolution, context ->
+                "provider-secret".toCharArray());
+
+        assertThatThrownBy(() -> service.forward(PROXY_TOKEN, REQUEST.getBytes()))
+                .isInstanceOfSatisfying(ModelProxyException.class,
+                        error -> assertThat(error.statusCode()).isEqualTo(403));
+
+        assertThat(attemptChecks).hasValue(2);
+        assertThat(upstreamCalls).hasValue(0);
+    }
+
+    @Test
     void rejectsOversizedRequestBeforeAuthenticatingWorker() {
         AtomicBoolean authenticated = new AtomicBoolean();
         ModelProxyService service = service(token -> {
