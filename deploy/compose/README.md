@@ -54,6 +54,21 @@ Control Plane 仅绑定到 `127.0.0.1:${CONTROL_PLANE_PORT}`；PostgreSQL、NATS
 
 `WORKER_REPLICAS` 取值为 0 到 8。每个槽位有固定且唯一的 `AGENTTEAMS_AGENT_ID`；不要使用 `docker compose --scale`，它会复制同一个槽位身份。启动脚本只选择前 N 个槽位，不会一并拉起全部 Worker。
 
+### 估算固定容量
+
+先从生产或 POC 遥测中统计任务到达率、平均执行时长，并为排队等待 p95 和 Worker 利用率设定目标。运行仓库自带的 Erlang C（M/M/c）估算器：
+
+```sh
+python3 ../../verification/fixed_capacity_estimator.py \
+  --arrival-per-minute 6 \
+  --mean-duration-seconds 30 \
+  --queue-p95-seconds 5 \
+  --max-utilization 0.70 \
+  --max-workers 8
+```
+
+示例输入会建议 7 个固定 Worker 槽位。该结果是假设到达服从泊松分布、执行时长服从指数分布、单个槽位并发为 1 的初始估算；它不替代压测校准。建议分别用峰值时段数据计算共享池总量，并对必须专属运行的租户单独计算，再按租户配额检查公平性。达到 8 槽仍无法满足排队或利用率目标时，工具明确返回容量不足；应调整容量目标/配置或限流排队，不会动态创建 Worker。
+
 先启动基础服务并注册 Agent。首次签发凭据前，单独启动启用了 OIDC 的 Control Plane 和 Enrollment（该命令不会启动 Worker；Enrollment DB setup 会在 schema 就绪后创建受限角色并应用 RLS）：
 
 ```sh

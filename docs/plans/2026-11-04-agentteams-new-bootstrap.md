@@ -131,6 +131,8 @@
 
 **门槛：** 容量不足不创建 Worker；租户配额公平；节点/服务重启和中间件中断后可恢复；不支持的 Sandbox 档位明确拒绝；高敏租户只进入专属池。
 
+**固定容量估算工具（2026-11-05）：** 新增 `verification/fixed_capacity_estimator.py`，使用 Erlang C（M/M/c）按到达率、平均执行时长、排队等待 p95、利用率上限和槽位上限计算最小固定 Worker 数。上限仍为 Compose 支持的 8 槽；无可行解时返回容量不足，不创建或扩缩 Worker。4 项单元测试覆盖最小可行池、排队 SLO 约束、容量上限与非法输入；CI 已纳入此门禁。示例输入 6 task/min、平均 30 s、排队等待 p95 ≤5 s、利用率 ≤70%，建议 7 个槽位。该数值仅用于初始 sizing，仍需用真实到达和执行时长压测校准；共享池用合并流量估算，专属租户分别估算。L5 再次只读核验显示当前访问身份仍无权列出 Service/Ingress、Deployments 或读取 Secret；现有 HTTPS issuer/JWKS 及新 Compose 主机上的独立模型凭据文件仍无可验证证据，因此真实 OIDC/Provider 联调条件未满足。
+
 ## 批次 5：解除旧应用镜像的长期依赖
 
 1. 依据批次 1–4 的真实任务和安全验收结果，列出新路径实际需要的 Control Plane、Gateway、Worker 能力及稳定 API/事件/数据库边界。
