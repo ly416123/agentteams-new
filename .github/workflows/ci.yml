@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   worker-enrollment:
-    name: Worker enrollment (Java 21)
+    name: Enrollment and credential proxy (Java 21)
     runs-on: ubuntu-24.04
     steps:
       - name: Check out repository
@@ -29,7 +29,7 @@ jobs:
           cache: maven
 
       - name: Test and package
-        run: mvn --batch-mode --no-transfer-progress -pl worker-enrollment verify
+        run: mvn --batch-mode --no-transfer-progress verify
 
       - name: Require PostgreSQL integration tests to execute
         run: |
@@ -55,6 +55,21 @@ jobs:
               assert suite.attrib["failures"] == "0", (name, suite.attrib)
               assert suite.attrib["errors"] == "0", (name, suite.attrib)
           print("All 17 PostgreSQL, OIDC, and pinned Gateway integration tests executed successfully.")
+          PY
+
+      - name: Require Attempt context authorization tests to execute
+        run: |
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+
+          report = ET.parse(
+              "credential-proxy/target/surefire-reports/TEST-io.agentteams.credentialproxy.AttemptExecutionContextResolverTest.xml"
+          ).getroot()
+          assert report.attrib["tests"] == "9", report.attrib
+          assert report.attrib["skipped"] == "0", report.attrib
+          assert report.attrib["failures"] == "0", report.attrib
+          assert report.attrib["errors"] == "0", report.attrib
+          print("All 9 Attempt context authorization tests executed successfully.")
           PY
 
       - name: Validate Compose and shell scripts

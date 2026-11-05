@@ -23,6 +23,7 @@
 
     <modules>
         <module>worker-enrollment</module>
+        <module>credential-proxy</module>
     </modules>
 
     <dependencyManagement>

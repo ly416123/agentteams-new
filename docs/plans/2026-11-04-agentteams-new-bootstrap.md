@@ -64,7 +64,9 @@
 
 **复用 Control Plane 的 RLS 边界审计（2026-11-05）：** 对固定 v0.1.5 的迁移 SQL、scope Repository、Task 查询与 Compose 数据库身份做只读检查，记录见[共享 Control Plane scope 与 RLS 就绪度审计](../audits/2026-11-05-shared-control-plane-scope-and-rls-readiness.md)。Task/Attempt/Assignment/Lease 等需沿 `resource_scopes` 与父子关系判定 scope；Conversation 有自身 scope。当前 Compose 使用 `POSTGRES_USER=agentteams` 初始化超级用户作为 Control Plane 连接，源码查询未设置事务级 GUC，因此单独从新仓库启用业务表 RLS无法保护 Control Plane。全系统 RLS 前置是拆分非 superuser/非 owner 运行角色、实现所有 API 和后台作业的事务 scope，并验证跨 Tenant 的业务 API；当前不宣称强隔离。
 
-**凭证代理接入边界（2026-11-05）：** Worker 可配置 ChatGPT Responses API endpoint 并逐请求读取模型 Token 文件，便于新项目把上游调用改道到代理；但当前模型 Token Source 不接收 Task/Attempt/Lease 上下文。Compose 已切换到每个固定 Worker 槽位独立的模型 Secret，仍不能证明 Attempt 级消费令牌。不能通过客户端自报的 HTTP header/request body 补身份；新项目需要由可信 Gateway/执行适配器建立 Agent 到当前 Assignment/Attempt/Lease 的绑定，再让模型代理校验不可伪造且可撤销的短时授权。该边界已记录在 RLS 审计文档，Attempt 级代理实施依赖新路径的可信执行上下文。
+**凭证代理接入边界（2026-11-05）：** Worker 可配置 ChatGPT Responses API endpoint 并逐请求读取模型 Token 文件，便于新项目把上游调用改道到代理；但当前模型 Token Source 不接收 Task/Attempt/Lease 上下文。Compose 已切换到每个固定 Worker 槽位独立的模型 Secret，仍不能证明 Attempt 级授权。不能信任客户端自报的 HTTP header/request body；固定并发为 1 时，代理可按独立 Worker 凭据识别 Agent，再从数据库解析唯一有效 Assignment/Attempt/Lease 与 Task scope。零条、多条、过期或 scope 不匹配均拒绝。该边界记录在 [ADR 0002](../decisions/0002-attempt-bound-model-proxy.md)。
+
+**Attempt 授权解析实现起步（2026-11-05）：** 新增 `credential-proxy` Java 模块。`AttemptExecutionContextResolver` 只在数据库候选恰好一条、Agent scope 匹配、Assignment/Attempt/Lease 活动且 Lease 未过期时产生内部上下文；上下文最长 5 分钟且不超过 Lease 到期。9 项本机单元测试覆盖无/多 Assignment、过期、较短 Lease 上下文过期、非活动、Agent/scope 不匹配及缺失字段。当前只实现领域解析边界，数据库查询、独立凭据签发、Provider Secret 解析和 HTTP 流式代理仍未完成；CI 新增 9 项测试运行门禁，待补丁验证。
 
 ## 批次 1：无 Kubernetes 固定容量 Compose POC
 
