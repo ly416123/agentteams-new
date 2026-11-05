@@ -72,6 +72,8 @@ Controller 源码中能直接看到 `PrincipalContext`、`ProjectApiAuthorizatio
 - `OutboxRelay` 通过持久 Outbox store 领取 due 事件并发布，按聚合 ID/版本排序；Relay 自身负责投递语义，不承担租户授权。消费侧需依据父级资源重验，因此 Outbox payload/subject 不能作为权限来源。
 - Scheduled Task HTTP 创建/列表/读取/暂停/恢复/触发等入口从当前 Principal 校验 tenant/project；配置 Repository 的查询与更新按 organization/tenant/project 条件过滤。后台 `ScheduledTaskScheduler` 通过单活 Scheduler lease 领取全局 due schedule，再从每条 schedule 的持久化 scope 构造受限 Principal，写入 Task spec 并调用正常 `TaskService.create`，run ID/Task ID 通过 schedule occurrence 做幂等关联。该后台角色是系统调度身份，须单独测试伪造/损坏 schedule scope、跨 Tenant 查询输入、lease 并发和重复触发恢复。
 - Task recovery checkpoint/state repository 多按 Task ID 查询，授权边界依赖触发者先通过 Task scope，或后台恢复器仅基于数据库事实执行。尚未确认所有恢复/一致性/质量消费者都在执行写入前验证父 Task/Attempt scope；这些消费者及其幂等/重试边界仍是 2A 未闭环项。
+- Assignment 与 Scheduled Task、Sandbox lifecycle、Webhook delivery、Usage budget、Dashboard alert、Worker operation recovery 等多项周期任务通过数据库 Scheduler lease 单活执行；这是并发/重复触发控制，不等于租户授权。Artifact Quality 与 Matrix outbox 使用逐行租约领取事件。Matrix 发送前会在事务中按消息 tenant 与 binding ID 重读并验证 Room binding 仍有效。其余投递作业仍需确认 row payload 的 parent resource 与 tenant 关系及失效/retry 语义。
+- Task State Consistency 使用全局批扫描，按 Task/Run snapshot 核验事实并记录 drift；内部查询由 token 保护，但 worker-facing 服务不能因此获得该审计接口。Sandbox lifecycle 按已持久化的 sandbox/task/attempt 记录调用 Provider，创建阶段从 Task/Attempt 派生数据；需在新路径确认强隔离租户没有因缺少 sandbox Provider 而降级至普通容器。
 
 ## 已追踪的 Team、MCP 与管理/内部边界
 
@@ -84,7 +86,7 @@ Controller 源码中能直接看到 `PrincipalContext`、`ProjectApiAuthorizatio
 ## 证据级别与后续门槛
 
 - **源码发现：** v0.1.5 有 Project membership、`resource_scopes` 和应用层授权路径；`tasks` 等核心实体并非都直接存 Tenant/Project/Team 列。已有 Enrollment RLS 仅保护 `agents` 与 `agent_sessions` 的受限路径。
-- **尚未证明：** 上表所有 Controller 与服务调用链均无越权；MCP、Team、Skill、Audit/Usage 和管理 API 的所有读写、汇总及下载路径均执行正确 Tenant/Project/Team 检查；NATS TASK_EVENT/CONFIG_APPLIED 与所有恢复/一致性/质量消费者对篡改关联 ID 一律拒绝；固定 Compose 中 A/B Tenant 并发与同 Worker 连续 Attempt 的 Conversation/Workspace/Tool/Artifact 无残留；全业务表 RLS 可强制执行。
-- **下一步 2A：** Conversation/Memory、Artifact/File、NATS 主执行事件、Scheduled Task、Team/MCP 与组织管理主路径已追踪，但尚未形成逐方法仓储/迁移/测试闭环。继续完成 Task Event/Config event、恢复/质量/其他后台消费者、Skill/Audit/Usage 和内部端点的父级校验，再按身份矩阵核验角色；为每族记录有效身份、scope 来源、拒绝响应、现有测试和缺失测试。
+- **尚未证明：** 上表所有 Controller 与服务调用链均无越权；MCP、Team、Skill、Audit/Usage 和管理 API 的所有读写、汇总及下载路径均执行正确 Tenant/Project/Team 检查；NATS TASK_EVENT/CONFIG_APPLIED 与所有恢复/一致性/质量消费者对篡改关联 ID 一律拒绝；所有逐行 Outbox 的 payload tenant 与父资源一致；固定 Compose 中 A/B Tenant 并发与同 Worker 连续 Attempt 的 Conversation/Workspace/Tool/Artifact 无残留；全业务表 RLS 可强制执行。
+- **下一步 2A：** Conversation/Memory、Artifact/File、NATS 主执行事件、Scheduled Task、Team/MCP、组织管理和部分单活/Outbox 作业已追踪，但尚未形成逐方法仓储/迁移/测试闭环。继续完成 Task Event/Config event、恢复/质量/其他后台消费者、Skill/Audit/Usage 和内部端点的父级校验，再按身份矩阵核验角色；为每族记录有效身份、scope 来源、拒绝响应、现有测试和缺失测试。
 - **2A 出口条件：** 所有可访问 API 与异步消费者都映射到真实表和 scope 来源；每项未授权路径有可复现负向用例或明确的修复任务；任何尚未被证明的共享 Control Plane 能力继续标记为未验收。
 - **环境边界：** L5 的 v0.1.5 IdP issuer/JWKS 是 HTTP，当前只读 RBAC 不能确认 HTTPS Ingress；不能用 L5 旧 Worker Secret 替代新项目 Provider 凭据。上述源码盘点不宣称运行时多租户验收。
