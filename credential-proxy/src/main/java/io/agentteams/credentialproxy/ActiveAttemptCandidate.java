@@ -12,7 +12,6 @@ public record ActiveAttemptCandidate(
         UUID taskId,
         UUID attemptId,
         UUID leaseId,
-        String modelCredentialRef,
         Instant leaseExpiresAt,
         boolean leaseActive,
         boolean attemptActive,

@@ -19,7 +19,7 @@ public final class AttemptExecutionContextResolver {
 
     public AttemptExecutionContext resolve(AuthenticatedWorker worker) {
         Objects.requireNonNull(worker, "worker");
-        List<ActiveAttemptCandidate> candidates = attempts.findActiveAttempts(worker.agentId());
+        List<ActiveAttemptCandidate> candidates = attempts.findActiveAttempts(worker);
         if (candidates == null || candidates.size() != 1) throw new AttemptExecutionDeniedException();
 
         ActiveAttemptCandidate candidate = candidates.getFirst();
@@ -39,8 +39,7 @@ public final class AttemptExecutionContextResolver {
                 || blank(candidate.teamId())
                 || candidate.taskId() == null
                 || candidate.attemptId() == null
-                || candidate.leaseId() == null
-                || blank(candidate.modelCredentialRef())) {
+                || candidate.leaseId() == null) {
             throw new AttemptExecutionDeniedException();
         }
 
@@ -48,7 +47,7 @@ public final class AttemptExecutionContextResolver {
         if (candidate.leaseExpiresAt().isBefore(contextExpiry)) contextExpiry = candidate.leaseExpiresAt();
         return new AttemptExecutionContext(1, candidate.tenantId(), candidate.projectId(), candidate.teamId(),
                 candidate.agentId(), candidate.taskId(), candidate.attemptId(), candidate.leaseId(),
-                candidate.modelCredentialRef(), now, contextExpiry);
+                worker.modelCredentialRef(), now, contextExpiry);
     }
 
     private static boolean blank(String value) {

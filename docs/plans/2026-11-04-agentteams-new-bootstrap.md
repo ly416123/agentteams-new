@@ -66,7 +66,9 @@
 
 **凭证代理接入边界（2026-11-05）：** Worker 可配置 ChatGPT Responses API endpoint 并逐请求读取模型 Token 文件，便于新项目把上游调用改道到代理；但当前模型 Token Source 不接收 Task/Attempt/Lease 上下文。Compose 已切换到每个固定 Worker 槽位独立的模型 Secret，仍不能证明 Attempt 级授权。不能信任客户端自报的 HTTP header/request body；固定并发为 1 时，代理可按独立 Worker 凭据识别 Agent，再从数据库解析唯一有效 Assignment/Attempt/Lease 与 Task scope。零条、多条、过期或 scope 不匹配均拒绝。该边界记录在 [ADR 0002](../decisions/0002-attempt-bound-model-proxy.md)。
 
-**Attempt 授权解析实现起步（2026-11-05）：** 新增 `credential-proxy` Java 模块。`AttemptExecutionContextResolver` 只在数据库候选恰好一条、Agent scope 匹配、Assignment/Attempt/Lease 活动且 Lease 未过期时产生内部上下文；上下文最长 5 分钟且不超过 Lease 到期。9 项本机单元测试覆盖无/多 Assignment、过期、较短 Lease 上下文过期、非活动、Agent/scope 不匹配及缺失字段。当前只实现领域解析边界，数据库查询、独立凭据签发、Provider Secret 解析和 HTTP 流式代理仍未完成；CI 新增 9 项测试运行门禁，待补丁验证。
+**Attempt 授权解析实现起步（2026-11-05）：** 新增 `credential-proxy` Java 模块。`AttemptExecutionContextResolver` 输入是从代理凭据哈希解析出的 Worker 身份（代理凭据 ID、Agent ID、Tenant/Project/Team、模型凭证引用）；它只在数据库候选恰好一条、Agent scope 匹配、Assignment/Attempt/Lease 活动且 Lease 未过期时产生内部上下文。上下文最长 5 分钟且不超过 Lease 到期。9 项单元测试覆盖无/多 Assignment、过期、较短 Lease 上下文过期、非活动、Agent/scope 不匹配及缺失字段。本机 `mvn verify` 成功；本机无 Docker，Testcontainers 的 17 项 PostgreSQL/OIDC/Gateway 测试被禁用跳过。PR #1 提交 `cc093ce` 的 CI run [41992380412](https://github.com/ly416123/agentteams-new/actions/runs/41992380412) 实际执行并通过全部 17 项集成测试和 9 项 Resolver 门禁，Compose/shell 检查通过。当前只实现领域解析边界；数据库查询、代理凭据签发、Provider Secret 解析和 HTTP 流式代理仍未完成。
+
+**L5 资源复核（2026-11-05）：** 当前 `kind-agentteams` context 可列出 `agentteams` 命名空间 Pod，包含旧版 Control Plane、Keycloak 25.0.6、PostgreSQL、NATS、MinIO、Gateway 等资源；部分旧 Manager/Console/Worker 相关 Pod 为 Pending。查询授权探测对 Secret/Service/Ingress 返回 `yes`，但本轮没有读取 Secret 数据；Service/Ingress 元数据查询超时，故不能确认可用 HTTPS 入口。此前记录的 issuer/JWKS 仍是 HTTP 地址。当前可见资源属于旧版 K8s 部署，不是 `agentteams-new` Compose 的 Worker Enrollment/credential-proxy 实例；本机也没有新项目 Worker 模型凭据文件。结论：L5 可提供旧版 IdP/数据库等参考环境，但目前不能直接完成新项目真实 Worker 验收；需要可验证的 HTTPS OIDC 入口和新运行主机独立的模型凭据文件。
 
 ## 批次 1：无 Kubernetes 固定容量 Compose POC
 

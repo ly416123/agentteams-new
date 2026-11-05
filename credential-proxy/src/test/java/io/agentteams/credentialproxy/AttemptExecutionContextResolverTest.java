@@ -11,6 +11,7 @@ import java.util.UUID;
 import org.junit.jupiter.api.Test;
 
 class AttemptExecutionContextResolverTest {
+    private static final UUID PROXY_CREDENTIAL_ID = UUID.fromString("77000000-0000-0000-0000-000000000005");
     private static final UUID AGENT_ID = UUID.fromString("77000000-0000-0000-0000-000000000001");
     private static final UUID TASK_ID = UUID.fromString("77000000-0000-0000-0000-000000000002");
     private static final UUID ATTEMPT_ID = UUID.fromString("77000000-0000-0000-0000-000000000003");
@@ -40,7 +41,7 @@ class AttemptExecutionContextResolverTest {
     @Test
     void deniesWhenWorkerHasMultipleActiveAssignments() {
         var second = new ActiveAttemptCandidate(UUID.randomUUID(), "tenant-b", "project-b", "team-b",
-                UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID(), "model-credential-b",
+                UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID(),
                 NOW.plusSeconds(600), true, true, true);
         var resolver = resolver(List.of(activeCandidate(), second));
 
@@ -51,7 +52,7 @@ class AttemptExecutionContextResolverTest {
     @Test
     void deniesExpiredLeaseEvenIfRepositoryReturnsIt() {
         var expired = new ActiveAttemptCandidate(AGENT_ID, "tenant-a", "project-a", "team-a", TASK_ID,
-                ATTEMPT_ID, LEASE_ID, "model-credential-a", NOW, true, true, true);
+                ATTEMPT_ID, LEASE_ID, NOW, true, true, true);
 
         assertThatThrownBy(() -> resolver(List.of(expired)).resolve(worker()))
                 .isInstanceOf(AttemptExecutionDeniedException.class);
@@ -60,7 +61,7 @@ class AttemptExecutionContextResolverTest {
     @Test
     void contextNeverOutlivesShorterLease() {
         var shortLease = new ActiveAttemptCandidate(AGENT_ID, "tenant-a", "project-a", "team-a", TASK_ID,
-                ATTEMPT_ID, LEASE_ID, "model-credential-a", NOW.plusSeconds(90), true, true, true);
+                ATTEMPT_ID, LEASE_ID, NOW.plusSeconds(90), true, true, true);
 
         assertThat(resolver(List.of(shortLease)).resolve(worker()).expiresAt())
                 .isEqualTo(NOW.plusSeconds(90));
@@ -69,7 +70,7 @@ class AttemptExecutionContextResolverTest {
     @Test
     void deniesCandidateFromAnotherAgent() {
         var forged = new ActiveAttemptCandidate(UUID.randomUUID(), "tenant-a", "project-a", "team-a", TASK_ID,
-                ATTEMPT_ID, LEASE_ID, "model-credential-a", NOW.plusSeconds(600), true, true, true);
+                ATTEMPT_ID, LEASE_ID, NOW.plusSeconds(600), true, true, true);
 
         assertThatThrownBy(() -> resolver(List.of(forged)).resolve(worker()))
                 .isInstanceOf(AttemptExecutionDeniedException.class);
@@ -78,11 +79,11 @@ class AttemptExecutionContextResolverTest {
     @Test
     void deniesCandidateWhenAssignmentAttemptOrLeaseIsNotActive() {
         var inactiveLease = new ActiveAttemptCandidate(AGENT_ID, "tenant-a", "project-a", "team-a", TASK_ID,
-                ATTEMPT_ID, LEASE_ID, "model-credential-a", NOW.plusSeconds(600), false, true, true);
+                ATTEMPT_ID, LEASE_ID, NOW.plusSeconds(600), false, true, true);
         var inactiveAttempt = new ActiveAttemptCandidate(AGENT_ID, "tenant-a", "project-a", "team-a", TASK_ID,
-                ATTEMPT_ID, LEASE_ID, "model-credential-a", NOW.plusSeconds(600), true, false, true);
+                ATTEMPT_ID, LEASE_ID, NOW.plusSeconds(600), true, false, true);
         var inactiveAssignment = new ActiveAttemptCandidate(AGENT_ID, "tenant-a", "project-a", "team-a", TASK_ID,
-                ATTEMPT_ID, LEASE_ID, "model-credential-a", NOW.plusSeconds(600), true, true, false);
+                ATTEMPT_ID, LEASE_ID, NOW.plusSeconds(600), true, true, false);
 
         for (var candidate : List.of(inactiveLease, inactiveAttempt, inactiveAssignment)) {
             assertThatThrownBy(() -> resolver(List.of(candidate)).resolve(worker()))
@@ -91,37 +92,33 @@ class AttemptExecutionContextResolverTest {
     }
 
     @Test
-    void deniesCandidateWithoutCompleteTenantScopeOrCredentialReference() {
+    void deniesCandidateWithoutCompleteTenantScope() {
         var missingTenant = new ActiveAttemptCandidate(AGENT_ID, " ", "project-a", "team-a", TASK_ID,
-                ATTEMPT_ID, LEASE_ID, "model-credential-a", NOW.plusSeconds(600), true, true, true);
-        var missingCredential = new ActiveAttemptCandidate(AGENT_ID, "tenant-a", "project-a", "team-a", TASK_ID,
-                ATTEMPT_ID, LEASE_ID, " ", NOW.plusSeconds(600), true, true, true);
-
-        for (var candidate : List.of(missingTenant, missingCredential)) {
-            assertThatThrownBy(() -> resolver(List.of(candidate)).resolve(worker()))
-                    .isInstanceOf(AttemptExecutionDeniedException.class);
-        }
+                ATTEMPT_ID, LEASE_ID, NOW.plusSeconds(600), true, true, true);
+        assertThatThrownBy(() -> resolver(List.of(missingTenant)).resolve(worker()))
+                .isInstanceOf(AttemptExecutionDeniedException.class);
     }
 
     @Test
     void deniesCandidateWhoseScopeDiffersFromAuthenticatedWorkerScope() {
         var otherTenant = new ActiveAttemptCandidate(AGENT_ID, "tenant-b", "project-a", "team-a", TASK_ID,
-                ATTEMPT_ID, LEASE_ID, "model-credential-a", NOW.plusSeconds(600), true, true, true);
+                ATTEMPT_ID, LEASE_ID, NOW.plusSeconds(600), true, true, true);
 
         assertThatThrownBy(() -> resolver(List.of(otherTenant)).resolve(worker()))
                 .isInstanceOf(AttemptExecutionDeniedException.class);
     }
 
     private static AuthenticatedWorker worker() {
-        return new AuthenticatedWorker(AGENT_ID, "tenant-a", "project-a", "team-a");
+        return new AuthenticatedWorker(PROXY_CREDENTIAL_ID, AGENT_ID, "tenant-a", "project-a", "team-a",
+                "model-credential-a");
     }
 
     private static AttemptExecutionContextResolver resolver(List<ActiveAttemptCandidate> candidates) {
-        return new AttemptExecutionContextResolver(agentId -> candidates, CLOCK);
+        return new AttemptExecutionContextResolver(ignored -> candidates, CLOCK);
     }
 
     private static ActiveAttemptCandidate activeCandidate() {
         return new ActiveAttemptCandidate(AGENT_ID, "tenant-a", "project-a", "team-a", TASK_ID, ATTEMPT_ID,
-                LEASE_ID, "model-credential-a", NOW.plusSeconds(600), true, true, true);
+                LEASE_ID, NOW.plusSeconds(600), true, true, true);
     }
 }
