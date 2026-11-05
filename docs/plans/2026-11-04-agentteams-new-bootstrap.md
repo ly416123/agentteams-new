@@ -141,6 +141,8 @@ Enrollment OIDC 传输安全加固（2026-11-05）：配置类拒绝远程 HTTP 
 
 Agent scope 生命周期闭环（2026-11-05）：新增 PostgreSQL 集成测试验证 Agent scope 不变时保留会话、scope tuple 改变或删除时撤销现存 Gateway Session 与关联模型代理凭据。`worker_enrollment_scope_owner` 仍为 `NOLOGIN/NOBYPASSRLS`，仅能读取 `agent_id/revoked_at` 并更新 `revoked_at`；Writer 不获 scope 表直接写权限。CI `42044993010` 暴露缺少 `revoked_at` 读取权限，`42045339661` 验证触发器逻辑后暴露测试 JDBC 时间参数类型问题；随后修正并把 PostgreSQL 门禁用例数从 7 调整为 8。CI `42046157692` 全绿，PostgreSQL 集成用例确实执行，Attempt 隔离、凭证代理、OIDC/Gateway、Compose 和容器构建门禁均通过。本机未配置 Docker socket，因此本地 Testcontainers 用例被跳过；以 Linux CI 容器执行结果作为该集成测试证据。L5 只读身份仍无法枚举 Service/Ingress/Deployment，未确认 agentteams-new 的 Worker/Provider 凭据文件；现有可见组件属于旧 agentteams-java 环境。
 
+**固定容量 Compose POC 新项目启动/重启验证（2026-11-05）：** 在专用 `agentteams-poc` Colima profile 中使用临时随机 DB 密码、新 Compose project `agentteams-new-validation` 和固定 v0.1.5 digest，新建 PostgreSQL/NATS 命名卷；PostgreSQL、NATS 健康，Flyway 完成 113 个 migration 到 v121，创建 4 个 JetStream Stream，Control Plane readiness 返回 `UP`，Gateway gRPC 9090 从项目网络可达。重启 Control Plane/Gateway 后 schema 保持 v121、Stream 保持；向 `TASK_EVENTS` 写入探针消息后重启 NATS，该消息仍可读取。固定容量估算器 4 项测试和全量 `verification` 测试 21 项均通过；示例 6 task/min、30 秒均值、排队 p95 5 秒、利用率 ≤70% 得出 7 个静态槽位。未启动 Worker：在缺可信 OIDC 身份时，Control Plane Agent/Task 路由对匿名请求返回 403，未手工插入 Token 或绕过鉴权。Gateway 固定 digest 的 gRPC 集成测试在 PR CI `42046970895` 实际执行 5/5、0 skipped；同一 CI 的 PostgreSQL/OIDC/代理门禁与 Compose/容器构建均通过。该结果验证固定服务部署与中间件重启持久性，不代表真实 OIDC/Worker Attempt、双租户隔离或 Provider 调用完成。默认 Colima 上现有容器未操作；独立 POC 的临时 Compose project 与其卷保留待后续 Worker/OIDC 联调，临时 `.env` 位于 `/tmp/agentteams-new-validation.env`，权限 `0600`，不含业务 Provider 凭据。
+
 ## 批次 5：解除旧应用镜像的长期依赖
 
 1. 依据批次 1–4 的真实任务和安全验收结果，列出新路径实际需要的 Control Plane、Gateway、Worker 能力及稳定 API/事件/数据库边界。
