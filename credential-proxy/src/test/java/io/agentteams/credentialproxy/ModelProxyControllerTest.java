@@ -15,6 +15,8 @@ import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -29,9 +31,11 @@ class ModelProxyControllerTest {
     private static final Instant NOW = Instant.parse("2026-11-05T10:00:00Z");
     private HttpServer upstream;
     private MockMvc mvc;
+    private ScheduledExecutorService streamMonitor;
 
     @BeforeEach
     void setUp() throws Exception {
+        streamMonitor = Executors.newSingleThreadScheduledExecutor();
         upstream = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         upstream.createContext("/v1/responses", exchange -> {
             exchange.getRequestBody().readAllBytes();
@@ -56,13 +60,15 @@ class ModelProxyControllerTest {
                         NOW.plusSeconds(60), true, true, true)), Clock.fixed(NOW, ZoneOffset.UTC)),
                 context -> "provider-secret".toCharArray(),
                 URI.create("http://127.0.0.1:" + upstream.getAddress().getPort() + "/v1/responses"),
-                Set.of("gpt-5.6-luna"), HttpClient.newHttpClient());
+                Set.of("gpt-5.6-luna"), HttpClient.newHttpClient(),
+                Clock.fixed(NOW, ZoneOffset.UTC), streamMonitor);
         mvc = MockMvcBuilders.standaloneSetup(new ModelProxyController(service)).build();
     }
 
     @AfterEach
     void stopUpstream() {
         if (upstream != null) upstream.stop(0);
+        if (streamMonitor != null) streamMonitor.shutdownNow();
     }
 
     @Test

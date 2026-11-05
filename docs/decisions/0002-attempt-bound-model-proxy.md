@@ -25,7 +25,7 @@ Credential Proxy 使用独立于 Gateway Session 的 Worker 模型代理凭据�
 1. Enrollment 签发独立模型代理凭据，数据库只保存哈希，并与 Gateway Session、Agent scope 关联。
 2. Credential Proxy 以无登录函数/最小数据库角色验证凭据，并解析唯一有效的 Assignment/Attempt/Lease 与 Task scope。
 3. Credential Source 按数据库授权的 Tenant/Project 解析上游 Secret；Worker 网络只允许访问代理端点。
-4. Responses API 代理支持流式转发、超时、取消、限流和模型 allowlist；数据库或 Secret 解析失败时 fail-closed。
+4. Responses API 代理支持流式转发、超时、取消、限流和模型 allowlist；流式期间每秒复核活动 Attempt/Lease，上下文撤销、变化、过期或数据库不可用时关闭上游流；数据库或 Secret 解析失败时 fail-closed。
 5. 在隔离 PostgreSQL 和固定 digest Worker 上验收签发、Attempt 归属、租约过期、撤销、Tenant A/B 交叉访问、流式响应和日志脱敏。
 
 ## 拒绝的授权输入

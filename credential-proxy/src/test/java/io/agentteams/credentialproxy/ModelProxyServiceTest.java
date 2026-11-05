@@ -21,6 +21,8 @@ import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -39,9 +41,11 @@ class ModelProxyServiceTest {
     private final AtomicReference<JsonNode> upstreamRequest = new AtomicReference<>();
     private final AtomicReference<Integer> upstreamStatus = new AtomicReference<>(200);
     private HttpServer upstream;
+    private ScheduledExecutorService streamMonitor;
 
     @BeforeEach
     void startUpstream() throws Exception {
+        streamMonitor = Executors.newSingleThreadScheduledExecutor();
         upstream = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         upstream.createContext("/v1/responses", exchange -> {
             upstreamCalls.incrementAndGet();
@@ -62,6 +66,7 @@ class ModelProxyServiceTest {
     @AfterEach
     void stopUpstream() {
         if (upstream != null) upstream.stop(0);
+        if (streamMonitor != null) streamMonitor.shutdownNow();
     }
 
     @Test
@@ -206,7 +211,8 @@ class ModelProxyServiceTest {
         URI endpoint = URI.create("http://127.0.0.1:" + upstream.getAddress().getPort() + "/v1/responses");
         return new ModelProxyService(authenticator, new AttemptExecutionContextResolver(attempts,
                 Clock.fixed(NOW, ZoneOffset.UTC)), credentials, endpoint,
-                Set.of("gpt-5.6-luna"), HttpClient.newHttpClient());
+                Set.of("gpt-5.6-luna"), HttpClient.newHttpClient(),
+                Clock.fixed(NOW, ZoneOffset.UTC), streamMonitor);
     }
 
     private static ActiveAttemptRepository activeAttempts() {

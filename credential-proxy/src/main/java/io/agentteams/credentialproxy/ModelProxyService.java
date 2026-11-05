@@ -4,20 +4,24 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.InetAddress;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.time.Clock;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.ScheduledExecutorService;
 
 /** Enforces Worker, active Attempt, model, and provider credential scope before forwarding. */
 public final class ModelProxyService {
     private static final int MAX_REQUEST_BYTES = 4 * 1024 * 1024;
     private static final Duration REQUEST_TIMEOUT = Duration.ofMinutes(5);
+    private static final long LEASE_POLL_INTERVAL_MILLIS = 1_000;
 
     private final ModelProxyAuthenticator authenticator;
     private final AttemptExecutionContextResolver contexts;
@@ -25,6 +29,8 @@ public final class ModelProxyService {
     private final URI upstreamEndpoint;
     private final Set<String> allowedModels;
     private final HttpClient http;
+    private final Clock clock;
+    private final ScheduledExecutorService streamMonitor;
     private final ObjectMapper json = new ObjectMapper();
 
     public ModelProxyService(ModelProxyAuthenticator authenticator,
@@ -32,7 +38,9 @@ public final class ModelProxyService {
             CredentialSource credentials,
             URI upstreamEndpoint,
             Set<String> allowedModels,
-            HttpClient http) {
+            HttpClient http,
+            Clock clock,
+            ScheduledExecutorService streamMonitor) {
         this.authenticator = Objects.requireNonNull(authenticator, "authenticator");
         this.contexts = Objects.requireNonNull(contexts, "contexts");
         this.credentials = Objects.requireNonNull(credentials, "credentials");
@@ -42,6 +50,8 @@ public final class ModelProxyService {
             throw new IllegalArgumentException("allowedModels must not be empty");
         }
         this.http = Objects.requireNonNull(http, "http");
+        this.clock = Objects.requireNonNull(clock, "clock");
+        this.streamMonitor = Objects.requireNonNull(streamMonitor, "streamMonitor");
     }
 
     public ModelProxyResponse forward(String workerToken, byte[] requestBody) {
@@ -99,13 +109,24 @@ public final class ModelProxyService {
                 response.body().close();
                 throw new ModelProxyException(502);
             }
-            return new ModelProxyResponse(response.statusCode(), contentType, response.body());
+            try {
+                InputStream guarded = new LeaseGuardedInputStream(response.body(), contexts, worker, context,
+                        clock, streamMonitor, LEASE_POLL_INTERVAL_MILLIS);
+                return new ModelProxyResponse(response.statusCode(), contentType, guarded);
+            } catch (RuntimeException monitorUnavailable) {
+                response.body().close();
+                throw new ModelProxyException(503);
+            }
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
             throw new ModelProxyException(503);
         } catch (IOException transportFailure) {
             throw new ModelProxyException(502);
         } catch (IllegalArgumentException malformedProviderCredential) {
+            throw new ModelProxyException(503);
+        } catch (ModelProxyException denied) {
+            throw denied;
+        } catch (RuntimeException unavailable) {
             throw new ModelProxyException(503);
         } finally {
             Arrays.fill(providerToken, '\0');
@@ -122,15 +143,7 @@ public final class ModelProxyService {
         } catch (RuntimeException unavailable) {
             throw new ModelProxyException(503);
         }
-        if (current.version() != original.version()
-                || !current.tenantId().equals(original.tenantId())
-                || !current.projectId().equals(original.projectId())
-                || !current.teamId().equals(original.teamId())
-                || !current.agentId().equals(original.agentId())
-                || !current.taskId().equals(original.taskId())
-                || !current.attemptId().equals(original.attemptId())
-                || !current.leaseId().equals(original.leaseId())
-                || !current.modelCredentialRef().equals(original.modelCredentialRef())) {
+        if (!original.sameExecutionAs(current)) {
             throw new ModelProxyException(403);
         }
     }

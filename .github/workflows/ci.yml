@@ -111,6 +111,7 @@ jobs:
           for class_name, expected in (
               ("ModelProxyServiceTest", "9"),
               ("ModelProxyControllerTest", "3"),
+              ("LeaseGuardedInputStreamTest", "1"),
           ):
               report = ET.parse(
                   f"credential-proxy/target/surefire-reports/TEST-io.agentteams.credentialproxy.{class_name}.xml"
@@ -119,7 +120,7 @@ jobs:
               assert report.attrib["skipped"] == "0", (class_name, report.attrib)
               assert report.attrib["failures"] == "0", (class_name, report.attrib)
               assert report.attrib["errors"] == "0", (class_name, report.attrib)
-          print("All 10 model proxy authorization, upstream forwarding, and HTTP streaming tests executed successfully.")
+          print("All 13 model proxy authorization, lease cancellation, upstream forwarding, and HTTP streaming tests executed successfully.")
           PY
 
       - name: Validate Compose and shell scripts

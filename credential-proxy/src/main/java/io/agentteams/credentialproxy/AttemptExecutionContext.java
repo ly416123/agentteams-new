@@ -36,4 +36,17 @@ public record AttemptExecutionContext(
     private static void requireText(String value, String field) {
         if (value == null || value.isBlank()) throw new IllegalArgumentException(field + " is required");
     }
+
+    public boolean sameExecutionAs(AttemptExecutionContext other) {
+        return other != null
+                && version == other.version
+                && tenantId.equals(other.tenantId)
+                && projectId.equals(other.projectId)
+                && teamId.equals(other.teamId)
+                && agentId.equals(other.agentId)
+                && taskId.equals(other.taskId)
+                && attemptId.equals(other.attemptId)
+                && leaseId.equals(other.leaseId)
+                && modelCredentialRef.equals(other.modelCredentialRef);
+    }
 }

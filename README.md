@@ -2,7 +2,7 @@
 
 面向固定容量、多租户 Agent 协作的无 Kubernetes 部署架构。项目以 Java 21 为服务端主线，复用现有 AgentTeams 的任务、租约、Outbox、Gateway 和 Worker 能力，并提供 Docker Compose / systemd 部署路径。
 
-> 当前阶段：固定容量 Compose POC 已接入独立 Worker Enrollment 服务、OIDC scope 检查和每槽位会话凭据投放；签名 JWT→HTTP→PostgreSQL 测试及 DB 最小权限测试通过，覆盖哈希、撤销和 tenant/project/team 拒绝。上游 Gateway 会话 fail-closed 修复已包含在 `agentteams-java v0.1.5`，固定 digest 的 5 种 gRPC 握手场景已在本机全部通过且未跳过。真实 OIDC Provider、Worker runtime 任务闭环和生产验收仍未完成。
+> 当前阶段：固定容量 Compose POC 已接入独立 Worker Enrollment 服务、OIDC scope 检查和每槽位会话凭据投放；签名 JWT→HTTP→PostgreSQL 测试及 DB 最小权限测试通过，覆盖哈希、撤销和 tenant/project/team 拒绝。上游 Gateway 会话 fail-closed 修复已包含在 `agentteams-java v0.1.5`，固定 digest 的 5 种 gRPC 握手场景已在本机全部通过且未跳过。Credential Proxy 会在每次请求出站前及流式传输期间复核 Attempt/Lease，撤销后关闭上游流。真实 OIDC Provider、Worker runtime 任务闭环和生产验收仍未完成。
 
 ## 目标
 
