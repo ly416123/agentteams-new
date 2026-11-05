@@ -54,3 +54,11 @@
 3. 若要求 PostgreSQL 本身强制全系统隔离，先拆分超级用户初始化/迁移账号与非 superuser、非 owner 的 Control Plane 运行角色；再在目标运行时实现每请求事务级 `ExecutionContext` 注入，并给后台消费者独立的系统 scope。
 4. 按实际外键逐表启用 RLS：父子资源使用 `USING` 与 `WITH CHECK`；`resource_scopes` 资源验证真实父 Project；Outbox 先显式携带并验证 scope。连接池同物理连接跨 Tenant 复用、无 scope、写入越权和角色绕过测试均纳入门禁。
 5. 在上述工作完成前，部署说明应继续明确：当前是应用层多租户授权加 Enrollment 表 RLS，不得称为全系统数据库强隔离。
+
+## 凭证代理接入边界
+
+固定 Worker 源码 `agent-worker/src/main/java/io/agentteams/worker/chatgpt/ChatGptPlanModel.java` 支持通过 `AGENTTEAMS_CHATGPT_RESPONSES_URL` 覆盖 Responses API 地址；`ChatGptPlanTokenSource.fromPath()` 每次模型请求都会重新读取 `AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE` 指向的文件。因此 `agentteams-new` 可以把该 endpoint 指向凭证代理，并让 Worker 文件只保存代理消费凭据，无需修改旧源码。
+
+但当前 `ChatGptPlanTokenSource.accessToken()` 接口不接收 `TaskId`、`AttemptId`、Lease 或 `ExecutionContext`，HTTP 模型请求也没有由 Worker 运行时注入这些可信字段。现有 Compose 又将同一个 `model_token` Docker Secret 挂到所有 Worker 槽位。直接加一个反向代理只能做到模型端点替换，不能自然获得 Attempt 级授权；凭证代理验收前要么先扩展 Worker 的 ExecutionContext 传递契约，要么明确选用较窄的 Agent/槽位 scope 并接受其风险边界，不能把它描述为 Attempt 隔离。
+
+实现凭证代理前应先锁定调用身份来源和轮换生命周期：代理消费凭据不可等同于 Gateway Session，不得通过可伪造的请求体字段确定 Tenant/Attempt；代理需在每次上游请求时执行范围、有效期、撤销和模型 allowlist 校验。若要维持「不改旧项目」的约束，Attempt 级能力缺口需由新项目的协议/sidecar/网关路径补足并经真实 Worker 测试证明。

@@ -56,6 +56,8 @@
 
 **复用 Control Plane 的 RLS 边界审计（2026-11-05）：** 对固定 v0.1.5 的迁移 SQL、scope Repository、Task 查询与 Compose 数据库身份做只读检查，记录见[共享 Control Plane scope 与 RLS 就绪度审计](../audits/2026-11-05-shared-control-plane-scope-and-rls-readiness.md)。Task/Attempt/Assignment/Lease 等需沿 `resource_scopes` 与父子关系判定 scope；Conversation 有自身 scope。当前 Compose 使用 `POSTGRES_USER=agentteams` 初始化超级用户作为 Control Plane 连接，源码查询未设置事务级 GUC，因此单独从新仓库启用业务表 RLS无法保护 Control Plane。全系统 RLS 前置是拆分非 superuser/非 owner 运行角色、实现所有 API 和后台作业的事务 scope，并验证跨 Tenant 的业务 API；当前不宣称强隔离。
 
+**凭证代理接入边界（2026-11-05）：** Worker 可配置 ChatGPT Responses API endpoint 并逐请求读取模型 Token 文件，便于新项目把上游调用改道到代理；但当前模型 Token Source 不接收 Task/Attempt/Lease 上下文，Compose 也将同一模型 Secret 挂给所有 Worker。若不扩展 Worker 的可信执行上下文，新代理最多证明 Agent/槽位级访问控制，不能达到计划要求的 Attempt 级消费令牌。该约束已记录在 RLS 审计文档，凭证代理开发前先确定新项目如何安全获得 Attempt 身份。
+
 ## 批次 1：无 Kubernetes 固定容量 Compose POC
 
 1. 先从旧仓库构建并发布 Control Plane、Gateway、Worker 的固定版本 OCI 镜像；记录镜像 digest 和源 commit。
