@@ -29,6 +29,29 @@ GRANT SELECT (id, agent_id, task_attempt_id, expires_at, released_at, status)
     ON TABLE public.agent_leases TO credential_proxy_query_owner;
 GRANT SELECT (resource_type, resource_id, tenant_id, project_id, team)
     ON TABLE public.resource_scopes TO credential_proxy_query_owner;
+GRANT SELECT (id, session_id, agent_id, tenant_id, project_id, team_id, token_sha256,
+              model_credential_ref, expires_at, revoked_at)
+    ON TABLE public.worker_model_proxy_credentials TO credential_proxy_query_owner;
+GRANT SELECT (id, agent_id, expires_at, revoked_at)
+    ON TABLE public.agent_sessions TO credential_proxy_query_owner;
+GRANT SELECT (agent_id, tenant_id, project_id, team_id)
+    ON TABLE public.worker_enrollment_agent_scopes TO credential_proxy_query_owner;
+
+ALTER TABLE public.worker_model_proxy_credentials ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.agent_sessions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.worker_enrollment_agent_scopes ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS credential_proxy_owner_model_credentials_read
+    ON public.worker_model_proxy_credentials;
+CREATE POLICY credential_proxy_owner_model_credentials_read
+    ON public.worker_model_proxy_credentials FOR SELECT TO credential_proxy_query_owner USING (true);
+DROP POLICY IF EXISTS credential_proxy_owner_sessions_read ON public.agent_sessions;
+CREATE POLICY credential_proxy_owner_sessions_read
+    ON public.agent_sessions FOR SELECT TO credential_proxy_query_owner USING (true);
+DROP POLICY IF EXISTS credential_proxy_owner_agent_scopes_read
+    ON public.worker_enrollment_agent_scopes;
+CREATE POLICY credential_proxy_owner_agent_scopes_read
+    ON public.worker_enrollment_agent_scopes FOR SELECT TO credential_proxy_query_owner USING (true);
 
 CREATE OR REPLACE FUNCTION public.credential_proxy_active_attempts(
     p_agent_id UUID,
@@ -97,7 +120,49 @@ $$;
 
 ALTER FUNCTION public.credential_proxy_active_attempts(UUID, TEXT, TEXT, TEXT)
     OWNER TO credential_proxy_query_owner;
-REVOKE CREATE ON SCHEMA public FROM credential_proxy_query_owner;
 REVOKE ALL ON FUNCTION public.credential_proxy_active_attempts(UUID, TEXT, TEXT, TEXT) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.credential_proxy_active_attempts(UUID, TEXT, TEXT, TEXT)
+    TO credential_proxy_query;
+
+CREATE OR REPLACE FUNCTION public.credential_proxy_authenticate(p_token_sha256 TEXT)
+RETURNS TABLE (
+    proxy_credential_id UUID,
+    agent_id UUID,
+    tenant_id TEXT,
+    project_id TEXT,
+    team_id TEXT,
+    model_credential_ref TEXT
+)
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+    SELECT credential.id,
+           credential.agent_id,
+           credential.tenant_id,
+           credential.project_id,
+           credential.team_id,
+           credential.model_credential_ref
+      FROM public.worker_model_proxy_credentials AS credential
+      JOIN public.agent_sessions AS session
+        ON session.id = credential.session_id
+       AND session.agent_id = credential.agent_id
+      JOIN public.worker_enrollment_agent_scopes AS current_scope
+        ON current_scope.agent_id = credential.agent_id
+       AND current_scope.tenant_id = credential.tenant_id
+       AND current_scope.project_id = credential.project_id
+       AND current_scope.team_id = credential.team_id
+     WHERE credential.token_sha256 = p_token_sha256::CHAR(64)
+       AND credential.revoked_at IS NULL
+       AND credential.expires_at > statement_timestamp()
+       AND session.revoked_at IS NULL
+       AND session.expires_at > statement_timestamp()
+$$;
+
+ALTER FUNCTION public.credential_proxy_authenticate(TEXT)
+    OWNER TO credential_proxy_query_owner;
+REVOKE CREATE ON SCHEMA public FROM credential_proxy_query_owner;
+REVOKE ALL ON FUNCTION public.credential_proxy_authenticate(TEXT) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.credential_proxy_authenticate(TEXT)
     TO credential_proxy_query;

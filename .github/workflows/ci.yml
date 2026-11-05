@@ -80,11 +80,11 @@ jobs:
           report = ET.parse(
               "credential-proxy/target/surefire-reports/TEST-io.agentteams.credentialproxy.JdbcActiveAttemptRepositoryPostgresTest.xml"
           ).getroot()
-          assert report.attrib["tests"] == "4", report.attrib
+          assert report.attrib["tests"] == "5", report.attrib
           assert report.attrib["skipped"] == "0", report.attrib
           assert report.attrib["failures"] == "0", report.attrib
           assert report.attrib["errors"] == "0", report.attrib
-          print("All 4 PostgreSQL credential proxy boundary tests executed successfully.")
+          print("All 5 PostgreSQL credential proxy boundary tests executed successfully.")
           PY
 
       - name: Validate Compose and shell scripts
