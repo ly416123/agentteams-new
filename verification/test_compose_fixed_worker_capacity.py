@@ -16,8 +16,8 @@ class ComposeFixedWorkerCapacityTest(unittest.TestCase):
         self,
         replicas: int,
         *,
-        shared_model_tokens: bool = False,
-        model_token_mode: int = 0o600,
+        shared_proxy_tokens: bool = False,
+        provider_secret_mode: int = 0o600,
         expected_error: str | None = None,
     ) -> list[str]:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -28,9 +28,15 @@ class ComposeFixedWorkerCapacityTest(unittest.TestCase):
                     key, value = line.split("=", 1)
                     values[key] = value
 
-            model_token = temp / "model-token"
-            model_token.write_text("test-only-model-token\n")
-            model_token.chmod(model_token_mode)
+            provider_root = temp / "provider-secrets"
+            provider_file = provider_root / "tenant-a/project-a/team-a/chatgpt"
+            provider_file.parent.mkdir(parents=True)
+            provider_file.write_text("test-only-provider-token\n")
+            provider_root.chmod(0o700)
+            (provider_root / "tenant-a").chmod(0o700)
+            (provider_root / "tenant-a/project-a").chmod(0o700)
+            (provider_root / "tenant-a/project-a/team-a").chmod(0o700)
+            provider_file.chmod(provider_secret_mode)
             values.update({
                 "API_AUTH_ENABLED": "true",
                 "OIDC_ISSUER_URI": "https://id.example.test/issuer",
@@ -38,14 +44,21 @@ class ComposeFixedWorkerCapacityTest(unittest.TestCase):
                 "OIDC_AUDIENCE": "agentteams-test",
                 "POSTGRES_PASSWORD": "test-postgres-password-with-32-chars",
                 "WORKER_ENROLLMENT_DB_PASSWORD": "test-enrollment-password-with-32-chars",
+                "CREDENTIAL_PROXY_DB_PASSWORD": "test-credential-proxy-password-with-32-chars",
+                "CREDENTIAL_PROXY_UID": str(os.getuid()),
+                "CREDENTIAL_PROXY_GID": str(os.getgid()),
+                "PROVIDER_CREDENTIALS_DIR": str(provider_root),
                 "WORKER_REPLICAS": str(replicas),
             })
 
             for slot in range(1, replicas + 1):
-                slot_model_token = temp / f"worker-{slot}.model-token"
-                slot_model_token.write_text(f"test-only-model-token-{slot}\n")
-                slot_model_token.chmod(model_token_mode)
-                values[f"WORKER_{slot}_MODEL_TOKEN_FILE"] = str(model_token if shared_model_tokens else slot_model_token)
+                slot_proxy_token = temp / f"worker-{slot}.model-proxy-token"
+                slot_proxy_token.write_text(f"atp_{chr(64 + slot) * 43}\n")
+                slot_proxy_token.chmod(0o600)
+                values[f"WORKER_{slot}_MODEL_PROXY_TOKEN_FILE"] = str(
+                    temp / "worker-1.model-proxy-token" if shared_proxy_tokens else slot_proxy_token
+                )
+                values[f"WORKER_{slot}_MODEL_CREDENTIAL_REF"] = "file:tenant-a/project-a/team-a/chatgpt"
                 credential_file = temp / f"worker-{slot}.runtime.env"
                 credential_file.write_text(f"AGENTTEAMS_GATEWAY_AUTH_TOKEN=ats_{'A' * 48}\n")
                 credential_file.chmod(0o600)
@@ -99,34 +112,39 @@ class ComposeFixedWorkerCapacityTest(unittest.TestCase):
         services = self.services_after_up(args)
         self.assertEqual(
             services,
-            ["postgres", "nats", "nats-bootstrap", "control-plane", "gateway", "worker-1", "worker-2", "worker-enrollment"],
+            ["postgres", "nats", "nats-bootstrap", "control-plane", "gateway", "worker-1", "worker-2", "worker-enrollment", "credential-proxy"],
         )
         self.assertNotIn("--scale", args)
 
-    def test_rejects_model_credential_file_shared_between_worker_slots(self) -> None:
+    def test_rejects_model_proxy_token_shared_between_worker_slots(self) -> None:
         self.invoke_startup(
             2,
-            shared_model_tokens=True,
-            expected_error="Each active Worker must use a distinct model credential file",
+            shared_proxy_tokens=True,
+            expected_error="Each active Worker must use a distinct model proxy token",
         )
 
-    def test_rejects_model_credential_file_readable_by_other_users(self) -> None:
+    def test_rejects_provider_credential_file_readable_by_other_users(self) -> None:
         self.invoke_startup(
             1,
-            model_token_mode=0o644,
-            expected_error="Worker model credential file must not be readable by group or other users",
+            provider_secret_mode=0o644,
+            expected_error="must resolve to an owner-only file under the matching tenant/project path",
         )
 
-    def test_each_worker_has_a_distinct_model_secret(self) -> None:
+    def test_workers_only_receive_model_proxy_tokens(self) -> None:
         compose = (ROOT / "deploy/compose/compose.yaml").read_text()
         for slot in range(1, 9):
-            secret_name = f"model_token_worker_{slot}"
+            secret_name = f"model_proxy_token_worker_{slot}"
             self.assertIn(f"AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE: /run/secrets/{secret_name}", compose)
             self.assertIn(f"secrets: [{secret_name}]", compose)
             self.assertRegex(
                 compose,
-                rf"{secret_name}:\n\s+file: \$\{{WORKER_{slot}_MODEL_TOKEN_FILE:\?set WORKER_{slot}_MODEL_TOKEN_FILE",
+                rf"{secret_name}:\n\s+file: \$\{{WORKER_{slot}_MODEL_PROXY_TOKEN_FILE:\?set WORKER_{slot}_MODEL_PROXY_TOKEN_FILE",
             )
+        self.assertIn("AGENTTEAMS_CHATGPT_RESPONSES_URL: http://credential-proxy:8085/v1/responses", compose)
+        self.assertIn("PROVIDER_CREDENTIALS_DIR:?set PROVIDER_CREDENTIALS_DIR", compose)
+        self.assertNotIn("model_token_worker_", compose)
+        self.assertRegex(compose, r"worker-egress:\n\s+internal: true")
+        self.assertRegex(compose, r"provider-egress:\n\s+driver: bridge")
 
 
 if __name__ == "__main__":

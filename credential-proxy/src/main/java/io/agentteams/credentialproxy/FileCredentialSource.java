@@ -12,7 +12,7 @@ import java.nio.file.Path;
 import java.io.InputStream;
 import java.util.Objects;
 
-/** Resolves {@code file:<relative-path>} references beneath one mounted secret directory. */
+/** Resolves {@code file:<tenant>/<project>/<team>/<relative-path>} references beneath a secret directory. */
 public final class FileCredentialSource implements CredentialSource {
     private static final String SCHEME = "file:";
     private static final int MAX_SECRET_BYTES = 64 * 1024;
@@ -30,8 +30,9 @@ public final class FileCredentialSource implements CredentialSource {
     }
 
     @Override
-    public char[] resolve(String reference) {
-        Path path = resolvePath(reference);
+    public char[] resolve(AttemptExecutionContext context) {
+        Objects.requireNonNull(context, "context");
+        Path path = resolvePath(context);
         byte[] bytes = null;
         try {
             Path realPath = path.toRealPath();
@@ -67,18 +68,32 @@ public final class FileCredentialSource implements CredentialSource {
         }
     }
 
-    private Path resolvePath(String reference) {
+    private Path resolvePath(AttemptExecutionContext context) {
+        String reference = context.modelCredentialRef();
         if (reference == null || !reference.startsWith(SCHEME) || reference.length() == SCHEME.length()) {
             throw new CredentialSourceException();
         }
         String relative = reference.substring(SCHEME.length());
         try {
             Path relativePath = Path.of(relative);
-            if (relativePath.isAbsolute() || relativePath.normalize().startsWith("..")) {
+            Path normalized = relativePath.normalize();
+            if (relativePath.isAbsolute() || normalized.startsWith("..") || normalized.getNameCount() < 4
+                    || !normalized.getName(0).toString().equals(context.tenantId())
+                    || !normalized.getName(1).toString().equals(context.projectId())
+                    || !normalized.getName(2).toString().equals(context.teamId())) {
                 throw new CredentialSourceException();
             }
-            Path resolved = root.resolve(relativePath).normalize();
+            for (Path segment : relativePath) {
+                String name = segment.toString();
+                if (name.equals(".") || name.equals("..")) throw new CredentialSourceException();
+            }
+            Path resolved = root.resolve(normalized);
             if (!resolved.startsWith(root) || resolved.equals(root)) throw new CredentialSourceException();
+            Path cursor = root;
+            for (Path segment : normalized) {
+                cursor = cursor.resolve(segment);
+                if (Files.isSymbolicLink(cursor)) throw new CredentialSourceException();
+            }
             return resolved;
         } catch (InvalidPathException error) {
             throw new CredentialSourceException();

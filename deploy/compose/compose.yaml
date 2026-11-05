@@ -101,13 +101,14 @@ services:
       PGUSER: agentteams
       PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       WORKER_ENROLLMENT_DB_PASSWORD: ${WORKER_ENROLLMENT_DB_PASSWORD:?set WORKER_ENROLLMENT_DB_PASSWORD in .env}
+      CREDENTIAL_PROXY_DB_PASSWORD: ${CREDENTIAL_PROXY_DB_PASSWORD:?set CREDENTIAL_PROXY_DB_PASSWORD in .env}
     entrypoint: ["/bin/sh", "-ec"]
     command:
       - |
         ready=0
         attempt=0
         while [ "$$attempt" -lt 90 ]; do
-          if psql -Atqc "SELECT to_regclass('public.agents') IS NOT NULL AND to_regclass('public.agent_sessions') IS NOT NULL" | grep -qx t; then ready=1; break; fi
+          if psql -Atqc "SELECT to_regclass('public.agents') IS NOT NULL AND to_regclass('public.agent_sessions') IS NOT NULL AND to_regclass('public.task_attempts') IS NOT NULL AND to_regclass('public.task_assignments') IS NOT NULL AND to_regclass('public.agent_leases') IS NOT NULL AND to_regclass('public.resource_scopes') IS NOT NULL" | grep -qx t; then ready=1; break; fi
           attempt=$$((attempt + 1))
           sleep 2
         done
@@ -119,12 +120,24 @@ services:
         \gexec
         SELECT format('ALTER ROLE worker_enrollment WITH LOGIN PASSWORD %L NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS', :'role_password')
         \gexec
+        \getenv proxy_role_password CREDENTIAL_PROXY_DB_PASSWORD
+        SELECT format('CREATE ROLE credential_proxy_runtime LOGIN PASSWORD %L NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS', :'proxy_role_password')
+         WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'credential_proxy_runtime')
+        \gexec
+        SELECT format('ALTER ROLE credential_proxy_runtime WITH LOGIN PASSWORD %L NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS', :'proxy_role_password')
+        \gexec
         GRANT CONNECT ON DATABASE agentteams TO worker_enrollment;
+        GRANT CONNECT ON DATABASE agentteams TO credential_proxy_runtime;
         GRANT USAGE ON SCHEMA public TO worker_enrollment;
         SQL
         psql -v ON_ERROR_STOP=1 -f /opt/worker-enrollment-rls.sql
+        psql -v ON_ERROR_STOP=1 -f /opt/credential-proxy.sql
+        psql -v ON_ERROR_STOP=1 <<'SQL'
+        GRANT credential_proxy_query TO credential_proxy_runtime;
+        SQL
     volumes:
       - ../../worker-enrollment/src/main/resources/db/worker-enrollment-rls.sql:/opt/worker-enrollment-rls.sql:ro
+      - ../../credential-proxy/src/main/resources/db/credential-proxy.sql:/opt/credential-proxy.sql:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -132,6 +145,36 @@ services:
         condition: service_started
     networks: [data]
     restart: "no"
+
+  credential-proxy:
+    image: agentteams-credential-proxy:0.1.0-SNAPSHOT
+    build:
+      context: ../..
+      dockerfile: credential-proxy/Dockerfile
+    profiles: [secure-api, worker-pool]
+    user: "${CREDENTIAL_PROXY_UID:-10001}:${CREDENTIAL_PROXY_GID:-10001}"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/agentteams
+      SPRING_DATASOURCE_USERNAME: credential_proxy_runtime
+      SPRING_DATASOURCE_PASSWORD: ${CREDENTIAL_PROXY_DB_PASSWORD:-}
+      AGENTTEAMS_CREDENTIAL_PROXY_SECRET_ROOT: /run/agentteams/provider-secrets
+      AGENTTEAMS_CREDENTIAL_PROXY_UPSTREAM_RESPONSES_URL: ${AGENTTEAMS_CREDENTIAL_PROXY_UPSTREAM_RESPONSES_URL:-https://api.openai.com/v1/responses}
+      AGENTTEAMS_CREDENTIAL_PROXY_ALLOWED_MODELS: ${AGENTTEAMS_CREDENTIAL_PROXY_ALLOWED_MODELS:-gpt-5.6-luna}
+    volumes:
+      - ${PROVIDER_CREDENTIALS_DIR:?set PROVIDER_CREDENTIALS_DIR in .env}:/run/agentteams/provider-secrets:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      worker-enrollment-db-setup:
+        condition: service_completed_successfully
+    networks: [data, worker-egress, provider-egress]
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8085/actuator/health/readiness"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+    restart: unless-stopped
 
   worker-enrollment:
     image: agentteams-worker-enrollment:0.1.0-SNAPSHOT
@@ -191,6 +234,7 @@ services:
   worker-1:
     image: ${WORKER_IMAGE:?set WORKER_IMAGE to a published image digest}
     platform: linux/amd64
+    user: &worker-user "${CREDENTIAL_PROXY_UID:-10001}:${CREDENTIAL_PROXY_GID:-10001}"
     profiles: [worker-pool, secure-api]
     env_file:
       - path: ${WORKER_1_CREDENTIALS_FILE:-./secrets/worker-1.runtime.env}
@@ -203,12 +247,15 @@ services:
       AGENTTEAMS_MODEL_PROVIDER: chatgpt-plan
       AGENTTEAMS_MODEL: chatgpt-plan:gpt-5.6-luna
       AGENTTEAMS_MAX_CONCURRENT_TASKS: "1"
-      AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE: /run/secrets/model_token_worker_1
-    secrets: [model_token_worker_1]
+      AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE: /run/secrets/model_proxy_token_worker_1
+      AGENTTEAMS_CHATGPT_RESPONSES_URL: http://credential-proxy:8085/v1/responses
+    secrets: [model_proxy_token_worker_1]
     depends_on:
       gateway:
         condition: service_started
       worker-enrollment:
+        condition: service_healthy
+      credential-proxy:
         condition: service_healthy
     networks: [worker-egress]
     restart: unless-stopped
@@ -216,6 +263,7 @@ services:
   worker-2:
     image: ${WORKER_IMAGE:?set WORKER_IMAGE to a published image digest}
     platform: linux/amd64
+    user: *worker-user
     profiles: [worker-pool, secure-api]
     env_file:
       - path: ${WORKER_2_CREDENTIALS_FILE:-./secrets/worker-2.runtime.env}
@@ -223,12 +271,14 @@ services:
     environment:
       <<: *worker-env
       AGENTTEAMS_AGENT_ID: ${WORKER_2_AGENT_ID:?set a registered Worker UUID}
-      AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE: /run/secrets/model_token_worker_2
-    secrets: [model_token_worker_2]
+      AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE: /run/secrets/model_proxy_token_worker_2
+    secrets: [model_proxy_token_worker_2]
     depends_on:
       gateway:
         condition: service_started
       worker-enrollment:
+        condition: service_healthy
+      credential-proxy:
         condition: service_healthy
     networks: [worker-egress]
     restart: unless-stopped
@@ -236,6 +286,7 @@ services:
   worker-3:
     image: ${WORKER_IMAGE:?set WORKER_IMAGE to a published image digest}
     platform: linux/amd64
+    user: *worker-user
     profiles: [worker-pool, secure-api]
     env_file:
       - path: ${WORKER_3_CREDENTIALS_FILE:-./secrets/worker-3.runtime.env}
@@ -243,12 +294,14 @@ services:
     environment:
       <<: *worker-env
       AGENTTEAMS_AGENT_ID: ${WORKER_3_AGENT_ID:?set a registered Worker UUID}
-      AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE: /run/secrets/model_token_worker_3
-    secrets: [model_token_worker_3]
+      AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE: /run/secrets/model_proxy_token_worker_3
+    secrets: [model_proxy_token_worker_3]
     depends_on:
       gateway:
         condition: service_started
       worker-enrollment:
+        condition: service_healthy
+      credential-proxy:
         condition: service_healthy
     networks: [worker-egress]
     restart: unless-stopped
@@ -256,6 +309,7 @@ services:
   worker-4:
     image: ${WORKER_IMAGE:?set WORKER_IMAGE to a published image digest}
     platform: linux/amd64
+    user: *worker-user
     profiles: [worker-pool, secure-api]
     env_file:
       - path: ${WORKER_4_CREDENTIALS_FILE:-./secrets/worker-4.runtime.env}
@@ -263,12 +317,14 @@ services:
     environment:
       <<: *worker-env
       AGENTTEAMS_AGENT_ID: ${WORKER_4_AGENT_ID:?set a registered Worker UUID}
-      AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE: /run/secrets/model_token_worker_4
-    secrets: [model_token_worker_4]
+      AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE: /run/secrets/model_proxy_token_worker_4
+    secrets: [model_proxy_token_worker_4]
     depends_on:
       gateway:
         condition: service_started
       worker-enrollment:
+        condition: service_healthy
+      credential-proxy:
         condition: service_healthy
     networks: [worker-egress]
     restart: unless-stopped
@@ -276,6 +332,7 @@ services:
   worker-5:
     image: ${WORKER_IMAGE:?set WORKER_IMAGE to a published image digest}
     platform: linux/amd64
+    user: *worker-user
     profiles: [worker-pool, secure-api]
     env_file:
       - path: ${WORKER_5_CREDENTIALS_FILE:-./secrets/worker-5.runtime.env}
@@ -283,12 +340,14 @@ services:
     environment:
       <<: *worker-env
       AGENTTEAMS_AGENT_ID: ${WORKER_5_AGENT_ID:?set a registered Worker UUID}
-      AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE: /run/secrets/model_token_worker_5
-    secrets: [model_token_worker_5]
+      AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE: /run/secrets/model_proxy_token_worker_5
+    secrets: [model_proxy_token_worker_5]
     depends_on:
       gateway:
         condition: service_started
       worker-enrollment:
+        condition: service_healthy
+      credential-proxy:
         condition: service_healthy
     networks: [worker-egress]
     restart: unless-stopped
@@ -296,6 +355,7 @@ services:
   worker-6:
     image: ${WORKER_IMAGE:?set WORKER_IMAGE to a published image digest}
     platform: linux/amd64
+    user: *worker-user
     profiles: [worker-pool, secure-api]
     env_file:
       - path: ${WORKER_6_CREDENTIALS_FILE:-./secrets/worker-6.runtime.env}
@@ -303,12 +363,14 @@ services:
     environment:
       <<: *worker-env
       AGENTTEAMS_AGENT_ID: ${WORKER_6_AGENT_ID:?set a registered Worker UUID}
-      AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE: /run/secrets/model_token_worker_6
-    secrets: [model_token_worker_6]
+      AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE: /run/secrets/model_proxy_token_worker_6
+    secrets: [model_proxy_token_worker_6]
     depends_on:
       gateway:
         condition: service_started
       worker-enrollment:
+        condition: service_healthy
+      credential-proxy:
         condition: service_healthy
     networks: [worker-egress]
     restart: unless-stopped
@@ -316,6 +378,7 @@ services:
   worker-7:
     image: ${WORKER_IMAGE:?set WORKER_IMAGE to a published image digest}
     platform: linux/amd64
+    user: *worker-user
     profiles: [worker-pool, secure-api]
     env_file:
       - path: ${WORKER_7_CREDENTIALS_FILE:-./secrets/worker-7.runtime.env}
@@ -323,12 +386,14 @@ services:
     environment:
       <<: *worker-env
       AGENTTEAMS_AGENT_ID: ${WORKER_7_AGENT_ID:?set a registered Worker UUID}
-      AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE: /run/secrets/model_token_worker_7
-    secrets: [model_token_worker_7]
+      AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE: /run/secrets/model_proxy_token_worker_7
+    secrets: [model_proxy_token_worker_7]
     depends_on:
       gateway:
         condition: service_started
       worker-enrollment:
+        condition: service_healthy
+      credential-proxy:
         condition: service_healthy
     networks: [worker-egress]
     restart: unless-stopped
@@ -336,6 +401,7 @@ services:
   worker-8:
     image: ${WORKER_IMAGE:?set WORKER_IMAGE to a published image digest}
     platform: linux/amd64
+    user: *worker-user
     profiles: [worker-pool, secure-api]
     env_file:
       - path: ${WORKER_8_CREDENTIALS_FILE:-./secrets/worker-8.runtime.env}
@@ -343,12 +409,14 @@ services:
     environment:
       <<: *worker-env
       AGENTTEAMS_AGENT_ID: ${WORKER_8_AGENT_ID:?set a registered Worker UUID}
-      AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE: /run/secrets/model_token_worker_8
-    secrets: [model_token_worker_8]
+      AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE: /run/secrets/model_proxy_token_worker_8
+    secrets: [model_proxy_token_worker_8]
     depends_on:
       gateway:
         condition: service_started
       worker-enrollment:
+        condition: service_healthy
+      credential-proxy:
         condition: service_healthy
     networks: [worker-egress]
     restart: unless-stopped
@@ -373,22 +441,22 @@ services:
     restart: unless-stopped
 
 secrets:
-  model_token_worker_1:
-    file: ${WORKER_1_MODEL_TOKEN_FILE:?set WORKER_1_MODEL_TOKEN_FILE to a readable model token file}
-  model_token_worker_2:
-    file: ${WORKER_2_MODEL_TOKEN_FILE:?set WORKER_2_MODEL_TOKEN_FILE to a readable model token file}
-  model_token_worker_3:
-    file: ${WORKER_3_MODEL_TOKEN_FILE:?set WORKER_3_MODEL_TOKEN_FILE to a readable model token file}
-  model_token_worker_4:
-    file: ${WORKER_4_MODEL_TOKEN_FILE:?set WORKER_4_MODEL_TOKEN_FILE to a readable model token file}
-  model_token_worker_5:
-    file: ${WORKER_5_MODEL_TOKEN_FILE:?set WORKER_5_MODEL_TOKEN_FILE to a readable model token file}
-  model_token_worker_6:
-    file: ${WORKER_6_MODEL_TOKEN_FILE:?set WORKER_6_MODEL_TOKEN_FILE to a readable model token file}
-  model_token_worker_7:
-    file: ${WORKER_7_MODEL_TOKEN_FILE:?set WORKER_7_MODEL_TOKEN_FILE to a readable model token file}
-  model_token_worker_8:
-    file: ${WORKER_8_MODEL_TOKEN_FILE:?set WORKER_8_MODEL_TOKEN_FILE to a readable model token file}
+  model_proxy_token_worker_1:
+    file: ${WORKER_1_MODEL_PROXY_TOKEN_FILE:?set WORKER_1_MODEL_PROXY_TOKEN_FILE to the enrolled proxy token file}
+  model_proxy_token_worker_2:
+    file: ${WORKER_2_MODEL_PROXY_TOKEN_FILE:?set WORKER_2_MODEL_PROXY_TOKEN_FILE to the enrolled proxy token file}
+  model_proxy_token_worker_3:
+    file: ${WORKER_3_MODEL_PROXY_TOKEN_FILE:?set WORKER_3_MODEL_PROXY_TOKEN_FILE to the enrolled proxy token file}
+  model_proxy_token_worker_4:
+    file: ${WORKER_4_MODEL_PROXY_TOKEN_FILE:?set WORKER_4_MODEL_PROXY_TOKEN_FILE to the enrolled proxy token file}
+  model_proxy_token_worker_5:
+    file: ${WORKER_5_MODEL_PROXY_TOKEN_FILE:?set WORKER_5_MODEL_PROXY_TOKEN_FILE to the enrolled proxy token file}
+  model_proxy_token_worker_6:
+    file: ${WORKER_6_MODEL_PROXY_TOKEN_FILE:?set WORKER_6_MODEL_PROXY_TOKEN_FILE to the enrolled proxy token file}
+  model_proxy_token_worker_7:
+    file: ${WORKER_7_MODEL_PROXY_TOKEN_FILE:?set WORKER_7_MODEL_PROXY_TOKEN_FILE to the enrolled proxy token file}
+  model_proxy_token_worker_8:
+    file: ${WORKER_8_MODEL_PROXY_TOKEN_FILE:?set WORKER_8_MODEL_PROXY_TOKEN_FILE to the enrolled proxy token file}
 
 volumes:
   postgres-data:
@@ -401,4 +469,6 @@ networks:
   host-ingress:
     driver: bridge
   worker-egress:
+    internal: true
+  provider-egress:
     driver: bridge

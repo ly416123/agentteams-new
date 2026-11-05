@@ -95,11 +95,30 @@ jobs:
           report = ET.parse(
               "credential-proxy/target/surefire-reports/TEST-io.agentteams.credentialproxy.FileCredentialSourceTest.xml"
           ).getroot()
-          assert report.attrib["tests"] == "5", report.attrib
+          assert report.attrib["tests"] == "7", report.attrib
           assert report.attrib["skipped"] == "0", report.attrib
           assert report.attrib["failures"] == "0", report.attrib
           assert report.attrib["errors"] == "0", report.attrib
-          print("All 5 file credential source security tests executed successfully.")
+          print("All 7 file credential source security tests executed successfully.")
+          PY
+
+      - name: Require model proxy authorization and forwarding tests to execute
+        run: |
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+
+          for class_name, expected in (
+              ("ModelProxyServiceTest", "7"),
+              ("ModelProxyControllerTest", "3"),
+          ):
+              report = ET.parse(
+                  f"credential-proxy/target/surefire-reports/TEST-io.agentteams.credentialproxy.{class_name}.xml"
+              ).getroot()
+              assert report.attrib["tests"] == expected, (class_name, report.attrib)
+              assert report.attrib["skipped"] == "0", (class_name, report.attrib)
+              assert report.attrib["failures"] == "0", (class_name, report.attrib)
+              assert report.attrib["errors"] == "0", (class_name, report.attrib)
+          print("All 10 model proxy authorization, upstream forwarding, and HTTP streaming tests executed successfully.")
           PY
 
       - name: Validate Compose and shell scripts
@@ -109,3 +128,6 @@ jobs:
           python3 -m unittest \
             verification.test_compose_fixed_worker_capacity \
             verification.test_compose_oidc_url_contract -v
+
+      - name: Build Credential Proxy container
+        run: docker build --tag agentteams-credential-proxy:ci --file credential-proxy/Dockerfile .

@@ -10,7 +10,7 @@ import java.util.Optional;
 import org.springframework.jdbc.core.JdbcTemplate;
 
 /** Resolves a model proxy bearer token through a narrow database function; the token is never queried in plaintext. */
-public final class JdbcModelProxyCredentialAuthenticator {
+public final class JdbcModelProxyCredentialAuthenticator implements ModelProxyAuthenticator {
     private static final String AUTHENTICATE_SQL = """
             SELECT proxy_credential_id, agent_id, tenant_id, project_id, team_id, model_credential_ref
               FROM public.credential_proxy_authenticate(?)
@@ -22,6 +22,7 @@ public final class JdbcModelProxyCredentialAuthenticator {
         this.jdbc = Objects.requireNonNull(jdbc, "jdbc");
     }
 
+    @Override
     public Optional<AuthenticatedWorker> authenticate(String token) {
         if (!validToken(token)) return Optional.empty();
         String tokenHash = sha256(token);

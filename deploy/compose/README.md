@@ -2,7 +2,7 @@
 
 本目录提供不依赖 Kubernetes API、CRD、Operator 或 Docker Socket 的单机/单节点部署入口。Compose 管理 PostgreSQL、NATS JetStream、Control Plane、Gateway 和最多 8 个预先定义的 Worker 槽位。Worker 数量通过启动脚本显式选择，不会随任务动态创建或扩缩。
 
-> 当前是 POC 部署档，不代表生产就绪。Worker Enrollment 已实现 OIDC scope 授权、哈希存储会话凭据和每槽位投放；真实 IdP 下的端到端任务、多租户负向隔离、上游凭证代理和 Worker drain 恢复仍待验收。
+> 当前是 POC 部署档，不代表生产就绪。Worker Enrollment 已实现 OIDC scope 授权和哈希凭据；Credential Proxy 已加入固定 Worker 启动链，真实 IdP 下的端到端任务、多租户负向隔离、真实 Provider 联调和 Worker drain 恢复仍待验收。
 
 ## 前置条件
 
@@ -10,22 +10,24 @@
 - Docker daemon 可访问 Docker Hub 与 GHCR。终端里的 `HTTP_PROXY` 不一定会传给 daemon；需要代理时，也要在 Docker Desktop/Engine 侧配置 registry 出站代理。
 - 当前固定的 `agentteams-java v0.1.5` 应用镜像仅提供 `linux/amd64`；ARM64 开发机需启用 amd64 仿真，生产主机按 amd64 部署。
 - 已发布的 Control Plane、Gateway、Worker GHCR 镜像 digest。`.env.example` 当前固定到 `agentteams-java v0.1.5`（source commit `0156f2c1fecdc868cb4a0f4f13fb068bb4162834`）。不要使用 `latest` 或可变 tag。
-- 每个活动 Worker 槽位各自的模型 token 文件。token 只以只读 Compose secret 文件挂入对应 Worker，不写进 `.env`；不同槽位不能配置到同一个文件。
+- 可信 HTTPS OIDC Provider、每个活动 Worker 的代理 Token 文件，以及按 Tenant/Project 组织的上游 Provider 凭据文件。Worker 仅接收独立的 `atp_` 代理 Token；上游凭据目录只读挂入 Credential Proxy。
 
 ```sh
 cd deploy/compose
 cp .env.example .env
 ```
 
-编辑 `.env`：填入强随机 `POSTGRES_PASSWORD`。镜像已固定到同一发布 tag 和 source commit，升级时从签名的 release manifest 获取新 digest 后一起更新。`POST /api/v1/agents` 只创建 Worker 记录并返回 UUID，不会签发 Gateway 会话 Token。分别设置 `WORKER_1_MODEL_TOKEN_FILE` 至 `WORKER_8_MODEL_TOKEN_FILE`，指向每个槽位独立的本机模型 token 文件；相对路径相对于本目录。使用 ChatGPT Plan Worker 时，文件应为现有 Worker 运行时支持的 access-token 格式，权限设为 `0600`。只需为活动槽位创建文件。
+编辑 `.env`：填入随机且互不相同的 `POSTGRES_PASSWORD`、`WORKER_ENROLLMENT_DB_PASSWORD` 和 `CREDENTIAL_PROXY_DB_PASSWORD`。将 `CREDENTIAL_PROXY_UID`、`CREDENTIAL_PROXY_GID` 设为运行部署用户的数字 UID/GID；Compose 中 Worker 和 Credential Proxy 都以此身份运行，以便它们只读各自挂载的 `0600` 文件。镜像已固定到发布 digest，升级时从签名 release manifest 获取新 digest 后一起更新。`POST /api/v1/agents` 只创建 Worker 记录，不会签发会话 Token。
+
+创建 `PROVIDER_CREDENTIALS_DIR` 指定的目录，并按 `file:<tenant>/<project>/<team>/<credential-name>` 的引用组织凭据。例如 `.env` 中 `WORKER_1_MODEL_CREDENTIAL_REF=file:tenant-a/project-a/team-a/chatgpt` 对应文件 `secrets/provider/tenant-a/project-a/team-a/chatgpt`。引用中的 Tenant、Project、Team 必须与数据库活动 Attempt 的 scope 完全一致。目录和所有子目录权限设为 `0700`，凭据文件设为 `0600`，所有者 UID 与 `CREDENTIAL_PROXY_UID` 一致。Credential Proxy 只读挂载此目录；Worker 网络为 internal 网络，只能访问 Gateway 和 Proxy，Provider 出站只由 Proxy 所在网络提供。每个活动 Worker 还需要各自的 `WORKER_n_MODEL_PROXY_TOKEN_FILE`，由 Enrollment 命令生成；这些 `atp_` 文件也须为 `0600` 且由同一 UID 拥有。只需为活动槽位准备模型代理 Token 和其引用的 Provider 凭据文件。
 
 要启用 Artifact 对象存储，将 `AGENTTEAMS_STORAGE_ENABLED=true`，并设置 `OBJECT_STORE_ACCESS_KEY` 与至少 24 字符的 `OBJECT_STORE_SECRET_KEY`。启动脚本会先启动 `storage` profile 中的 SeaweedFS S3，并等待 S3 服务就绪后再启动 Control Plane；`agentteams` bucket 在 SeaweedFS 启动时创建，参数采用 [SeaweedFS `weed mini` S3 配置](https://github-wiki-see.page/m/seaweedfs/seaweedfs/wiki/Quick-Start-with-weed-mini)。S3 和管理端口都不发布到宿主机。当前 POC 使用单节点 SeaweedFS，并把全局 S3 凭证提供给 Control Plane；生产环境应改用具备 bucket 范围授权、备份和恢复能力的对象存储身份/服务。
 
-Worker 池启用前，配置真实 OIDC issuer、JWKS URL、audience，并设置唯一的 `WORKER_ENROLLMENT_DB_PASSWORD`（至少 24 字符）；将 `API_AUTH_ENABLED=true`。这个开关同时开启 Control Plane API OIDC 安全和 Enrollment OIDC 验证。Enrollment 数据库角色由一次性 setup 容器创建，只能读取 `agents` 并读写 `agent_sessions`。不要手工向数据库写 Token。Control Plane 和 Enrollment HTTP 端口只绑定到 `127.0.0.1`，不可改为公网或局域网监听；如需远端访问，应放在完成 TLS 和身份校验的可信入口后。
+Worker 池启用前，配置真实 HTTPS OIDC issuer、JWKS URL、audience，并设置唯一的 `WORKER_ENROLLMENT_DB_PASSWORD` 和 `CREDENTIAL_PROXY_DB_PASSWORD`（各至少 24 字符）；将 `API_AUTH_ENABLED=true`。这个开关同时开启 Control Plane API OIDC 安全和 Enrollment OIDC 验证。不要手工向数据库写 Token。Control Plane 和 Enrollment HTTP 端口只绑定到 `127.0.0.1`，不可改为公网或局域网监听；如需远端访问，应放在完成 TLS 和身份校验的可信入口后。
 
-Enrollment 数据库使用独立的 `worker_enrollment` 登录角色；setup 会启用 `agents`、`agent_sessions` 和 scope 索引的 PostgreSQL RLS，并授予 Enrollment 所需的列级权限。`worker_enrollment` 不是表所有者、超级用户或 `BYPASSRLS`。专用 `worker_enrollment_scope_owner` 角色仅拥有 scope 索引和同步触发函数，不能登录，也没有绕过 RLS 的权限；Control Plane 写入 Agent 时由该函数同步 scope，Enrollment 不能读取完整 `agents.metadata`，其他应用角色不能直接修改 scope 索引。Enrollment 在签发/撤销事务中设置 JWT 已验证的 tenant/project/team scope；无 scope 时策略不返回 Agent，跨 scope Session 写入会被拒绝。当前 RLS 只覆盖 Enrollment 所需的 Agent、Session 和 scope 索引，不代表 Task、Attempt、Artifact 等资源已完成全系统隔离。
+Enrollment 和 Credential Proxy 使用不同的非特权数据库登录角色。setup 会为两者启用窄列授权、RLS 和 `SECURITY DEFINER` 查询函数；Credential Proxy 运行角色只能执行活动 Attempt/模型 Token 查询函数，不能直接读取 Token 哈希或业务表。该 RLS 覆盖仍不代表 Task、Attempt、Artifact 等资源已完成全系统隔离。
 
-Enrollment 端口默认为 `127.0.0.1:8090`；若 `.env` 中覆盖 `ENROLLMENT_PORT`，该值仅影响宿主机端口映射，绑定地址仍固定为 loopback。`enroll-worker.sh` 需要 `curl`、`jq` 和由 OIDC Provider 签发且 scope/audience 匹配的临时 access token 文件。
+Enrollment 端口默认为 `127.0.0.1:8090`；若 `.env` 中覆盖 `ENROLLMENT_PORT`，该值仅影响宿主机端口映射，绑定地址仍固定为 loopback。`enroll-worker.sh` 需要 `curl`、`jq` 和由 OIDC Provider 签发且 scope/audience 匹配的临时 access token 文件。Credential Proxy 默认只转发到 `https://api.openai.com/v1/responses`，只允许 `.env` 的模型 allowlist；自定义上游地址应使用 HTTPS，HTTP 仅允许 loopback 测试地址。
 
 使用私有 GHCR 镜像时，先在本机执行 `docker login ghcr.io`。不要把 PAT 写入 Compose 文件或 `.env`。
 
@@ -40,7 +42,7 @@ docker compose --env-file .env up -d postgres nats nats-bootstrap control-plane 
 docker compose --env-file .env ps
 ```
 
-Control Plane 仅绑定到 `127.0.0.1:${CONTROL_PLANE_PORT}`；PostgreSQL、NATS 和 Gateway gRPC 端口不发布到宿主机。PostgreSQL/NATS 位于无外连的 `data` 网络；Worker 仅加入 `worker-egress` 网络，与同时连接两网的 Gateway 通信，不能直接连接数据库或 NATS。Worker 的 bridge 网络允许访问模型服务；主机防火墙/出站代理策略需按环境限制 Worker 外部访问。NATS 第一次启动时创建 TASK_EVENTS、AGENT_EVENTS、CONTROL_EVENTS、DEADLETTER_EVENTS 四个持久 stream；数据库由 Control Plane Flyway 迁移。
+Control Plane 仅绑定到 `127.0.0.1:${CONTROL_PLANE_PORT}`；PostgreSQL、NATS 和 Gateway gRPC 端口不发布到宿主机。PostgreSQL/NATS 位于无外连的 `data` 网络；Worker 仅加入 internal 的 `worker-egress` 网络，与同时连接两网的 Gateway 和 Credential Proxy 通信，不能直接连接数据库、NATS 或公网模型服务。Credential Proxy 单独连接 `provider-egress` bridge 网络，Host 防火墙/出站代理应按上游地址限制该出口。NATS 第一次启动时创建四个持久 stream；数据库由 Control Plane Flyway 迁移，随后 setup 安装 Enrollment 与 Credential Proxy 的受限角色和查询函数。
 
 启用对象存储时，使用启动脚本保证 S3 端点就绪后再启动应用：
 
@@ -67,14 +69,14 @@ Agent scope 必须在 `metadata.scope` 中包含 enrollment 配置所使用的 `
 
 基础用法只把 Gateway token 写入槽位文件；明文仅在 Enrollment 响应和本机受限文件短暂出现，数据库存哈希。设置 `.env` 中对应的 `WORKER_1_CREDENTIALS_FILE` 路径（相对路径以本目录为准）、`WORKER_REPLICAS=1`，再启动：
 
-Enrollment 也支持为模型代理创建独立短期凭据。附加 `ttl-seconds`、非敏感 `model-credential-ref` 和代理 Token 文件路径：
+Enrollment 也会为模型代理创建独立短期凭据。附加 `ttl-seconds`、Tenant/Project 下的非敏感 `model-credential-ref` 和代理 Token 文件路径：
 
 ```sh
 ./enroll-worker.sh http://127.0.0.1:8090 <agent-uuid> /secure/path/oidc-access-token \
-  ./secrets/worker-1.runtime.env 604800 vault://tenant/project/chatgpt ./secrets/worker-1.model-proxy-token
+  ./secrets/worker-1.runtime.env 604800 file:tenant-a/project-a/team-a/chatgpt ./secrets/worker-1.model-proxy-token
 ```
 
-Gateway Token 和模型代理 Token 互不通用；数据库只存两者的 SHA-256，模型代理凭据绑定 Gateway session、Agent scope 和模型凭据引用，撤销 session 会一并撤销模型代理凭据。输出文件均设置为 `0600`。当前 Compose 尚未运行 HTTP 模型代理；完成代理部署并把 Worker 的模型 endpoint 指向代理前，不要将该 `atp_` Token 配置成直接访问模型供应商的凭据。它不是上游 Provider Secret。
+Gateway Token 和模型代理 Token 互不通用；数据库只存两者的 SHA-256，模型代理凭据绑定 Gateway session、Agent scope 和模型凭据引用，撤销 session 会一并撤销模型代理凭据。输出文件均设置为 `0600`。Worker 将 Responses API 请求发往内部 Credential Proxy；Proxy 逐请求校验唯一活动 Assignment/Attempt/Lease，并要求凭据引用中的 Tenant/Project 与数据库执行上下文一致，再读取 Provider Secret、替换 Authorization 并流式转发。客户端不能通过请求体或 header 选择租户/Attempt；非成功上游错误正文不会回传给 Worker。
 
 ```sh
 ./start-workers.sh
@@ -91,7 +93,7 @@ Gateway Token 和模型代理 Token 互不通用；数据库只存两者的 SHA-
 ./revoke-worker-session.sh http://127.0.0.1:8090 <agent-uuid> <old-session-uuid> /secure/path/oidc-access-token
 ```
 
-撤销会阻止后续 Gateway 握手，并同步撤销关联的模型代理 Token；v0.1.5 不会主动断开已建立的 Gateway 连接。兼容模式下 Worker 仍可从各自模型 token 文件读取供应商凭据，这与 Gateway session 是两类凭据。每个活动槽位必须使用不同文件；配置校验会拒绝指向同一个底层文件的槽位。当前模型代理尚未提供 HTTP 转发，兼容模式仍不提供 Attempt 级授权或上游凭据隔离。
+撤销会阻止后续 Gateway 握手，并同步撤销关联的模型代理 Token；v0.1.5 不会主动断开已建立的 Gateway 连接。每个活动槽位必须使用不同的代理 Token 文件；多个同 Tenant/Project 的 Worker 可引用同一个受 scope 保护的 Provider 凭据。
 
 ## 状态与运维
 

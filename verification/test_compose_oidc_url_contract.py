@@ -22,6 +22,7 @@ class ComposeOidcUrlContractTest(unittest.TestCase):
             "OIDC_AUDIENCE": "agentteams-test",
             "POSTGRES_PASSWORD": "test-postgres-password-with-32-chars",
             "WORKER_ENROLLMENT_DB_PASSWORD": "test-enrollment-password-with-32-chars",
+            "CREDENTIAL_PROXY_DB_PASSWORD": "test-credential-proxy-password-with-32-chars",
             "WORKER_REPLICAS": "0",
         })
         with tempfile.TemporaryDirectory() as temp_dir:
