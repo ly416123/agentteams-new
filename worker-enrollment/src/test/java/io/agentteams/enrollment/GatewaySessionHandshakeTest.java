@@ -38,7 +38,7 @@ import org.testcontainers.utility.DockerImageName;
 @Testcontainers(disabledWithoutDocker = true)
 class GatewaySessionHandshakeTest {
     private static final String GATEWAY_IMAGE = "ghcr.io/ly416123/agentteams-agent-gateway"
-            + "@sha256:251b6d61a1dc62b5bdd01b36b32dc4a508b1e8d92af59491374f7ce0d7a10b91";
+            + "@sha256:40c919d31b0fe7bdf876237c36fff405a16c2208420ad42374f6dd67491e055f";
     private static final String SERVICE = "io.agentteams.contracts.v1.AgentChannel/Connect";
     private static final Metadata.Key<String> TOKEN_HEADER = Metadata.Key.of("x-agent-token", Metadata.ASCII_STRING_MARSHALLER);
     private static final MethodDescriptor.Marshaller<byte[]> BYTE_ARRAY = new MethodDescriptor.Marshaller<>() {

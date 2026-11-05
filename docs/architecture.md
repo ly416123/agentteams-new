@@ -29,7 +29,7 @@ NATS JetStream ──► Agent Gateway ◄─────┘ command persistence
 - NATS JetStream 承载持久事件。Gateway 持久化命令并按序号、ACK 游标处理断线恢复。
 - Worker 静态部署并主动注册。控制面不接触 Docker Socket，不持有创建容器的权限。
 - 固定 Worker 的 Gateway 会话由独立 `worker-enrollment` 服务签发：调用者须通过 OIDC issuer、签名、audience 验证，并持有 `worker:session:manage` 权限；调用 scope 必须与 Agent 注册元数据中的 tenant/project/team 完全一致。明文随机 token 只返回一次，数据库仅保存 SHA-256，TTL 限制在 1 小时至 30 天。
-- Enrollment 数据库帐号只拥有读取 `agents`、读取/插入/更新 `agent_sessions` 的权限；Compose 为每个 Worker 槽位单独加载 `0600` 凭据文件。v0.1.4 Gateway 只在握手时验证 session，撤销不主动断开现有连接。
+- Enrollment 数据库帐号只拥有读取 `agents`、读取/插入/更新 `agent_sessions` 的权限；Compose 为每个 Worker 槽位单独加载 `0600` 凭据文件。v0.1.5 Gateway 在握手时校验 session，撤销不主动断开现有连接。
 - Matrix 是可选的人机协作适配器；不能作为调度总线或任务状态库。
 - Artifact 正文存储在隔离的对象存储命名空间，通过租户授权后的短期 URL 访问。
 
@@ -69,7 +69,7 @@ PostgreSQL、NATS、对象存储与 Matrix（启用时）都要有持久化、�
 
 ## 7. 兼容与共享代码边界
 
-新架构不另建 Task/Attempt/RBAC/Outbox 状态机，不双写事实源。外部边界使用版本化 protobuf/gRPC 与稳定公共 API。共享核心 Maven 制品 `0.1.4` 已发布并通过独立远端消费者验证。Control Plane、Gateway、Worker 的 OCI 镜像来自 `agentteams-java v0.1.4`，均按 digest 固定在 `deploy/compose/.env.example`，源 commit 为 `02d5ad3017f56b2a3cbb6c60112077d32f3299f4`；发布清单见 [v0.1.4 release](https://github.com/ly416123/agentteams-java/releases/tag/v0.1.4)。
+新架构不另建 Task/Attempt/RBAC/Outbox 状态机，不双写事实源。外部边界使用版本化 protobuf/gRPC 与稳定公共 API。共享核心 Maven 制品 `0.1.5` 已发布并通过独立远端消费者验证。Control Plane、Gateway、Worker 的 OCI 镜像来自 `agentteams-java v0.1.5`，均按 digest 固定在 `deploy/compose/.env.example`，源 commit 为 `0156f2c1fecdc868cb4a0f4f13fb068bb4162834`；发布清单见 [v0.1.5 release](https://github.com/ly416123/agentteams-java/releases/tag/v0.1.5)。
 
 Java 21 继续承载 Control Plane、Gateway、Scheduler、协议和 AgentScope Worker。Python 仅用于确实需要 Python SDK 的独立 Agent/评测/批处理；其他语言需先有可测量的性能或隔离需求。
 

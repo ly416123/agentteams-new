@@ -8,8 +8,8 @@
 
 - Docker Engine 与 Docker Compose v2。
 - Docker daemon 可访问 Docker Hub 与 GHCR。终端里的 `HTTP_PROXY` 不一定会传给 daemon；需要代理时，也要在 Docker Desktop/Engine 侧配置 registry 出站代理。
-- 当前固定的 `agentteams-java v0.1.4` 应用镜像仅提供 `linux/amd64`；ARM64 开发机需启用 amd64 仿真，生产主机按 amd64 部署。
-- 已发布的 Control Plane、Gateway、Worker GHCR 镜像 digest。`.env.example` 当前固定到 `agentteams-java v0.1.4`（source commit `02d5ad3017f56b2a3cbb6c60112077d32f3299f4`）。不要使用 `latest` 或可变 tag。
+- 当前固定的 `agentteams-java v0.1.5` 应用镜像仅提供 `linux/amd64`；ARM64 开发机需启用 amd64 仿真，生产主机按 amd64 部署。
+- 已发布的 Control Plane、Gateway、Worker GHCR 镜像 digest。`.env.example` 当前固定到 `agentteams-java v0.1.5`（source commit `0156f2c1fecdc868cb4a0f4f13fb068bb4162834`）。不要使用 `latest` 或可变 tag。
 - Worker 模型调用所需的 token 文件。token 只以只读 Compose secret 文件挂入 Worker，不写进 `.env`。
 
 ```sh
@@ -73,7 +73,7 @@ Control Plane 仅绑定到 `127.0.0.1:${CONTROL_PLANE_PORT}`；PostgreSQL、NATS
 ./revoke-worker-session.sh http://127.0.0.1:8090 <agent-uuid> <old-session-uuid> /secure/path/oidc-access-token
 ```
 
-撤销只阻止后续 Gateway 握手；v0.1.4 不会主动断开已建立的连接。Worker 还会通过模型 token 文件调用模型服务，这与 Gateway session 是两类凭据。
+撤销只阻止后续 Gateway 握手；v0.1.5 不会主动断开已建立的连接。Worker 还会通过模型 token 文件调用模型服务，这与 Gateway session 是两类凭据。
 
 ## 状态与运维
 

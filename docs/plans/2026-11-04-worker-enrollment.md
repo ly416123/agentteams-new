@@ -2,9 +2,9 @@
 
 > **面向 AI 代理的工作者：** 按顺序执行任务，先写失败测试，验证失败后再实现。完成每一阶段后检查租户 scope 和秘密投放边界。
 
-**目标：** 在不修改 `agentteams-java` 的前提下，为固定 Worker 槽位提供可撤销、租户范围受限的 Gateway 会话凭证签发与 Compose 投放路径。
+**目标：** 在 `agentteams-new` 为固定 Worker 槽位提供可撤销、租户范围受限的 Gateway 会话凭证签发与 Compose 投放路径；若复用的上游制品存在安全阻断，只允许实施范围最小、可审计的依赖修复，不把新架构功能转移到旧项目。
 
-**架构：** 新增独立 Java 21 Spring Boot enrollment 服务，使用 v0.1.4 已有 `agents`、`agent_sessions` 表。OIDC 权限和 Agent 元数据 scope 都通过后才可签发/撤销；明文 Token 仅在签发响应返回一次，持久层只写 SHA-256。Compose 为每个 Worker 加载独立、权限受限的 runtime env 文件。
+**架构：** 新增独立 Java 21 Spring Boot enrollment 服务，使用共享核心制品提供的 `agents`、`agent_sessions` 表。OIDC 权限和 Agent 元数据 scope 都通过后才可签发/撤销；明文 Token 仅在签发响应返回一次，持久层只写 SHA-256。Compose 为每个 Worker 加载独立、权限受限的 runtime env 文件。
 
 **技术栈：** Java 21、Spring Boot 3.5.16、Spring Security OAuth2 Resource Server、Spring JDBC、PostgreSQL、JUnit 5、Docker Compose v2。
 
@@ -47,10 +47,10 @@
 
 ## Task 4：验证与交付
 
-- [x] 运行 22 项 Enrollment 测试、Maven verify、Compose config 与 shell 静态校验；CI 已覆盖同样的 Java 21/Compose 检查。
+- [x] 运行 27 项 Enrollment 测试、Maven verify、Compose config 与 shell 静态校验；CI 已覆盖同样的 Java 21/Compose 检查。
 - [x] 使用 Testcontainers/PostgreSQL 验证 scope 查询、Token Hash 落库、撤销幂等和专用 DB role 仅能访问授权表；CI 明确要求 10 项 PostgreSQL 集成断言全部执行。
 - [x] 使用进程内临时 RSA/JWKS 发行者通过真实 HTTP JWT 解码器与 PostgreSQL 验证签名、issuer、audience、Token Hash、撤销和 tenant/project/team scope 拒绝。
-- [ ] 在 CI 中启动固定 digest 的 v0.1.4 Gateway 和 PostgreSQL，以最小 protobuf/gRPC 客户端验证有效握手、Gateway/Agent 状态投影，以及未知、过期、撤销和 Agent 绑定不匹配的拒绝；共 5 项，CI 强制确认未跳过。CI `41953617348` 实际执行了 5 项：有效会话通过，但 4 类无效会话均错误收到 `READY` 并写入在线状态。此项为安全阻断，须修复 `agentteams-java` 并发布新 digest 后重验，不能在当前镜像上勾选通过。
+- [x] 在本机使用固定 digest 的 v0.1.5 Gateway 与 PostgreSQL，以最小 protobuf/gRPC 客户端验证有效握手、Gateway/Agent 状态投影，以及未知、过期、撤销和 Agent 绑定不匹配的拒绝；本机共 5 项且未跳过。旧镜像失败见 CI `41953617348`；新镜像 digest `sha256:40c919d31b0fe7bdf876237c36fff405a16c2208420ad42374f6dd67491e055f` 的本机验收 5/5 通过。发布来源为 `agentteams-java v0.1.5` / commit `0156f2c1fecdc868cb4a0f4f13fb068bb4162834`。
 - [ ] 在部署环境使用真实 OIDC Provider 验证 claims 映射，并使用真实 Worker runtime 完成任务 attempt、续租/重连及撤销后的新连接拒绝；测试发行者不替代真实 IdP，当前没有有效 Worker 模型凭据。
 - [x] 检查没有测试密钥或 Token 文件入库；更新审计、PR 描述并提交。
 
@@ -62,4 +62,4 @@
 - 固定 digest Gateway 测试使用合成数据库 session 与协议客户端；它验证 Gateway 鉴权和状态写入，但不代表完整 Worker AgentScope runtime 或任务闭环验收。
 - OIDC/JWKS 配置错误必须 fail-closed。生产 Compose 不允许关闭 API 身份认证或将 Control Plane/enrollment 端口绑定到非回环地址，除非前置可信 TLS 入口已明确配置。
 - v0.1.4 Worker 只在连接时校验 Session；Token 到期不会主动断开已建立连接。轮换流程必须创建新 Session 并触发 Worker 重连，不能把到期等同于即时撤销。
-- 当前 v0.1.4 Gateway 存在会话鉴权失效证据；Enrollment API 的 scope 校验和 Token Hash 落库不能弥补 Gateway 接受无效 Token 的问题。依 Worker Enrollment 计划的“不修改 `agentteams-java`”约束，修复旧 Gateway 前需先解除该仓库边界约束。
+- v0.1.4 Gateway 曾存在会话鉴权失效；已在 `agentteams-java v0.1.5` 修复并通过固定 digest 的 5/5 握手验收。新架构功能继续只在 `agentteams-new` 实现；若复用制品出现安全阻断，只做独立、最小、可审计的上游依赖修复。

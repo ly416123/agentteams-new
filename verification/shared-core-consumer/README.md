@@ -29,7 +29,7 @@ mvn -f verification/shared-core-consumer/pom.xml \
   dependency:tree -Dverbose
 ```
 
-成功标准是 Maven 从 GitHub Packages 解析 `agentteams-java:0.1.4` parent 和 6 个核心 JAR，并从 Maven Central 解析它们的第三方传递依赖。使用临时 local cache 可避免旧的本机 SNAPSHOT 或手工安装包掩盖远端缺失。若发布版本号改变，通过 `-Dagentteams.core.version=<release-version>` 指定同一版本。
+成功标准是 Maven 从 GitHub Packages 解析 `agentteams-java:0.1.5` parent 和 6 个核心 JAR，并从 Maven Central 解析它们的第三方传递依赖。使用临时 local cache 可避免旧的本机 SNAPSHOT 或手工安装包掩盖远端缺失。若发布版本号改变，通过 `-Dagentteams.core.version=<release-version>` 指定同一版本。
 
 ## 验证未上传的候选发布
 
@@ -38,8 +38,8 @@ mvn -f verification/shared-core-consumer/pom.xml \
 ```bash
 AGENTTEAMS_JAVA_SOURCE=/path/to/agentteams-java \
 AGENTTEAMS_JAVA_REF=<commit-or-tag> \
-AGENTTEAMS_CORE_VERSION=0.1.4 \
+AGENTTEAMS_CORE_VERSION=0.1.5 \
   verification/shared-core-consumer/verify-local-release.sh
 ```
 
-2026-11-04 已使用本机 `gh` 凭证（`read:packages`）和本机代理 `127.0.0.1:7892`，在临时 Maven settings 与独立本地缓存下执行远端 `dependency:tree`。Maven 从 GitHub Packages 成功解析根 parent、6 个核心模块 `0.1.4` 及第三方传递依赖，输出 `BUILD SUCCESS`。凭证通过环境变量注入，未写入仓库或持久 settings。该验证证明本机凭证路径可用；新仓库 GitHub Actions 的 `GITHUB_TOKEN` 跨仓库访问仍待单独验证。
+2026-11-04 已使用本机 `gh` 凭证（`read:packages`）和本机代理 `127.0.0.1:7892`，在临时 Maven settings 与独立本地缓存下执行远端 `dependency:tree`。Maven 从 GitHub Packages 成功解析根 parent、6 个核心模块 `0.1.5` 及第三方传递依赖，输出 `BUILD SUCCESS`。凭证通过环境变量注入，未写入仓库或持久 settings。该验证证明本机凭证路径可用；新仓库 GitHub Actions 的 `GITHUB_TOKEN` 跨仓库访问仍待单独验证。

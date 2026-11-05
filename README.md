@@ -2,7 +2,7 @@
 
 面向固定容量、多租户 Agent 协作的无 Kubernetes 部署架构。项目以 Java 21 为服务端主线，复用现有 AgentTeams 的任务、租约、Outbox、Gateway 和 Worker 能力，并提供 Docker Compose / systemd 部署路径。
 
-> 当前阶段：固定容量 Compose POC 已接入独立 Worker Enrollment 服务、OIDC scope 检查和每槽位会话凭据投放；签名 JWT→HTTP→PostgreSQL 测试及 DB 最小权限测试通过，覆盖哈希、撤销和 tenant/project/team 拒绝。CI 已加入固定 digest 的 v0.1.4 Gateway gRPC 握手集成测试；最新 CI 仍在等待 GitHub runner，握手验收尚未通过。真实 OIDC Provider、Worker runtime 任务闭环和生产验收仍未完成。
+> 当前阶段：固定容量 Compose POC 已接入独立 Worker Enrollment 服务、OIDC scope 检查和每槽位会话凭据投放；签名 JWT→HTTP→PostgreSQL 测试及 DB 最小权限测试通过，覆盖哈希、撤销和 tenant/project/team 拒绝。上游 Gateway 会话 fail-closed 修复已包含在 `agentteams-java v0.1.5`，固定 digest 的 5 种 gRPC 握手场景已在本机全部通过且未跳过。真实 OIDC Provider、Worker runtime 任务闭环和生产验收仍未完成。
 
 ## 目标
 
@@ -21,7 +21,7 @@
 
 ## 仓库边界
 
-当前 `agentteams-java` 是完整源码仓库。为避免本仓库通过本机相对路径引用兄弟目录，或复制一份控制面和 Worker 后独立演进，6 个共享模块与根 parent 已以 `0.1.4` 发布到 GitHub Packages，并通过本仓库独立 Maven consumer 完成远端解析验证。
+当前 `agentteams-java` 是完整源码仓库。为避免本仓库通过本机相对路径引用兄弟目录，或复制一份控制面和 Worker 后独立演进，6 个共享模块与根 parent 已以 `0.1.5` 发布到 GitHub Packages，并通过本仓库独立 Maven consumer 完成远端解析验证。
 
 批次 0 已在 `agentteams-java` 发布并验证 contracts、domain、application-contracts、runtime、observability、storage 六个共享模块的版本化 Maven 制品。后续如发现模块边界不适合独立发布，则以受控迁移和兼容 API/事件契约替代；决策及影响记录在 [共享核心复用 ADR](docs/decisions/0001-shared-core-reuse.md)。
 
@@ -78,4 +78,4 @@ Worker 会话凭据已支持按 tenant/project/team 授权签发、哈希持久�
 
 ## Maven 制品
 
-共享 Java 模块使用 `agentteams-java` 的稳定 Git tag 作为统一版本发布到 GitHub Packages；新项目固定消费 `0.1.4`，不读取 SNAPSHOT。已通过本机代理和 classic PAT（`read:packages`）使用独立 Maven 缓存完成远端解析；本地发布边界也可用 `verification/shared-core-consumer/verify-local-release.sh` 重放。GitHub Packages Maven Registry 要求认证，即使包关联的仓库公开也需凭证。
+共享 Java 模块使用 `agentteams-java` 的稳定 Git tag 作为统一版本发布到 GitHub Packages；新项目固定消费 `0.1.5`，不读取 SNAPSHOT。已通过本机代理和 classic PAT（`read:packages`）使用独立 Maven 缓存完成远端解析；本地发布边界也可用 `verification/shared-core-consumer/verify-local-release.sh` 重放。GitHub Packages Maven Registry 要求认证，即使包关联的仓库公开也需凭证。
