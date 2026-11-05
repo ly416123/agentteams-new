@@ -221,6 +221,7 @@ services:
     build:
       context: ../..
       dockerfile: worker-enrollment/Dockerfile
+      secrets: [maven_settings]
     profiles: [secure-api]
     environment:
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/agentteams
@@ -242,7 +243,7 @@ services:
         condition: service_completed_successfully
     ports:
       - "127.0.0.1:${ENROLLMENT_PORT:-8090}:8090"
-    networks: [data]
+    networks: [data, host-ingress]
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8090/actuator/health"]
       interval: 5s

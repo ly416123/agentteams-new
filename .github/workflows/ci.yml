@@ -140,3 +140,6 @@ jobs:
 
       - name: Build Credential Proxy container
         run: docker build --secret id=maven_settings,src="$HOME/.m2/settings.xml" --tag agentteams-credential-proxy:ci --file credential-proxy/Dockerfile .
+
+      - name: Build Worker Enrollment container
+        run: docker build --secret id=maven_settings,src="$HOME/.m2/settings.xml" --tag agentteams-worker-enrollment:ci --file worker-enrollment/Dockerfile .

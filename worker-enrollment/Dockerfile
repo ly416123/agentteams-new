@@ -3,8 +3,10 @@ WORKDIR /workspace
 
 COPY pom.xml ./pom.xml
 COPY worker-enrollment/pom.xml ./worker-enrollment/pom.xml
+COPY credential-proxy/pom.xml ./credential-proxy/pom.xml
 COPY worker-enrollment/src ./worker-enrollment/src
-RUN mvn -B -ntp -f pom.xml -pl worker-enrollment -am package -DskipTests
+RUN --mount=type=secret,id=maven_settings,target=/root/.m2/settings.xml \
+    mvn -B -ntp -f pom.xml -pl worker-enrollment -am package -DskipTests
 
 FROM eclipse-temurin:21-jre-jammy
 WORKDIR /app

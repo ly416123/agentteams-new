@@ -158,6 +158,16 @@ class ComposeFixedWorkerCapacityTest(unittest.TestCase):
         compose = (ROOT / "deploy/compose/compose.yaml").read_text()
         credential_proxy = compose.split("\n  credential-proxy:\n", 1)[1].split("\n  worker-enrollment:\n", 1)[0]
         self.assertIn("      secrets: [maven_settings]", credential_proxy)
+
+    def test_worker_enrollment_is_host_reachable_and_builds_with_maven_settings(self) -> None:
+        compose = (ROOT / "deploy/compose/compose.yaml").read_text()
+        enrollment = compose.split("\n  worker-enrollment:\n", 1)[1].split("\n  gateway:\n", 1)[0]
+        dockerfile = (ROOT / "worker-enrollment/Dockerfile").read_text()
+        self.assertIn('"127.0.0.1:${ENROLLMENT_PORT:-8090}:8090"', enrollment)
+        self.assertIn("    networks: [data, host-ingress]", enrollment)
+        self.assertIn("      secrets: [maven_settings]", enrollment)
+        self.assertIn("COPY credential-proxy/pom.xml ./credential-proxy/pom.xml", dockerfile)
+        self.assertIn("--mount=type=secret,id=maven_settings,target=/root/.m2/settings.xml", dockerfile)
         self.assertRegex(compose, r"maven_settings:\n\s+file: \$\{MAVEN_SETTINGS_FILE:-/dev/null\}")
 
 
