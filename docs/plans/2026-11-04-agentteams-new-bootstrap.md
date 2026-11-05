@@ -74,6 +74,8 @@
 
 **模型代理凭据签发与撤销绑定（2026-11-05）：** Enrollment API 现在可在 Worker session 签发请求中接收非敏感 `modelCredentialRef`，返回独立 `atp_` 模型代理 Token；Gateway Token 与代理 Token 分别只存 SHA-256，代理记录绑定 session、Agent、Tenant/Project/Team、凭据引用和相同到期时间。Enrollment DB role 只获同 scope 的代理凭据插入、撤销及最少元数据读取权，不能读取 Token 哈希或模型凭据引用；撤销 Gateway session 会在同一事务撤销关联代理凭据。`enroll-worker.sh` 可把两种 Token 写入各自 `0600` 文件。CI [run 42006053503](https://github.com/ly416123/agentteams-new/actions/runs/42006053503) 通过 18 项 PostgreSQL/OIDC/Gateway 集成、4 项 Credential Proxy PostgreSQL 测试、9 项 Resolver 单测及 Compose/shell 门禁，零跳过；新增测试验证代理 Token 哈希持久化、scope 限制和 Session 联动撤销。本机 8 项 Enrollment 服务单测通过，但本机没有 Docker，PostgreSQL 集成由 CI 执行。代理 HTTP 认证、Provider Secret 解析和流式转发尚未实现，`atp_` Token 当前不可直接用于模型调用。
 
+**模型代理 Token 鉴权查询（2026-11-05）：** `credential-proxy` 新增 `JdbcModelProxyCredentialAuthenticator`，仅接受固定格式 `atp_` token，在应用侧计算 SHA-256 后调用独立 PostgreSQL `SECURITY DEFINER` 函数；函数同时验证 Token 与 Gateway session 的撤销/过期状态，以及 Agent 当前 Tenant/Project/Team scope，且只返回代理所需身份和非敏感凭据引用。运行角色只能执行函数，不能读取 Token 哈希表。GitHub Actions [run 42006970309](https://github.com/ly416123/agentteams-new/actions/runs/42006970309) 全绿，5 项 PostgreSQL Credential Proxy 边界测试、9 项 Resolver 测试及全部 Enrollment/OIDC/Compose 门禁均执行通过、零跳过。本机 Maven 编译和 9 项 Resolver 测试通过；本机无 Docker，5 项数据库测试本地跳过，由 CI 实际执行。此阶段只完成认证与身份解析，尚未接入 HTTP 模型代理、Provider Secret Source、上游请求转发和流式处理。
+
 ## 批次 1：无 Kubernetes 固定容量 Compose POC
 
 1. 先从旧仓库构建并发布 Control Plane、Gateway、Worker 的固定版本 OCI 镜像；记录镜像 digest 和源 commit。
