@@ -119,6 +119,10 @@ networks:
                     capture_output=True, text=True, timeout=300,
                 )
                 self.assertEqual(backup_result.returncode, 0, backup_result.stderr)
+                nats_backups = list((bundle / "nats").glob("*"))
+                for path in nats_backups:
+                    self.assertEqual(path.stat().st_uid, os.geteuid(), f"backup owner mismatch: {path}")
+                    self.assertEqual(path.stat().st_mode & 0o077, 0, f"backup permissions too broad: {path}")
                 original_manifest = (bundle / "manifest.json").read_bytes()
                 (bundle / "manifest.json").write_bytes(original_manifest + b"tamper")
                 tampered_manifest = subprocess.run(

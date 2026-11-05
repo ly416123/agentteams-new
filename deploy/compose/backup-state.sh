@@ -54,6 +54,10 @@ for stream in TASK_EVENTS AGENT_EVENTS CONTROL_EVENTS DEADLETTER_EVENTS; do
     natsio/nats-box:0.14.0 \
     nats --server nats://nats:4222 stream backup --no-progress "$stream" "/backup/$stream"
 done
+# The NATS container writes root-owned mode-0600 files. Return ownership to
+# the invoking user before host-side checksumming and the final permission lock.
+docker run --rm -v "$bundle/nats:/backup" alpine:3.21 \
+  chown -R "$(id -u):$(id -g)" /backup
 
 storage_enabled=$(awk -F= '$1 == "AGENTTEAMS_STORAGE_ENABLED" { gsub(/[[:space:]]/, "", $2); print $2 }' "$env_file")
 storage_archive=false
