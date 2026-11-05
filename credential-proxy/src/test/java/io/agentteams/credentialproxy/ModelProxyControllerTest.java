@@ -17,6 +17,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.Semaphore;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -32,10 +33,12 @@ class ModelProxyControllerTest {
     private HttpServer upstream;
     private MockMvc mvc;
     private ScheduledExecutorService streamMonitor;
+    private Semaphore activeStreamPermits;
 
     @BeforeEach
     void setUp() throws Exception {
         streamMonitor = Executors.newSingleThreadScheduledExecutor();
+        activeStreamPermits = new Semaphore(64);
         upstream = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         upstream.createContext("/v1/responses", exchange -> {
             exchange.getRequestBody().readAllBytes();
@@ -61,7 +64,7 @@ class ModelProxyControllerTest {
                 context -> "provider-secret".toCharArray(),
                 URI.create("http://127.0.0.1:" + upstream.getAddress().getPort() + "/v1/responses"),
                 Set.of("gpt-5.6-luna"), HttpClient.newHttpClient(),
-                Clock.fixed(NOW, ZoneOffset.UTC), streamMonitor);
+                Clock.fixed(NOW, ZoneOffset.UTC), streamMonitor, activeStreamPermits);
         mvc = MockMvcBuilders.standaloneSetup(new ModelProxyController(service)).build();
     }
 

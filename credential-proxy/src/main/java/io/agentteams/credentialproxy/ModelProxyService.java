@@ -15,6 +15,7 @@ import java.time.Duration;
 import java.util.Arrays;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.ScheduledExecutorService;
 
 /** Enforces Worker, active Attempt, model, and provider credential scope before forwarding. */
@@ -31,6 +32,7 @@ public final class ModelProxyService {
     private final HttpClient http;
     private final Clock clock;
     private final ScheduledExecutorService streamMonitor;
+    private final Semaphore activeStreamPermits;
     private final ObjectMapper json = new ObjectMapper();
 
     public ModelProxyService(ModelProxyAuthenticator authenticator,
@@ -40,7 +42,8 @@ public final class ModelProxyService {
             Set<String> allowedModels,
             HttpClient http,
             Clock clock,
-            ScheduledExecutorService streamMonitor) {
+            ScheduledExecutorService streamMonitor,
+            Semaphore activeStreamPermits) {
         this.authenticator = Objects.requireNonNull(authenticator, "authenticator");
         this.contexts = Objects.requireNonNull(contexts, "contexts");
         this.credentials = Objects.requireNonNull(credentials, "credentials");
@@ -52,6 +55,7 @@ public final class ModelProxyService {
         this.http = Objects.requireNonNull(http, "http");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.streamMonitor = Objects.requireNonNull(streamMonitor, "streamMonitor");
+        this.activeStreamPermits = Objects.requireNonNull(activeStreamPermits, "activeStreamPermits");
     }
 
     public ModelProxyResponse forward(String workerToken, byte[] requestBody) {
@@ -110,8 +114,8 @@ public final class ModelProxyService {
                 throw new ModelProxyException(502);
             }
             try {
-                InputStream guarded = new LeaseGuardedInputStream(response.body(), contexts, worker, context,
-                        clock, streamMonitor, LEASE_POLL_INTERVAL_MILLIS);
+                InputStream guarded = new LeaseGuardedInputStream(response.body(), authenticator, contexts,
+                        worker, context, clock, streamMonitor, activeStreamPermits, LEASE_POLL_INTERVAL_MILLIS);
                 return new ModelProxyResponse(response.statusCode(), contentType, guarded);
             } catch (RuntimeException monitorUnavailable) {
                 response.body().close();

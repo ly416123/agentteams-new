@@ -39,6 +39,7 @@ class JdbcActiveAttemptRepositoryPostgresTest {
     void createSchemaAndInstallNarrowFunction() throws Exception {
         jdbc = new JdbcTemplate(new DriverManagerDataSource(
                 POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword()));
+        jdbc.execute("DROP FUNCTION IF EXISTS credential_proxy_revalidate(UUID) CASCADE");
         jdbc.execute("DROP FUNCTION IF EXISTS credential_proxy_authenticate(TEXT) CASCADE");
         jdbc.execute("DROP FUNCTION IF EXISTS credential_proxy_active_attempts(UUID, TEXT, TEXT, TEXT) CASCADE");
         jdbc.execute("DROP ROLE IF EXISTS credential_proxy_test");
@@ -120,6 +121,9 @@ class JdbcActiveAttemptRepositoryPostgresTest {
         assertThat(new JdbcModelProxyCredentialAuthenticator(restricted).authenticate(PROXY_TOKEN))
                 .contains(new AuthenticatedWorker(PROXY_CREDENTIAL_ID, AGENT, "tenant-a", "project-a", "team-a",
                         "vault://tenant-a/project-a/chatgpt"));
+        assertThat(new JdbcModelProxyCredentialAuthenticator(restricted).revalidate(
+                new AuthenticatedWorker(PROXY_CREDENTIAL_ID, AGENT, "tenant-a", "project-a", "team-a",
+                        "vault://tenant-a/project-a/chatgpt"))).isPresent();
         assertThatThrownBy(() -> restricted.queryForObject("SELECT count(*) FROM task_assignments", Long.class))
                 .isInstanceOf(org.springframework.dao.DataAccessException.class);
         assertThatThrownBy(() -> restricted.queryForObject("SELECT token_sha256 FROM worker_model_proxy_credentials",
@@ -131,23 +135,37 @@ class JdbcActiveAttemptRepositoryPostgresTest {
         insertProxyCredential();
         var authenticator = new JdbcModelProxyCredentialAuthenticator(jdbc);
 
-        assertThat(authenticator.authenticate(PROXY_TOKEN)).contains(new AuthenticatedWorker(
-                PROXY_CREDENTIAL_ID, AGENT, "tenant-a", "project-a", "team-a", "vault://tenant-a/project-a/chatgpt"));
+        AuthenticatedWorker authenticated = new AuthenticatedWorker(
+                PROXY_CREDENTIAL_ID, AGENT, "tenant-a", "project-a", "team-a", "vault://tenant-a/project-a/chatgpt");
+        assertThat(authenticator.authenticate(PROXY_TOKEN)).contains(authenticated);
+        assertThat(authenticator.revalidate(authenticated)).contains(authenticated);
         assertThat(authenticator.authenticate("invalid-token")).isEmpty();
+
+        jdbc.update("UPDATE worker_model_proxy_credentials SET model_credential_ref = 'vault://tenant-a/project-a/rotated' WHERE id = ?",
+                PROXY_CREDENTIAL_ID);
+        assertThat(authenticator.revalidate(authenticated)).get()
+                .extracting(AuthenticatedWorker::modelCredentialRef)
+                .isEqualTo("vault://tenant-a/project-a/rotated");
+        jdbc.update("UPDATE worker_model_proxy_credentials SET model_credential_ref = ? WHERE id = ?",
+                authenticated.modelCredentialRef(), PROXY_CREDENTIAL_ID);
 
         jdbc.update("UPDATE worker_model_proxy_credentials SET revoked_at = statement_timestamp() WHERE id = ?",
                 PROXY_CREDENTIAL_ID);
         assertThat(authenticator.authenticate(PROXY_TOKEN)).isEmpty();
+        assertThat(authenticator.revalidate(authenticated)).isEmpty();
         jdbc.update("UPDATE worker_model_proxy_credentials SET revoked_at = NULL, expires_at = now() - interval '1 second' WHERE id = ?",
                 PROXY_CREDENTIAL_ID);
         assertThat(authenticator.authenticate(PROXY_TOKEN)).isEmpty();
+        assertThat(authenticator.revalidate(authenticated)).isEmpty();
         jdbc.update("UPDATE worker_model_proxy_credentials SET expires_at = now() + interval '10 minutes' WHERE id = ?",
                 PROXY_CREDENTIAL_ID);
         jdbc.update("UPDATE worker_enrollment_agent_scopes SET tenant_id = 'tenant-b' WHERE agent_id = ?", AGENT);
         assertThat(authenticator.authenticate(PROXY_TOKEN)).isEmpty();
+        assertThat(authenticator.revalidate(authenticated)).isEmpty();
         jdbc.update("UPDATE worker_enrollment_agent_scopes SET tenant_id = 'tenant-a' WHERE agent_id = ?", AGENT);
         jdbc.update("UPDATE agent_sessions SET revoked_at = statement_timestamp() WHERE id = ?", SESSION_ID);
         assertThat(authenticator.authenticate(PROXY_TOKEN)).isEmpty();
+        assertThat(authenticator.revalidate(authenticated)).isEmpty();
     }
 
     private void insertScope(String type, UUID id, String tenant, String project, String team) {

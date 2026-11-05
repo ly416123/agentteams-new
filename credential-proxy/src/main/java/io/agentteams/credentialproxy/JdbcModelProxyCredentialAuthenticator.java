@@ -15,6 +15,10 @@ public final class JdbcModelProxyCredentialAuthenticator implements ModelProxyAu
             SELECT proxy_credential_id, agent_id, tenant_id, project_id, team_id, model_credential_ref
               FROM public.credential_proxy_authenticate(?)
             """;
+    private static final String REVALIDATE_SQL = """
+            SELECT proxy_credential_id, agent_id, tenant_id, project_id, team_id, model_credential_ref
+              FROM public.credential_proxy_revalidate(?)
+            """;
 
     private final JdbcTemplate jdbc;
 
@@ -25,15 +29,24 @@ public final class JdbcModelProxyCredentialAuthenticator implements ModelProxyAu
     @Override
     public Optional<AuthenticatedWorker> authenticate(String token) {
         if (!validToken(token)) return Optional.empty();
-        String tokenHash = sha256(token);
-        List<AuthenticatedWorker> identities = jdbc.query(AUTHENTICATE_SQL,
+        return readIdentity(AUTHENTICATE_SQL, sha256(token));
+    }
+
+    @Override
+    public Optional<AuthenticatedWorker> revalidate(AuthenticatedWorker worker) {
+        Objects.requireNonNull(worker, "worker");
+        return readIdentity(REVALIDATE_SQL, worker.proxyCredentialId());
+    }
+
+    private Optional<AuthenticatedWorker> readIdentity(String sql, Object parameter) {
+        List<AuthenticatedWorker> identities = jdbc.query(sql,
                 (rs, row) -> new AuthenticatedWorker(
                         rs.getObject("proxy_credential_id", java.util.UUID.class),
                         rs.getObject("agent_id", java.util.UUID.class),
                         rs.getString("tenant_id"),
                         rs.getString("project_id"),
                         rs.getString("team_id"),
-                        rs.getString("model_credential_ref")), tokenHash);
+                        rs.getString("model_credential_ref")), parameter);
         if (identities.size() != 1) return Optional.empty();
         return Optional.of(identities.getFirst());
     }

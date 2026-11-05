@@ -23,6 +23,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.Semaphore;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -42,10 +43,12 @@ class ModelProxyServiceTest {
     private final AtomicReference<Integer> upstreamStatus = new AtomicReference<>(200);
     private HttpServer upstream;
     private ScheduledExecutorService streamMonitor;
+    private Semaphore activeStreamPermits;
 
     @BeforeEach
     void startUpstream() throws Exception {
         streamMonitor = Executors.newSingleThreadScheduledExecutor();
+        activeStreamPermits = new Semaphore(64);
         upstream = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         upstream.createContext("/v1/responses", exchange -> {
             upstreamCalls.incrementAndGet();
@@ -212,7 +215,7 @@ class ModelProxyServiceTest {
         return new ModelProxyService(authenticator, new AttemptExecutionContextResolver(attempts,
                 Clock.fixed(NOW, ZoneOffset.UTC)), credentials, endpoint,
                 Set.of("gpt-5.6-luna"), HttpClient.newHttpClient(),
-                Clock.fixed(NOW, ZoneOffset.UTC), streamMonitor);
+                Clock.fixed(NOW, ZoneOffset.UTC), streamMonitor, activeStreamPermits);
     }
 
     private static ActiveAttemptRepository activeAttempts() {

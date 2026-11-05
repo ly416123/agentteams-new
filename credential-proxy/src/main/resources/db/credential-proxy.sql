@@ -166,3 +166,45 @@ REVOKE CREATE ON SCHEMA public FROM credential_proxy_query_owner;
 REVOKE ALL ON FUNCTION public.credential_proxy_authenticate(TEXT) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.credential_proxy_authenticate(TEXT)
     TO credential_proxy_query;
+
+CREATE OR REPLACE FUNCTION public.credential_proxy_revalidate(p_proxy_credential_id UUID)
+RETURNS TABLE (
+    proxy_credential_id UUID,
+    agent_id UUID,
+    tenant_id TEXT,
+    project_id TEXT,
+    team_id TEXT,
+    model_credential_ref TEXT
+)
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+    SELECT credential.id,
+           credential.agent_id,
+           credential.tenant_id,
+           credential.project_id,
+           credential.team_id,
+           credential.model_credential_ref
+      FROM public.worker_model_proxy_credentials AS credential
+      JOIN public.agent_sessions AS session
+        ON session.id = credential.session_id
+       AND session.agent_id = credential.agent_id
+      JOIN public.worker_enrollment_agent_scopes AS current_scope
+        ON current_scope.agent_id = credential.agent_id
+       AND current_scope.tenant_id = credential.tenant_id
+       AND current_scope.project_id = credential.project_id
+       AND current_scope.team_id = credential.team_id
+     WHERE credential.id = p_proxy_credential_id
+       AND credential.revoked_at IS NULL
+       AND credential.expires_at > statement_timestamp()
+       AND session.revoked_at IS NULL
+       AND session.expires_at > statement_timestamp()
+$$;
+
+ALTER FUNCTION public.credential_proxy_revalidate(UUID)
+    OWNER TO credential_proxy_query_owner;
+REVOKE ALL ON FUNCTION public.credential_proxy_revalidate(UUID) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.credential_proxy_revalidate(UUID)
+    TO credential_proxy_query;

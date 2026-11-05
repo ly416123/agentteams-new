@@ -5,8 +5,9 @@ import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.Arrays;
-import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.Set;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.stream.Collectors;
 import org.springframework.beans.factory.annotation.Value;
@@ -68,6 +69,13 @@ public class CredentialProxyApplication {
     }
 
     @Bean
+    Semaphore modelProxyActiveStreamPermits(
+            @Value("${agentteams.credential-proxy.max-active-streams:64}") int maxActiveStreams) {
+        if (maxActiveStreams < 1) throw new IllegalArgumentException("max active streams must be positive");
+        return new Semaphore(maxActiveStreams, true);
+    }
+
+    @Bean
     ModelProxyService modelProxyService(
             ModelProxyAuthenticator authenticator,
             AttemptExecutionContextResolver contexts,
@@ -75,11 +83,13 @@ public class CredentialProxyApplication {
             HttpClient modelProxyHttpClient,
             Clock credentialProxyClock,
             ScheduledExecutorService modelProxyStreamMonitor,
+            Semaphore modelProxyActiveStreamPermits,
             @Value("${agentteams.credential-proxy.upstream-responses-url:https://api.openai.com/v1/responses}") String endpoint,
             @Value("${agentteams.credential-proxy.allowed-models:gpt-5.6-luna}") String allowedModels) {
         Set<String> models = Arrays.stream(allowedModels.split(","))
                 .map(String::trim).filter(value -> !value.isEmpty()).collect(Collectors.toUnmodifiableSet());
         return new ModelProxyService(authenticator, contexts, credentials, java.net.URI.create(endpoint),
-                models, modelProxyHttpClient, credentialProxyClock, modelProxyStreamMonitor);
+                models, modelProxyHttpClient, credentialProxyClock, modelProxyStreamMonitor,
+                modelProxyActiveStreamPermits);
     }
 }
