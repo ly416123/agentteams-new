@@ -43,6 +43,10 @@ class ComposeStateRecoveryTest(unittest.TestCase):
     command: [--jetstream, --store_dir=/data/jetstream, --http_port=8222]
     volumes: [nats-data:/data/jetstream]
     networks: [data]
+  control-plane:
+    image: alpine:3.21
+    command: [sh, -c, "sleep 3600"]
+    networks: [data]
   seaweedfs:
     image: alpine:3.21
     profiles: [storage]
@@ -113,6 +117,16 @@ networks:
                     text=True,
                     timeout=30,
                 )
+
+                compose(source, "up", "-d", "control-plane")
+                backup_result = subprocess.run(
+                    [str(BACKUP), str(env_file), str(bundle), source], env=environment,
+                    capture_output=True, text=True, timeout=60,
+                )
+                self.assertNotEqual(backup_result.returncode, 0)
+                self.assertIn("Application services must be stopped", backup_result.stderr)
+                self.assertFalse(bundle.exists(), "refused backup must not leave a partial bundle")
+                compose(source, "stop", "control-plane")
 
                 backup_result = subprocess.run(
                     [str(BACKUP), str(env_file), str(bundle), source], env=environment,

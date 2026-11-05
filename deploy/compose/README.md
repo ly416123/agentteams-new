@@ -115,7 +115,7 @@ Gateway Token 和模型代理 Token 互不通用；数据库只存两者的 SHA-
 ## 状态与运维
 
 - PostgreSQL 与 NATS JetStream 数据存放于命名卷 `postgres-data`、`nats-data`。
-- 备份前先暂停新任务提交，并确认没有运行中 Attempt；随后停止全部任务生产者/消费者，保持整个备份窗口没有 Task 或 Artifact 写入。当前 POC 没有专用 Worker drain 命令，需由操作者确认 Attempt 已排空。`backup-state.sh` 生成 PostgreSQL custom dump、4 个 JetStream 持久 Stream 快照；启用对象存储时，还会停止 SeaweedFS 并归档 `seaweedfs-data` 卷。备份目录及文件权限收紧为 `0700/0600`，包含敏感租户数据；转移到异机后仍需加密和限制访问。
+- 备份前先暂停新任务提交，并确认没有运行中 Attempt；随后停止全部任务生产者/消费者，保持整个备份窗口没有 Task 或 Artifact 写入。当前 POC 没有专用 Worker drain 命令，需由操作者确认 Attempt 已排空。`backup-state.sh` 会检查所选 Compose project，只允许 PostgreSQL、NATS 和可选 SeaweedFS 运行；发现其他运行服务时，会在创建备份目录前拒绝执行。该检查只覆盖当前 Compose project，仍需确认外部 Task/Artifact 写入方已暂停。脚本生成 PostgreSQL custom dump、4 个 JetStream 持久 Stream 快照；启用对象存储时，还会停止 SeaweedFS 并归档 `seaweedfs-data` 卷。备份目录及文件权限收紧为 `0700/0600`，包含敏感租户数据；转移到异机后仍需加密和限制访问。
 
 ```sh
 docker compose --env-file .env --profile secure-api --profile worker-pool stop \

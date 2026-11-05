@@ -13,12 +13,25 @@ project=${3:-${COMPOSE_PROJECT_NAME:-agentteams}}
 compose_file=${COMPOSE_FILE:-$script_dir/compose.yaml}
 case "$project" in ''|[!a-z0-9]*|*[!a-z0-9_-]*) echo "Invalid Compose project name" >&2; exit 2 ;; esac
 if [ -e "$bundle" ]; then echo "Backup destination already exists: $bundle" >&2; exit 2; fi
+compose() { docker compose -p "$project" --env-file "$env_file" -f "$compose_file" "$@"; }
+postgres_id=$(compose ps -q postgres)
+nats_id=$(compose ps -q nats)
+if [ -z "$postgres_id" ] || [ -z "$nats_id" ]; then
+  echo "PostgreSQL and NATS must already be running in the selected Compose project" >&2
+  exit 2
+fi
+running_services=$(compose ps --status running --services)
+application_services=$(printf '%s\n' "$running_services" \
+  | awk '$0 != "postgres" && $0 != "nats" && $0 != "seaweedfs" && NF')
+if [ -n "$application_services" ]; then
+  echo "Application services must be stopped before backup: $application_services" >&2
+  exit 2
+fi
 mkdir -p "$(dirname -- "$bundle")"
 umask 077
 mkdir "$bundle"
 mkdir "$bundle/nats"
 chmod 0777 "$bundle/nats"
-compose() { docker compose -p "$project" --env-file "$env_file" -f "$compose_file" "$@"; }
 restart_storage=false
 cleanup() {
   if [ "$restart_storage" = true ]; then compose --profile storage start seaweedfs >/dev/null 2>&1 || true; fi
@@ -30,12 +43,6 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-postgres_id=$(compose ps -q postgres)
-nats_id=$(compose ps -q nats)
-if [ -z "$postgres_id" ] || [ -z "$nats_id" ]; then
-  echo "PostgreSQL and NATS must already be running in the selected Compose project" >&2
-  exit 2
-fi
 compose exec -T postgres pg_isready -U agentteams -d agentteams >/dev/null
 compose exec -T nats wget -qO- http://127.0.0.1:8222/healthz | grep -q ok
 
