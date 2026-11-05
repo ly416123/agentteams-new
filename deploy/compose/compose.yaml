@@ -189,6 +189,7 @@ services:
     build:
       context: ../..
       dockerfile: credential-proxy/Dockerfile
+      secrets: [maven_settings]
     profiles: [secure-api, worker-pool]
     user: "${CREDENTIAL_PROXY_UID:-10001}:${CREDENTIAL_PROXY_GID:-10001}"
     environment:
@@ -481,6 +482,8 @@ services:
     restart: unless-stopped
 
 secrets:
+  maven_settings:
+    file: ${MAVEN_SETTINGS_FILE:-/dev/null}
   model_proxy_token_worker_1:
     file: ${WORKER_1_MODEL_PROXY_TOKEN_FILE:?set WORKER_1_MODEL_PROXY_TOKEN_FILE to the enrolled proxy token file}
   model_proxy_token_worker_2:

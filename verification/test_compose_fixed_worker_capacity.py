@@ -154,6 +154,12 @@ class ComposeFixedWorkerCapacityTest(unittest.TestCase):
         self.assertRegex(compose, r"worker-egress:\n\s+internal: true")
         self.assertRegex(compose, r"provider-egress:\n\s+driver: bridge")
 
+    def test_credential_proxy_build_mounts_maven_settings_as_a_build_secret(self) -> None:
+        compose = (ROOT / "deploy/compose/compose.yaml").read_text()
+        credential_proxy = compose.split("\n  credential-proxy:\n", 1)[1].split("\n  worker-enrollment:\n", 1)[0]
+        self.assertIn("      secrets: [maven_settings]", credential_proxy)
+        self.assertRegex(compose, r"maven_settings:\n\s+file: \$\{MAVEN_SETTINGS_FILE:-/dev/null\}")
+
 
 if __name__ == "__main__":
     unittest.main()

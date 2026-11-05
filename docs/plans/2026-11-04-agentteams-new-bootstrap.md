@@ -158,3 +158,5 @@ Agent scope 生命周期闭环（2026-11-05）：新增 PostgreSQL 集成测试�
 - 新旧路径任一时刻只有一个调度写入者；禁止业务状态双写。
 - Matrix 只是可选协作渠道；PostgreSQL、Outbox、NATS 持久语义不由内存队列替代。
 - 不在目标路径完成前宣称生产就绪、零信任凭证隔离或普通容器强隔离。
+
+**固定 Worker 安全依赖与 Credential Proxy 本机 POC（2026-11-05）：** 修正 Credential Proxy 源码构建缺少 Maven `settings.xml` BuildKit secret 的 Compose 配置，并补充测试和 README；settings 只通过 BuildKit secret 挂载，不写入镜像层或运行环境。专用 `agentteams-poc` Colima profile 通过只读 virtiofs 挂载当前 `agentteams-new` 工作树，修复 enrollment/credential SQL 文件 bind mount 被解析为目录的问题；仅重建并重跑隔离 project 的一次性 DB 初始化容器，SQL 以 `ON_ERROR_STOP` 成功完成。Credential Proxy 从源码构建并健康运行，readiness 为 `UP`；`/v1/responses` 匿名请求返回 `401`。PostgreSQL 当前运行角色 `agentteams_runtime` 为 LOGIN、非 superuser、无 `BYPASSRLS`。Provider credential 文件目录为空，因此没有真实上游模型请求；未启动 Worker 或模拟 OIDC。定向 Compose 测试 7/7 通过。全量本机 unittest 曾进入恢复集成测试并试图通过默认 Docker context 启动 SeaweedFS，因默认 daemon 拉取挂起而人工中止；这不是验证通过，且该测试清理了自身随机临时项目。后续全量本机恢复测试应明确隔离 Docker context/代理后再执行；PR CI `42046970895` 上一轮全量门禁通过，但本次新增 Compose BuildKit secret 回归仍需由推送后的 CI 重跑。真实 OIDC、Worker Attempt、双租户隔离和 Provider 调用继续受 L5 HTTPS IdP/新运行主机凭据待确认阻塞。

@@ -31,6 +31,8 @@ Enrollment 端口默认为 `127.0.0.1:8090`；若 `.env` 中覆盖 `ENROLLMENT_P
 
 使用私有 GHCR 镜像时，先在本机执行 `docker login ghcr.io`。不要把 PAT 写入 Compose 文件或 `.env`。
 
+首次由 Compose 从源码构建 Credential Proxy 时，Maven 需要读取 GitHub Packages 中的共享 Java 模块。将 `MAVEN_SETTINGS_FILE` 设为本机 Maven `settings.xml` 的绝对路径（文件需含 `github` server 的 `read:packages` 凭据）；Compose 只把该文件作为 BuildKit secret 临时挂载到构建步骤，不会传入运行容器或镜像层。已经构建好本地镜像时无需设置该路径。不要提交或复制 `settings.xml` 内容。
+
 ## 校验与启动
 
 不启动 Worker 的基础服务（依赖会自动运行 `database-role-setup`）：
