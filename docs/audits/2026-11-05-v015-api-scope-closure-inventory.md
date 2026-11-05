@@ -92,21 +92,21 @@ Controller 源码中能直接看到 `PrincipalContext`、`ProjectApiAuthorizatio
 - **测试缺口：** `UsageQueryServiceTest` 覆盖带 Principal 时 Tenant/Project SQL scope，也覆盖无 Principal 的未约束查询；当前未看到把匿名 HTTP 请求、OIDC filter 启用状态与 `/usage/summary`、`/export`、`/dimensions/completeness` 串起来的部署态拒绝测试。timeseries 是 QueryService 方法，本 Controller 未暴露对应路由。因此这里是有明确配置前提的源码授权链，不是生产环境 A/B Tenant HTTP 验收证据。
 - Usage Budget Repository 对单租户写读使用 tenant/project 复合条件；周期任务由单活 lease 领取所有 active policy 时，需要确认每个 event 保留 policy 的 Tenant/Project 且告警 delivery 无跨 scope 汇总。Webhook Repository 的订阅查询按 organization/tenant/project 过滤；delivery worker 是系统身份，发送前要以 delivery row 所属订阅/secretRef 做一致性校验和 SSRF 保护。
 
-## 已确认的 Skill 私有包跨 scope 路由缺口
+## v0.1.5 Skill 私有包跨 scope 路由缺口及派生补丁处理
 
-**证据级别：** v0.1.5 发布源码调用链确认；尚未在运行中的 Control Plane 上重放跨 Tenant 请求。
+**证据级别：** 原始 v0.1.5 发布源码调用链确认；加固派生补丁已有 Controller 负向单测，尚未在运行中的 Control Plane 上重放带 OIDC 身份的跨 Tenant HTTP 请求。
 
 - `SkillController.preparePackageUpload()`、`completePackageUpload()` 与 `downloadPackage()` 直接调用 `SkillPackageStorageService`，没有先调用 `SkillService.getSkill()` 或 `ResourceScopeRepository.requireVisible()`。
 - `SkillPackageStorageService.versionForSkill()` 只按 `versionId` 读取版本并比较路径中的 `skillId` 与 `version.skillId()`；它没有读取 `PrincipalContext`、Tenant/Project membership 或 `SKILL` scope。知道有效 Skill/Version ID 的已认证用户因此可以请求私有包的 presigned upload/download URL 或确认上传。
 - 同一 `SkillService` 的 `getSkill()`、版本列表、publish/review/disable 会执行 Skill scope 检查，因此这是包对象入口与其余 Skill API 授权不一致，不是证明所有 Skill API 均无授权。
 - `SkillControllerTest.preparesAndCompletesPackageUploadWithoutAcceptingCallerStorageKey()` 只验证忽略客户端 storage key 并返回 URL；该测试使用 standalone Controller，没有身份、Tenant A/B 或 scope 拒绝断言。
 
-**影响与处理要求：** 在 v0.1.5 复用路径中，Skill 私有包 upload/complete/download 必须列入跨 Tenant 负向 API 门禁。`agentteams-new` 尚无自己的 Skill Controller，不能把该缺口标记为已修复；应用组件迁移到新仓库时，授权必须在签发任何对象存储 URL 前完成，并验证 A/B Tenant 对已知 Skill/Version ID 的请求均 fail-closed。当前不得把复用 v0.1.5 的整套 API 描述为已满足多租户隔离。
+**修复状态：** 原始 v0.1.5 发布源码仍存在上述路径缺口。`agentteams-new` 维护的固定 v0.1.5 派生补丁已在 `preparePackageUpload()`、`completePackageUpload()`、`downloadPackage()` 调用存储服务前执行 `service.getSkill(skillId)`，由 `SkillService` 的 `SKILL` scope guard 在任何存储 URL 签发前拒绝越权。新增 `SkillControllerTest.rejectsCrossScopePackageUploadCompletionAndDownloadBeforeIssuingStorageUrls` 覆盖三条路由均返回 403，且 `SkillPackageStorageService` 零交互；类内 6/6、0 skipped，已加入固定派生镜像构建门禁。该证据关闭了派生补丁路径的已知 Controller 绕过，但仍是服务层 Controller 测试，不是已认证真实 HTTP 的 Tenant A/B 集成验收；Skill 包 A/B 端到端验收仍列为多租户门槛，不能据此宣称复用 v0.1.5 的整套 API 已满足隔离。
 
 ## 证据级别与后续门槛
 
 - **源码发现：** v0.1.5 有 Project membership、`resource_scopes` 和应用层授权路径；`tasks` 等核心实体并非都直接存 Tenant/Project/Team 列。已有 Enrollment RLS 仅保护 `agents` 与 `agent_sessions` 的受限路径。
 - **尚未证明：** 上表所有 Controller 与服务调用链均无越权；MCP、Team、Skill、Audit/Usage 和管理 API 的所有读写、汇总及下载路径均执行正确 Tenant/Project/Team 检查；NATS TASK_EVENT/CONFIG_APPLIED 与所有恢复/一致性/质量消费者对篡改关联 ID 一律拒绝；所有逐行 Outbox 的 payload tenant 与父资源一致；固定 Compose 中 A/B Tenant 并发与同 Worker 连续 Attempt 的 Conversation/Workspace/Tool/Artifact 无残留；v0.1.5 业务 schema 没有 RLS，未来 RLS 方案尚未实现或验证。
-- **下一步 2A：** Conversation/Memory、Artifact/File、NATS 主执行事件、Scheduled Task、Team/MCP、组织管理和部分单活/Outbox 作业已追踪，但尚未形成逐方法仓储/迁移/测试闭环。继续完成 Task Event/Config event、恢复/质量/其他后台消费者、Skill/Audit/Usage 和内部端点的父级校验，再按身份矩阵核验角色；为每族记录有效身份、scope 来源、拒绝响应、现有测试和缺失测试。
+- **下一步 2A：** Conversation/Memory、Artifact/File、NATS 主执行事件、Scheduled Task、Team/MCP、组织管理和部分单活/Outbox 作业已追踪，但尚未形成逐方法仓储/迁移/测试闭环。TASK_EVENT、Skill 包私有路由的已发现缺口和 ConfigApplied Agent/binding 关系已有固定补丁门禁；仍需完成 ConfigApplied 消息链、恢复/质量/其他后台消费者、Skill/Audit/Usage 和内部端点的父级校验，再按身份矩阵核验角色；为每族记录有效身份、scope 来源、拒绝响应、现有测试和缺失测试。
 - **2A 出口条件：** 所有可访问 API 与异步消费者都映射到真实表和 scope 来源；每项未授权路径有可复现负向用例或明确的修复任务；任何尚未被证明的共享 Control Plane 能力继续标记为未验收。
 - **环境边界：** L5 的 v0.1.5 IdP issuer/JWKS 是 HTTP，当前只读 RBAC 不能确认 HTTPS Ingress；不能用 L5 旧 Worker Secret 替代新项目 Provider 凭据。上述源码盘点不宣称运行时多租户验收。
