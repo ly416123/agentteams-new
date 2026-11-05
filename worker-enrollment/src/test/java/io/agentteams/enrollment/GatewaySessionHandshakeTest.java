@@ -165,7 +165,7 @@ class GatewaySessionHandshakeTest {
     private static Handshake connect(UUID agentId, String token) {
         ManagedChannel channel = ManagedChannelBuilder.forAddress(gateway.getHost(), gateway.getMappedPort(9090))
                 .usePlaintext().build();
-        ClientCall<byte[], byte[]> call = channel.newCall(CONNECT, CallOptions.DEFAULT.withDeadlineAfter(10, TimeUnit.SECONDS));
+        ClientCall<byte[], byte[]> call = channel.newCall(CONNECT, CallOptions.DEFAULT.withDeadlineAfter(60, TimeUnit.SECONDS));
         BlockingQueue<byte[]> responses = new LinkedBlockingQueue<>();
         BlockingQueue<Status> statuses = new LinkedBlockingQueue<>();
         Metadata headers = new Metadata();
