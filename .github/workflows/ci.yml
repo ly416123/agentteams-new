@@ -87,6 +87,21 @@ jobs:
           print("All 5 PostgreSQL credential proxy boundary tests executed successfully.")
           PY
 
+      - name: Require credential source security tests to execute
+        run: |
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+
+          report = ET.parse(
+              "credential-proxy/target/surefire-reports/TEST-io.agentteams.credentialproxy.FileCredentialSourceTest.xml"
+          ).getroot()
+          assert report.attrib["tests"] == "5", report.attrib
+          assert report.attrib["skipped"] == "0", report.attrib
+          assert report.attrib["failures"] == "0", report.attrib
+          assert report.attrib["errors"] == "0", report.attrib
+          print("All 5 file credential source security tests executed successfully.")
+          PY
+
       - name: Validate Compose and shell scripts
         run: |
           docker compose --env-file deploy/compose/.env.example -f deploy/compose/compose.yaml config --quiet
