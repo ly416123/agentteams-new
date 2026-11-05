@@ -61,6 +61,9 @@ class LeaseGuardedInputStreamTest {
                 .hasCauseInstanceOf(IOException.class);
         assertThat(checks.get()).isGreaterThanOrEqualTo(2);
         assertThat(guarded.isInvalidated()).isTrue();
+        assertThat(permits.availablePermits()).isEqualTo(1);
+        guarded.close();
+        assertThat(permits.availablePermits()).isEqualTo(1);
     }
 
     @Test
@@ -95,6 +98,7 @@ class LeaseGuardedInputStreamTest {
         assertThatThrownBy(pendingRead::get).hasCauseInstanceOf(IOException.class);
         assertThat(checks).hasValue(1);
         assertThat(guarded.isInvalidated()).isTrue();
+        assertThat(permits.availablePermits()).isEqualTo(1);
     }
 
     @Test
@@ -108,8 +112,9 @@ class LeaseGuardedInputStreamTest {
         }, Clock.fixed(NOW, ZoneOffset.UTC));
         AttemptExecutionContext original = contexts.resolve(worker);
         BlockingInputStream upstream = new BlockingInputStream();
+        Semaphore permits = acquiredPermit();
         LeaseGuardedInputStream guarded = new LeaseGuardedInputStream(upstream, activeAuthenticator(), contexts,
-                worker, original, Clock.fixed(NOW, ZoneOffset.UTC), scheduler, acquiredPermit(), 10);
+                worker, original, Clock.fixed(NOW, ZoneOffset.UTC), scheduler, permits, 10);
 
         var pendingRead = reader.submit(() -> guarded.read());
 
@@ -117,6 +122,7 @@ class LeaseGuardedInputStreamTest {
         assertThatThrownBy(pendingRead::get).hasCauseInstanceOf(IOException.class);
         assertThat(checks).hasValue(2);
         assertThat(guarded.isInvalidated()).isTrue();
+        assertThat(permits.availablePermits()).isEqualTo(1);
     }
 
     @Test
