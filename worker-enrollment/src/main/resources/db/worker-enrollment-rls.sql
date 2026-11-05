@@ -158,9 +158,9 @@ GRANT UPDATE (revoked_at) ON TABLE worker_model_proxy_credentials TO worker_enro
 
 -- The SECURITY DEFINER scope trigger gets only the columns needed to revoke
 -- credentials. Its policies intentionally cannot expose or mutate other rows.
-GRANT SELECT (agent_id), UPDATE (revoked_at) ON TABLE agent_sessions
+GRANT SELECT (agent_id, revoked_at), UPDATE (revoked_at) ON TABLE agent_sessions
     TO worker_enrollment_scope_owner;
-GRANT SELECT (agent_id), UPDATE (revoked_at) ON TABLE worker_model_proxy_credentials
+GRANT SELECT (agent_id, revoked_at), UPDATE (revoked_at) ON TABLE worker_model_proxy_credentials
     TO worker_enrollment_scope_owner;
 
 DROP POLICY IF EXISTS worker_enrollment_scope_owner_read_sessions ON agent_sessions;
