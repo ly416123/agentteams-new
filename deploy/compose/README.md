@@ -2,7 +2,7 @@
 
 本目录提供不依赖 Kubernetes API、CRD、Operator 或 Docker Socket 的单机/单节点部署入口。Compose 管理 PostgreSQL、NATS JetStream、Control Plane、Gateway 和最多 8 个预先定义的 Worker 槽位。Worker 数量通过启动脚本显式选择，不会随任务动态创建或扩缩。
 
-> 当前是 POC 部署档，不代表生产就绪。Worker Enrollment 已实现 OIDC scope 授权和哈希凭据；Credential Proxy 已加入固定 Worker 启动链，真实 IdP 下的端到端任务、多租户负向隔离、真实 Provider 联调和 Worker drain 恢复仍待验收。
+> 当前是 POC 部署档，不代表生产就绪。固定复用的 v0.1.5 Control Plane/Gateway 存在 `TASK_EVENT` 按消息 Task ID 写入、未核对 Attempt/Lease/Agent 归属的跨租户事件注入缺口（[审计](../../docs/audits/2026-11-06-v015-task-event-scope-gap.md)）。该边界修复并通过负向集成测试前，不得将此复用路径用于多租户任务。Worker Enrollment 已实现 OIDC scope 授权和哈希凭据；Credential Proxy 已加入固定 Worker 启动链，真实 IdP 下的端到端任务、多租户隔离、真实 Provider 联调和 Worker drain 恢复仍待验收。
 
 ## 前置条件
 
