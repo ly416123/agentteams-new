@@ -20,6 +20,12 @@ if [ "$replicas" -lt 0 ] || [ "$replicas" -gt 8 ]; then
   exit 2
 fi
 
+deployment_mode=$(value DEPLOYMENT_MODE)
+case "$deployment_mode" in
+  local-dev|self-hosted-small) ;;
+  *) echo "DEPLOYMENT_MODE must be local-dev or self-hosted-small" >&2; exit 2 ;;
+esac
+
 api_auth_enabled=$(value API_AUTH_ENABLED)
 api_auth_enabled=${api_auth_enabled:-false}
 case "$api_auth_enabled" in
@@ -28,6 +34,10 @@ case "$api_auth_enabled" in
 esac
 if [ "$replicas" -gt 0 ] && [ "$api_auth_enabled" != "true" ]; then
   echo "API_AUTH_ENABLED=true is required before starting Workers" >&2
+  exit 2
+fi
+if [ "$deployment_mode" != "local-dev" ] && [ "$api_auth_enabled" != "true" ]; then
+  echo "API_AUTH_ENABLED=true is required outside local-dev" >&2
   exit 2
 fi
 if [ "$replicas" -gt 0 ]; then
