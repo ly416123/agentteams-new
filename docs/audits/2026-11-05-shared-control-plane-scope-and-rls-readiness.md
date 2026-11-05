@@ -65,7 +65,7 @@
 
 固定 Worker 源码 `agent-worker/src/main/java/io/agentteams/worker/chatgpt/ChatGptPlanModel.java` 支持通过 `AGENTTEAMS_CHATGPT_RESPONSES_URL` 覆盖 Responses API 地址；`ChatGptPlanTokenSource.fromPath()` 每次模型请求都会重新读取 `AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE` 指向的文件。因此 `agentteams-new` 可以把该 endpoint 指向凭证代理，并让 Worker 文件只保存代理消费凭据，无需修改旧源码。
 
-**Credential Proxy 授权查询加固（agentteams-new，2026-11-05）：** `credential_proxy_active_attempts` 现只接受 Proxy Credential ID，不再接受调用方自报的 Agent ID 或 Tenant/Project/Team。函数从有效 Credential、未撤销 Session 和 Enrollment 当前 scope 派生身份，再验证 Worker 与 Task scope 一致；Repository 对返回行再次与已验证身份逐字段比对。旧四参数函数在初始化 SQL 重跑时显式删除，避免留下可绕过的新 API 的旧 overload。该改动只强化新项目 Credential Proxy 数据库边界，不改变 v0.1.5 Control Plane 的其它业务表 RLS 缺口，也不证明真实 Worker/HTTP 双租户链路已通过。
+**Credential Proxy 授权查询加固（agentteams-new，2026-11-05）：** `credential_proxy_active_attempts` 现只接受 Proxy Credential ID，不再接受调用方自报的 Agent ID 或 Tenant/Project/Team。函数从有效 Credential、未撤销 Session 和 Enrollment 当前 scope 派生身份，再验证 Worker 与 Task scope 一致；Repository 对返回行再次与已验证身份逐字段比对。旧四参数函数在升级脚本中保留签名但撤销 `PUBLIC`、`credential_proxy_query`、`credential_proxy_runtime`、`worker_enrollment` 与 `agentteams_runtime` 的执行权，避免数据库依赖对象导致 `DROP FUNCTION` 失败；新运行角色只能调用新的单参数函数。该改动只强化新项目 Credential Proxy 数据库边界，不改变 v0.1.5 Control Plane 的其它业务表 RLS 缺口，也不证明真实 Worker/HTTP 双租户链路已通过。
 
 但当前 `ChatGptPlanTokenSource.accessToken()` 接口不接收 `TaskId`、`AttemptId`、Lease 或 `ExecutionContext`，HTTP 模型请求也没有由 Worker 运行时注入这些可信字段。Compose 已改为每个 Worker 槽位单独挂载模型 token Secret，并拒绝活动槽位使用同一底层文件；这降低了槽位间凭证复用，但 Worker 进程仍可读取自己的上游凭证。直接加一个反向代理只能做到模型端点替换，不能自然获得 Attempt 级授权；凭证代理验收前要么先扩展 Worker 的 ExecutionContext 传递契约，要么明确选用较窄的 Agent/槽位 scope 并接受其风险边界，不能把它描述为 Attempt 隔离。
 

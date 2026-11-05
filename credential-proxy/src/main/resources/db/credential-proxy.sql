@@ -53,9 +53,29 @@ DROP POLICY IF EXISTS credential_proxy_owner_agent_scopes_read
 CREATE POLICY credential_proxy_owner_agent_scopes_read
     ON public.worker_enrollment_agent_scopes FOR SELECT TO credential_proxy_query_owner USING (true);
 
--- Remove the older caller-scoped overload. Runtime scope must be derived from
--- the active credential/session, never supplied as authorization parameters.
-DROP FUNCTION IF EXISTS public.credential_proxy_active_attempts(UUID, TEXT, TEXT, TEXT);
+-- Retire the older caller-scoped overload without dropping it: external
+-- database objects may depend on its signature during an in-place upgrade.
+-- Runtime principals must no longer be able to invoke it.
+DO $$
+DECLARE
+    runtime_role TEXT;
+BEGIN
+    IF to_regprocedure('public.credential_proxy_active_attempts(uuid,text,text,text)') IS NOT NULL THEN
+        EXECUTE 'REVOKE ALL ON FUNCTION public.credential_proxy_active_attempts(UUID, TEXT, TEXT, TEXT) '
+             || 'FROM PUBLIC';
+        FOREACH runtime_role IN ARRAY ARRAY[
+            'credential_proxy_query', 'credential_proxy_runtime',
+            'worker_enrollment', 'agentteams_runtime'
+        ] LOOP
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = runtime_role) THEN
+                EXECUTE format(
+                    'REVOKE ALL ON FUNCTION public.credential_proxy_active_attempts(UUID, TEXT, TEXT, TEXT) FROM %I',
+                    runtime_role);
+            END IF;
+        END LOOP;
+    END IF;
+END;
+$$;
 
 CREATE OR REPLACE FUNCTION public.credential_proxy_active_attempts(p_proxy_credential_id UUID)
 RETURNS TABLE (

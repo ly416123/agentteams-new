@@ -46,7 +46,16 @@ class JdbcActiveAttemptRepositoryPostgresTest {
         jdbc.execute("DROP ROLE IF EXISTS credential_proxy_test");
         jdbc.execute("DROP TABLE IF EXISTS worker_model_proxy_credentials, agent_sessions, worker_enrollment_agent_scopes CASCADE");
         jdbc.execute("DROP TABLE IF EXISTS task_assignments, task_attempts, agent_leases, resource_scopes CASCADE");
-        jdbc.execute("DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'credential_proxy_query') THEN EXECUTE 'DROP OWNED BY credential_proxy_query'; END IF; IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'credential_proxy_query_owner') THEN EXECUTE 'DROP OWNED BY credential_proxy_query_owner'; END IF; END $$");
+        jdbc.execute("DO $$ BEGIN "
+                + "IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'credential_proxy_runtime') THEN EXECUTE 'DROP OWNED BY credential_proxy_runtime'; END IF; "
+                + "IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'worker_enrollment') THEN EXECUTE 'DROP OWNED BY worker_enrollment'; END IF; "
+                + "IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'agentteams_runtime') THEN EXECUTE 'DROP OWNED BY agentteams_runtime'; END IF; "
+                + "IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'credential_proxy_query') THEN EXECUTE 'DROP OWNED BY credential_proxy_query'; END IF; "
+                + "IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'credential_proxy_query_owner') THEN EXECUTE 'DROP OWNED BY credential_proxy_query_owner'; END IF; "
+                + "IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'credential_proxy_query') AND EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'credential_proxy_runtime') THEN EXECUTE 'REVOKE credential_proxy_query FROM credential_proxy_runtime'; END IF; END $$");
+        jdbc.execute("DROP ROLE IF EXISTS credential_proxy_runtime");
+        jdbc.execute("DROP ROLE IF EXISTS worker_enrollment");
+        jdbc.execute("DROP ROLE IF EXISTS agentteams_runtime");
         jdbc.execute("DROP ROLE IF EXISTS credential_proxy_query");
         jdbc.execute("DROP ROLE IF EXISTS credential_proxy_query_owner");
         jdbc.execute("CREATE TABLE task_attempts (id UUID PRIMARY KEY, task_id UUID NOT NULL, lease_id UUID NOT NULL, phase TEXT NOT NULL, lease_expires_at TIMESTAMPTZ NOT NULL)");
@@ -59,6 +68,15 @@ class JdbcActiveAttemptRepositoryPostgresTest {
         jdbc.execute("ALTER TABLE agent_sessions ENABLE ROW LEVEL SECURITY");
         jdbc.execute("ALTER TABLE worker_enrollment_agent_scopes ENABLE ROW LEVEL SECURITY");
         jdbc.execute("ALTER TABLE worker_model_proxy_credentials ENABLE ROW LEVEL SECURITY");
+        jdbc.execute("CREATE ROLE credential_proxy_query NOLOGIN NOSUPERUSER NOBYPASSRLS");
+        jdbc.execute("CREATE ROLE credential_proxy_runtime NOLOGIN NOSUPERUSER NOBYPASSRLS");
+        jdbc.execute("CREATE ROLE worker_enrollment NOLOGIN NOSUPERUSER NOBYPASSRLS");
+        jdbc.execute("CREATE ROLE agentteams_runtime NOLOGIN NOSUPERUSER NOBYPASSRLS");
+        jdbc.execute("CREATE FUNCTION public.credential_proxy_active_attempts(UUID, TEXT, TEXT, TEXT) "
+                + "RETURNS INTEGER LANGUAGE SQL STABLE SECURITY DEFINER AS 'SELECT 1'");
+        jdbc.execute("GRANT EXECUTE ON FUNCTION public.credential_proxy_active_attempts(UUID, TEXT, TEXT, TEXT) "
+                + "TO PUBLIC, credential_proxy_query, credential_proxy_runtime, worker_enrollment, agentteams_runtime");
+        jdbc.execute("GRANT credential_proxy_query TO credential_proxy_runtime");
         String script = new String(new ClassPathResource("db/credential-proxy.sql")
                 .getInputStream().readAllBytes(), StandardCharsets.UTF_8);
         executePostgresScript(script);
@@ -137,6 +155,21 @@ class JdbcActiveAttemptRepositoryPostgresTest {
                  WHERE n.nspname = 'public' AND p.proname = 'credential_proxy_active_attempts'
                    AND pg_get_function_identity_arguments(p.oid) = 'p_proxy_credential_id uuid'
                 """, Long.class)).isEqualTo(1L);
+        assertThat(jdbc.queryForObject("SELECT to_regprocedure("
+                + "'public.credential_proxy_active_attempts(uuid,text,text,text)') IS NOT NULL", Boolean.class))
+                .isTrue();
+        assertThat(jdbc.queryForObject("SELECT has_function_privilege('credential_proxy_query', "
+                + "'public.credential_proxy_active_attempts(uuid,text,text,text)', 'EXECUTE')", Boolean.class))
+                .isFalse();
+        for (String runtimeRole : new String[] {
+                "credential_proxy_runtime", "worker_enrollment", "agentteams_runtime"}) {
+            assertThat(jdbc.queryForObject("SELECT has_function_privilege(?, "
+                    + "'public.credential_proxy_active_attempts(uuid,text,text,text)', 'EXECUTE')",
+                    Boolean.class, runtimeRole)).as(runtimeRole).isFalse();
+        }
+        assertThatThrownBy(() -> restricted.queryForObject("SELECT public.credential_proxy_active_attempts("
+                + "?::uuid, ?::text, ?::text, ?::text)", Integer.class, AGENT, "tenant-b", "project-b", "team-b"))
+                .isInstanceOf(org.springframework.dao.DataAccessException.class);
     }
 
     @Test
