@@ -112,6 +112,12 @@ class WorkerSessionServiceTest {
         private UUID revokedAgentId;
         private UUID revokedSessionId;
         private Instant revokedAt;
+        private WorkerScope executionScope;
+
+        @Override
+        public void setExecutionScope(WorkerScope scope) {
+            executionScope = scope;
+        }
 
         @Override
         public Optional<WorkerRegistration> findAgent(UUID agentId) {

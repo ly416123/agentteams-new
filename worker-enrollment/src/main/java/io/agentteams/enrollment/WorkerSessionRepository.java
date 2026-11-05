@@ -5,6 +5,8 @@ import java.util.Optional;
 import java.util.UUID;
 
 public interface WorkerSessionRepository {
+    void setExecutionScope(WorkerScope scope);
+
     Optional<WorkerRegistration> findAgent(UUID agentId);
 
     void insert(WorkerSessionRecord session);

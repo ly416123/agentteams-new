@@ -42,6 +42,7 @@ public class WorkerSessionService {
         Objects.requireNonNull(callerScope, "callerScope");
         Duration ttl = requestedTtl == null ? defaultTtl : validateTtl(requestedTtl);
 
+        repository.setExecutionScope(callerScope);
         WorkerSessionRepository.WorkerRegistration worker = repository.findAgent(agentId)
                 .orElseThrow(() -> new WorkerEnrollmentException("Worker is not available in caller scope"));
         if (!callerScope.equalsScope(worker.scope()) || !isEnrollable(worker.phase())) {
@@ -63,6 +64,7 @@ public class WorkerSessionService {
         Objects.requireNonNull(agentId, "agentId");
         Objects.requireNonNull(sessionId, "sessionId");
         Objects.requireNonNull(callerScope, "callerScope");
+        repository.setExecutionScope(callerScope);
         Optional<WorkerSessionRepository.WorkerSessionOwnership> session =
                 repository.findSessionForUpdate(agentId, sessionId);
         if (session.isEmpty() || !callerScope.equalsScope(session.get().scope())) {

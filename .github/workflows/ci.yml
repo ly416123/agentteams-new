@@ -46,7 +46,7 @@ jobs:
               "worker-enrollment/target/surefire-reports/TEST-io.agentteams.enrollment.GatewaySessionHandshakeTest.xml"
           ).getroot()
           for name, suite, expected_count in (
-              ("repository", report, "4"),
+              ("repository", report, "5"),
               ("signed OIDC to PostgreSQL", oidc_report, "6"),
               ("pinned Gateway gRPC session handshake", gateway_report, "5"),
           ):
@@ -54,7 +54,7 @@ jobs:
               assert suite.attrib["skipped"] == "0", (name, suite.attrib)
               assert suite.attrib["failures"] == "0", (name, suite.attrib)
               assert suite.attrib["errors"] == "0", (name, suite.attrib)
-          print("All 15 PostgreSQL, OIDC, and pinned Gateway integration tests executed successfully.")
+          print("All 16 PostgreSQL, OIDC, and pinned Gateway integration tests executed successfully.")
           PY
 
       - name: Validate Compose and shell scripts

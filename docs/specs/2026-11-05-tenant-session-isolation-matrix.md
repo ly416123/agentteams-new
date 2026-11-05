@@ -1,6 +1,6 @@
 # 多租户与会话隔离验收矩阵
 
-**状态：** 批次 2A 基线，实施前需按当前固定版本实现校验
+**状态：** 批次 2A 基线已落文档；Enrollment DB 的 agents/agent_sessions RLS 已实施，其他资源仍待盘点和验收
 **日期：** 2026-11-05
 **范围：** HTTP 身份、业务资源、Worker 执行上下文、数据库与后台消息
 
@@ -54,6 +54,7 @@ Task 与 Attempt 的事实源是 PostgreSQL。NATS、Gateway、Worker、对象�
 - 新项目 `worker-enrollment` 已从经验证 JWT 读取配置指定的 tenant/project/team claims，并要求管理权限；Repository 将 Agent 元数据中的三段 scope 与调用者逐项比较，Session Hash 持久化。已有 PostgreSQL/JWT 集成测试证明缺 scope 与跨 Tenant/Project/Team 签发、撤销请求被拒绝。
 - 复用的 v0.1.5 Worker 运行时以 Attempt ID 创建 AgentScope session；旧源码显示 workspace scope 含 Tenant/Project/Team/Agent/Task/Attempt，并在运行终止时释放 Harness 绑定。这是上游实现证据，尚未证明固定 Compose 组合中同一 Agent 连续 Attempt 无残留，或不同 Tenant 的独立 Worker 互不可见。
 - 新项目没有复制 Task/Attempt/Artifact/Outbox 状态机，也没有为这些资源实现新的全系统 `ExecutionContext` 或 RLS。当前 Compose 复用旧应用镜像，因此不能宣称批次 2 已完成。
+- `worker_enrollment` 专用数据库角色现对 `agents` 与 `agent_sessions` 启用 RLS；授权/撤销事务将已验证的 tenant/project/team 写入事务局部 PostgreSQL 设置，策略缺 scope 默认拒绝，Agent 关联约束 Session 行，列级授权不允许读取 Token Hash。PostgreSQL 集成测试覆盖同一池连接跨 Tenant 复用、跨 scope 插入拒绝、事务结束后 scope 清除和角色无 `BYPASSRLS`。这项纵深防御仅覆盖 Enrollment。
 - L5 有真实 Keycloak 和 Worker 凭据 Secret 引用，但 issuer/JWKS 使用 HTTP，当前新 Compose 强制 HTTPS；现有本机 Kubernetes context 只允许读取 Pod，不能读取 Secret/ConfigMap。L5 不作为本轮隔离验收环境，且其运行服务未被改动。
 
 ## 验收批次

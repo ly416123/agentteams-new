@@ -114,16 +114,17 @@ services:
         if [ "$$ready" -ne 1 ]; then echo "Control Plane agent/session schema did not become ready" >&2; exit 1; fi
         psql -v ON_ERROR_STOP=1 <<'SQL'
         \getenv role_password WORKER_ENROLLMENT_DB_PASSWORD
-        SELECT format('CREATE ROLE worker_enrollment LOGIN PASSWORD %L', :'role_password')
+        SELECT format('CREATE ROLE worker_enrollment LOGIN PASSWORD %L NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS', :'role_password')
          WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'worker_enrollment')
         \gexec
-        SELECT format('ALTER ROLE worker_enrollment PASSWORD %L', :'role_password')
+        SELECT format('ALTER ROLE worker_enrollment WITH LOGIN PASSWORD %L NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS', :'role_password')
         \gexec
         GRANT CONNECT ON DATABASE agentteams TO worker_enrollment;
         GRANT USAGE ON SCHEMA public TO worker_enrollment;
-        GRANT SELECT ON TABLE agents TO worker_enrollment;
-        GRANT SELECT, INSERT, UPDATE ON TABLE agent_sessions TO worker_enrollment;
         SQL
+        psql -v ON_ERROR_STOP=1 -f /opt/worker-enrollment-rls.sql
+    volumes:
+      - ../../worker-enrollment/src/main/resources/db/worker-enrollment-rls.sql:/opt/worker-enrollment-rls.sql:ro
     depends_on:
       postgres:
         condition: service_healthy

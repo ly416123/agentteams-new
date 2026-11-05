@@ -7,6 +7,7 @@ import java.time.Instant;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
 
@@ -16,6 +17,20 @@ public class JdbcWorkerSessionRepository implements WorkerSessionRepository {
 
     public JdbcWorkerSessionRepository(JdbcTemplate jdbc) {
         this.jdbc = Objects.requireNonNull(jdbc, "jdbc");
+    }
+
+    @Override
+    public void setExecutionScope(WorkerScope scope) {
+        Objects.requireNonNull(scope, "scope");
+        if (!TransactionSynchronizationManager.isActualTransactionActive()) {
+            throw new IllegalStateException("Worker enrollment scope requires an active database transaction");
+        }
+        jdbc.queryForObject("SELECT set_config('agentteams.tenant_id', ?, true)",
+                String.class, scope.tenant());
+        jdbc.queryForObject("SELECT set_config('agentteams.project_id', ?, true)",
+                String.class, scope.project());
+        jdbc.queryForObject("SELECT set_config('agentteams.team_id', ?, true)",
+                String.class, scope.team());
     }
 
     @Override

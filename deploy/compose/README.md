@@ -23,6 +23,8 @@ cp .env.example .env
 
 Worker 池启用前，配置真实 OIDC issuer、JWKS URL、audience，并设置唯一的 `WORKER_ENROLLMENT_DB_PASSWORD`（至少 24 字符）；将 `API_AUTH_ENABLED=true`。这个开关同时开启 Control Plane API OIDC 安全和 Enrollment OIDC 验证。Enrollment 数据库角色由一次性 setup 容器创建，只能读取 `agents` 并读写 `agent_sessions`。不要手工向数据库写 Token。Control Plane 和 Enrollment HTTP 端口只绑定到 `127.0.0.1`，不可改为公网或局域网监听；如需远端访问，应放在完成 TLS 和身份校验的可信入口后。
 
+Enrollment 数据库使用独立的 `worker_enrollment` 登录角色；setup 会启用 `agents` 与 `agent_sessions` 的 PostgreSQL RLS，并授予 Session 表所需的列级权限。该角色不是表所有者、超级用户或 `BYPASSRLS`。Enrollment 在签发/撤销事务中设置 JWT 已验证的 tenant/project/team scope；无 scope 时策略不返回 Agent，跨 scope Session 写入会被拒绝。当前 RLS 只覆盖 Enrollment 使用的这两张表，不能代表 Task、Attempt、Artifact 等资源已完成全系统隔离。
+
 Enrollment 端口默认为 `127.0.0.1:8090`；若 `.env` 中覆盖 `ENROLLMENT_PORT`，该值仅影响宿主机端口映射，绑定地址仍固定为 loopback。`enroll-worker.sh` 需要 `curl`、`jq` 和由 OIDC Provider 签发且 scope/audience 匹配的临时 access token 文件。
 
 使用私有 GHCR 镜像时，先在本机执行 `docker login ghcr.io`。不要把 PAT 写入 Compose 文件或 `.env`。
