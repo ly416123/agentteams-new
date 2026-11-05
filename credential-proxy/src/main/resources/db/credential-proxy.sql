@@ -1,0 +1,103 @@
+-- Apply after the shared Control Plane schema is migrated through v121.
+-- Only the non-login function owner can read the narrow columns below. The
+-- runtime login should inherit credential_proxy_query and receive no table grants.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'credential_proxy_query_owner') THEN
+        CREATE ROLE credential_proxy_query_owner
+            NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'credential_proxy_query') THEN
+        CREATE ROLE credential_proxy_query
+            NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+    END IF;
+END;
+$$;
+
+ALTER ROLE credential_proxy_query_owner
+    WITH NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+ALTER ROLE credential_proxy_query
+    WITH NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+
+GRANT USAGE ON SCHEMA public TO credential_proxy_query_owner, credential_proxy_query;
+GRANT CREATE ON SCHEMA public TO credential_proxy_query_owner;
+GRANT SELECT (id, task_id, lease_id, phase, lease_expires_at)
+    ON TABLE public.task_attempts TO credential_proxy_query_owner;
+GRANT SELECT (task_id, attempt_id, agent_id, phase, released_at)
+    ON TABLE public.task_assignments TO credential_proxy_query_owner;
+GRANT SELECT (id, agent_id, task_attempt_id, expires_at, released_at, status)
+    ON TABLE public.agent_leases TO credential_proxy_query_owner;
+GRANT SELECT (resource_type, resource_id, tenant_id, project_id, team)
+    ON TABLE public.resource_scopes TO credential_proxy_query_owner;
+
+CREATE OR REPLACE FUNCTION public.credential_proxy_active_attempts(
+    p_agent_id UUID,
+    p_tenant_id TEXT,
+    p_project_id TEXT,
+    p_team_id TEXT
+)
+RETURNS TABLE (
+    agent_id UUID,
+    tenant_id TEXT,
+    project_id TEXT,
+    team_id TEXT,
+    task_id UUID,
+    attempt_id UUID,
+    lease_id UUID,
+    lease_expires_at TIMESTAMPTZ,
+    lease_active BOOLEAN,
+    attempt_active BOOLEAN,
+    assignment_active BOOLEAN
+)
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+    SELECT assignment.agent_id,
+           task_scope.tenant_id,
+           task_scope.project_id,
+           task_scope.team,
+           assignment.task_id,
+           assignment.attempt_id,
+           lease.id,
+           LEAST(lease.expires_at, attempt.lease_expires_at),
+           TRUE,
+           TRUE,
+           TRUE
+      FROM public.task_assignments AS assignment
+      JOIN public.task_attempts AS attempt
+        ON attempt.id = assignment.attempt_id
+       AND attempt.task_id = assignment.task_id
+      JOIN public.agent_leases AS lease
+        ON lease.id = attempt.lease_id
+       AND lease.task_attempt_id = attempt.id
+       AND lease.agent_id = assignment.agent_id
+      JOIN public.resource_scopes AS worker_scope
+        ON worker_scope.resource_type = 'WORKER'
+       AND worker_scope.resource_id = assignment.agent_id
+      JOIN public.resource_scopes AS task_scope
+        ON task_scope.resource_type = 'TASK'
+       AND task_scope.resource_id = assignment.task_id
+     WHERE assignment.agent_id = p_agent_id
+       AND worker_scope.tenant_id = p_tenant_id
+       AND worker_scope.project_id = p_project_id
+       AND worker_scope.team = p_team_id
+       AND task_scope.tenant_id = p_tenant_id
+       AND task_scope.project_id = p_project_id
+       AND task_scope.team = p_team_id
+       AND assignment.phase IN ('ASSIGNED', 'ACCEPTED', 'RUNNING')
+       AND assignment.released_at IS NULL
+       AND attempt.phase IN ('ASSIGNED', 'ACCEPTED', 'RUNNING')
+       AND attempt.lease_expires_at > statement_timestamp()
+       AND lease.status = 'ACTIVE'
+       AND lease.released_at IS NULL
+       AND lease.expires_at > statement_timestamp()
+$$;
+
+ALTER FUNCTION public.credential_proxy_active_attempts(UUID, TEXT, TEXT, TEXT)
+    OWNER TO credential_proxy_query_owner;
+REVOKE CREATE ON SCHEMA public FROM credential_proxy_query_owner;
+REVOKE ALL ON FUNCTION public.credential_proxy_active_attempts(UUID, TEXT, TEXT, TEXT) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.credential_proxy_active_attempts(UUID, TEXT, TEXT, TEXT)
+    TO credential_proxy_query;

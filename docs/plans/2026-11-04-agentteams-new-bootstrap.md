@@ -70,6 +70,8 @@
 
 **L5 资源复核（2026-11-05）：** 当前 `kind-agentteams` context 可列出 `agentteams` 命名空间 Pod，包含旧版 Control Plane、Keycloak 25.0.6、PostgreSQL、NATS、MinIO、Gateway 等资源；部分旧 Manager/Console/Worker 相关 Pod 为 Pending。查询授权探测对 Secret/Service/Ingress 返回 `yes`，但本轮没有读取 Secret 数据；Service/Ingress 元数据查询超时，故不能确认可用 HTTPS 入口。此前记录的 issuer/JWKS 仍是 HTTP 地址。当前可见资源属于旧版 K8s 部署，不是 `agentteams-new` Compose 的 Worker Enrollment/credential-proxy 实例；本机也没有新项目 Worker 模型凭据文件。结论：L5 可提供旧版 IdP/数据库等参考环境，但目前不能直接完成新项目真实 Worker 验收；需要可验证的 HTTPS OIDC 入口和新运行主机独立的模型凭据文件。
 
+**Attempt 数据库查询实现（2026-11-05）：** `credential-proxy` 增加 JDBC repository，通过 PostgreSQL `SECURITY DEFINER` 函数查询唯一活动 Assignment/Attempt/Lease，并同时匹配 Agent 的 `WORKER` scope 与任务的 `TASK` scope。非登录函数 owner 只获必要列的 SELECT，代理查询组无底层表权限，只获函数 EXECUTE；脚本要求在共享 schema v121 完成后由数据库管理员执行。新增 4 项 PostgreSQL Testcontainers 验收（精确租户匹配、过期/其他租户过滤、多活动执行保留给 Resolver 拒绝、运行角色无法直接 SELECT）。本机没有 Docker，4 项集成测试本机跳过；CI 门禁要求 4 项全部真实执行。上一补丁 `392de64` 的 GitHub Actions [run 41998270039](https://github.com/ly416123/agentteams-new/actions/runs/41998270039) 已通过。当前新增查询尚待推送后由 CI 验证，模型代理凭据哈希查验、运行登录角色签发、Provider Secret 解析和 HTTP 流式转发仍未完成。
+
 ## 批次 1：无 Kubernetes 固定容量 Compose POC
 
 1. 先从旧仓库构建并发布 Control Plane、Gateway、Worker 的固定版本 OCI 镜像；记录镜像 digest 和源 commit。
