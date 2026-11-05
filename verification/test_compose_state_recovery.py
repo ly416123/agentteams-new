@@ -168,6 +168,17 @@ networks:
                         text=True,
                         timeout=180,
                     )
+                # NATS owns the stream backup files in the bind mount and
+                # leaves them mode 0600/root-owned. Let Docker's root user
+                # remove that test-only tree so TemporaryDirectory can clean
+                # up the remaining host-owned files reliably.
+                subprocess.run(
+                    ["docker", "run", "--rm", "-v", f"{temp}:/cleanup", "alpine:3.21",
+                     "sh", "-ec", "chmod -R u+rwX /cleanup/backup 2>/dev/null || true; rm -rf /cleanup/backup"],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
 
 
 if __name__ == "__main__":

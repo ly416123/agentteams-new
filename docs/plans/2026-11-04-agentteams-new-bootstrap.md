@@ -135,6 +135,8 @@
 
 **固定容量状态备份与恢复演练（2026-11-05）：** 新增 `backup-state.sh`/`restore-state.sh`，备份 PostgreSQL custom dump、4 个 NATS JetStream Stream；启用对象存储时停止 SeaweedFS 并归档其持久卷。bundle 带 SHA-256 清单且收紧到 `0700/0600`。恢复只接受新的 Compose project 和空卷，先恢复 PostgreSQL、NATS 与对象数据，不自动启动应用；校验失败会清理新建目标资源。`start-workers.sh` 现支持 `COMPOSE_PROJECT_NAME`，便于确认状态后在恢复项目启动固定槽位。隔离 Docker Compose 演练使用随机项目验证 PostgreSQL 行、4 个 Stream 消息和对象文件恢复，并验证被篡改 dump 与已存在目标被拒绝；演练容器、网络和卷均清理。当前恢复脚本要求操作者在整个备份窗口暂停 Task/Artifact 写入；Compose POC 暂无专用 Worker drain 命令，仍需人工确认无活动 Attempt。该演练不包含外部 OIDC/Provider/数据库密钥恢复、不证明异机备份或生产对象存储恢复；这些仍是批次 4 验收项。
 
+恢复演练 CI 清理修复（2026-11-05）：GitHub Actions 首次运行 `42035500129` 的 Java/Maven、PostgreSQL 与凭据代理门禁全部通过，但恢复集成用例结束时报错：NATS 容器以 root 写入 `0600` 备份文件，Runner 用户不能删除临时目录。修正测试 teardown，由临时 Alpine 容器以 root 清理仅用于该用例的备份树；本机恢复集成用例通过，完整 verification 共 21 项通过。待修复提交的 CI 复跑完成后补录远端结果。
+
 ## 批次 5：解除旧应用镜像的长期依赖
 
 1. 依据批次 1–4 的真实任务和安全验收结果，列出新路径实际需要的 Control Plane、Gateway、Worker 能力及稳定 API/事件/数据库边界。
