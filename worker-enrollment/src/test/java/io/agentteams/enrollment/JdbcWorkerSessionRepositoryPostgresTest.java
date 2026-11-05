@@ -6,13 +6,11 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import java.time.Instant;
 import java.util.UUID;
 import com.zaxxer.hikari.HikariDataSource;
-import org.springframework.core.io.ClassPathResource;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
-import org.springframework.jdbc.datasource.init.ResourceDatabasePopulator;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.testcontainers.containers.PostgreSQLContainer;
@@ -61,6 +59,10 @@ class JdbcWorkerSessionRepositoryPostgresTest {
                 )
                 """);
         jdbc.execute("CREATE TABLE platform_identities (id UUID PRIMARY KEY, subject TEXT NOT NULL)");
+        jdbc.execute("CREATE ROLE worker_enrollment LOGIN PASSWORD 'enrollment-test-password' NOSUPERUSER NOBYPASSRLS");
+        jdbc.execute("GRANT CONNECT ON DATABASE enrollment_test TO worker_enrollment");
+        jdbc.execute("GRANT USAGE ON SCHEMA public TO worker_enrollment");
+        applyEnrollmentRls();
         repository = new JdbcWorkerSessionRepository(jdbc);
     }
 
@@ -118,20 +120,23 @@ class JdbcWorkerSessionRepositoryPostgresTest {
     @Test
     void enrollmentDatabaseRoleCanUseOnlyTheGrantedTables() {
         insertAgent(AGENT_ID, "READY", "{\"scope\":{\"tenant\":\"tenant-a\",\"project\":\"project-a\",\"team\":\"team-a\"}}");
-        jdbc.execute("CREATE ROLE worker_enrollment LOGIN PASSWORD 'enrollment-test-password' NOSUPERUSER NOBYPASSRLS");
-        jdbc.execute("GRANT CONNECT ON DATABASE enrollment_test TO worker_enrollment");
-        jdbc.execute("GRANT USAGE ON SCHEMA public TO worker_enrollment");
         grantEnrollmentAgentColumns();
+        grantEnrollmentAgentScopeColumns();
         grantEnrollmentSessionColumns();
 
         var restrictedDataSource = new DriverManagerDataSource(
                 POSTGRES.getJdbcUrl(), "worker_enrollment", "enrollment-test-password");
         JdbcTemplate restrictedJdbc = new JdbcTemplate(restrictedDataSource);
         JdbcWorkerSessionRepository restrictedRepository = new JdbcWorkerSessionRepository(restrictedJdbc);
-        assertThat(restrictedRepository.findAgent(AGENT_ID)).isPresent();
-        restrictedRepository.insert(new WorkerSessionRepository.WorkerSessionRecord(
-                SESSION_ID, AGENT_ID, TOKEN_HASH, Instant.now().plusSeconds(3600), Instant.now()));
-        assertThat(restrictedRepository.revoke(AGENT_ID, SESSION_ID, Instant.now())).isTrue();
+        TransactionTemplate transaction =
+                new TransactionTemplate(new DataSourceTransactionManager(restrictedDataSource));
+        transaction.executeWithoutResult(status -> {
+            restrictedRepository.setExecutionScope(new WorkerScope("tenant-a", "project-a", "team-a"));
+            assertThat(restrictedRepository.findAgent(AGENT_ID)).isPresent();
+            restrictedRepository.insert(new WorkerSessionRepository.WorkerSessionRecord(
+                    SESSION_ID, AGENT_ID, TOKEN_HASH, Instant.now().plusSeconds(3600), Instant.now()));
+            assertThat(restrictedRepository.revoke(AGENT_ID, SESSION_ID, Instant.now())).isTrue();
+        });
         assertThatThrownBy(
                 () -> restrictedJdbc.queryForObject("SELECT count(*) FROM platform_identities", Long.class))
                 .isInstanceOf(org.springframework.dao.DataAccessException.class);
@@ -146,15 +151,14 @@ class JdbcWorkerSessionRepositoryPostgresTest {
     @Test
     void rowPoliciesFollowTransactionLocalTenantProjectAndTeamScope() {
         UUID tenantBAgent = UUID.fromString("66000000-0000-0000-0000-000000000004");
+        jdbc.execute("DROP TRIGGER IF EXISTS worker_enrollment_sync_agent_scope ON agents");
+        jdbc.execute("DELETE FROM worker_enrollment_agent_scopes");
         insertAgent(AGENT_ID, "READY", "{\"scope\":{\"tenant\":\"tenant-a\",\"project\":\"project-a\",\"team\":\"team-a\"}}");
         insertAgent(tenantBAgent, "READY", "{\"scope\":{\"tenant\":\"tenant-b\",\"project\":\"project-b\",\"team\":\"team-b\"}}");
-        jdbc.execute("CREATE ROLE worker_enrollment LOGIN PASSWORD 'enrollment-test-password' NOSUPERUSER NOBYPASSRLS");
-        jdbc.execute("GRANT CONNECT ON DATABASE enrollment_test TO worker_enrollment");
-        jdbc.execute("GRANT USAGE ON SCHEMA public TO worker_enrollment");
         grantEnrollmentAgentColumns();
+        grantEnrollmentAgentScopeColumns();
         grantEnrollmentSessionColumns();
-        new ResourceDatabasePopulator(new ClassPathResource("db/worker-enrollment-rls.sql"))
-                .execute(jdbc.getDataSource());
+        applyEnrollmentRls();
         assertThat(jdbc.queryForObject(
                 "SELECT rolbypassrls FROM pg_roles WHERE rolname = 'worker_enrollment'", Boolean.class))
                 .isFalse();
@@ -174,6 +178,12 @@ class JdbcWorkerSessionRepositoryPostgresTest {
             assertThatThrownBy(() -> restrictedRepository.setExecutionScope(
                     new WorkerScope("tenant-a", "project-a", "team-a")))
                     .isInstanceOf(IllegalStateException.class);
+            assertThatThrownBy(() -> transaction.execute(status -> {
+                restrictedRepository.setExecutionScope(new WorkerScope("tenant-a", "project-a", "team-a"));
+                return restrictedJdbc.queryForObject(
+                        "SELECT metadata->>'scope' FROM agents WHERE id = ?", String.class, AGENT_ID);
+            }))
+                    .isInstanceOf(org.springframework.dao.DataAccessException.class);
             Integer firstConnectionPid = transaction.execute(status -> {
                 restrictedRepository.setExecutionScope(new WorkerScope("tenant-a", "project-a", "team-a"));
                 assertThat(restrictedRepository.findAgent(AGENT_ID)).isPresent();
@@ -225,7 +235,16 @@ class JdbcWorkerSessionRepositoryPostgresTest {
     }
 
     private void grantEnrollmentAgentColumns() {
-        jdbc.execute("GRANT SELECT (id, phase, metadata) ON TABLE agents TO worker_enrollment");
+        jdbc.execute("GRANT SELECT (id, phase) ON TABLE agents TO worker_enrollment");
+    }
+
+    private void applyEnrollmentRls() {
+        PostgresScriptRunner.run(jdbc, "db/worker-enrollment-rls.sql");
+    }
+
+    private void grantEnrollmentAgentScopeColumns() {
+        jdbc.execute("GRANT SELECT (agent_id, tenant_id, project_id, team_id) "
+                + "ON TABLE worker_enrollment_agent_scopes TO worker_enrollment");
     }
 
     private static java.util.Map<String, Object> restrictedRepositoryScope(HikariDataSource dataSource) {
@@ -242,10 +261,16 @@ class JdbcWorkerSessionRepositoryPostgresTest {
         if (Boolean.TRUE.equals(exists)) {
             jdbc.execute("DROP POLICY IF EXISTS worker_enrollment_agents_scope ON agents");
             jdbc.execute("DROP POLICY IF EXISTS worker_enrollment_sessions_scope ON agent_sessions");
+            jdbc.execute("DROP POLICY IF EXISTS worker_enrollment_agent_scopes_scope "
+                    + "ON worker_enrollment_agent_scopes");
             jdbc.execute("ALTER TABLE agents DISABLE ROW LEVEL SECURITY");
             jdbc.execute("ALTER TABLE agent_sessions DISABLE ROW LEVEL SECURITY");
+            jdbc.execute("ALTER TABLE worker_enrollment_agent_scopes DISABLE ROW LEVEL SECURITY");
+            jdbc.execute("DROP TRIGGER IF EXISTS worker_enrollment_sync_agent_scope ON agents");
+            jdbc.execute("DROP FUNCTION IF EXISTS worker_enrollment_sync_agent_scope()");
             jdbc.execute("DROP OWNED BY worker_enrollment");
             jdbc.execute("DROP ROLE worker_enrollment");
+            jdbc.execute("DROP TABLE IF EXISTS worker_enrollment_agent_scopes");
         }
     }
 }

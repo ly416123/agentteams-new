@@ -104,7 +104,11 @@ class OidcJwtIntegrationTest {
     @BeforeEach
     void createSchemaAndScopedWorker() {
         jdbc.execute("DROP TABLE IF EXISTS agent_sessions");
+        jdbc.execute("DROP TABLE IF EXISTS worker_enrollment_agent_scopes CASCADE");
         jdbc.execute("DROP TABLE IF EXISTS agents");
+        jdbc.execute("DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'worker_enrollment') THEN "
+                + "CREATE ROLE worker_enrollment LOGIN PASSWORD 'enrollment-test-password' "
+                + "NOSUPERUSER NOBYPASSRLS; END IF; END $$");
         jdbc.execute("""
                 CREATE TABLE agents (
                     id UUID PRIMARY KEY,
@@ -123,6 +127,7 @@ class OidcJwtIntegrationTest {
                     created_at TIMESTAMPTZ NOT NULL
                 )
                 """);
+        PostgresScriptRunner.run(jdbc, "db/worker-enrollment-rls.sql");
         insertAgent("tenant-a", "project-a", "team-a");
     }
 

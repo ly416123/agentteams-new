@@ -36,15 +36,13 @@ public class JdbcWorkerSessionRepository implements WorkerSessionRepository {
     @Override
     public Optional<WorkerRegistration> findAgent(UUID agentId) {
         return jdbc.query("""
-                SELECT phase,
-                       NULLIF(BTRIM(metadata #>> '{scope,tenant}'), '') AS tenant_id,
-                       NULLIF(BTRIM(metadata #>> '{scope,project}'), '') AS project_id,
-                       NULLIF(BTRIM(metadata #>> '{scope,team}'), '') AS team_id
-                  FROM agents
-                 WHERE id = ?
-                   AND NULLIF(BTRIM(metadata #>> '{scope,tenant}'), '') IS NOT NULL
-                   AND NULLIF(BTRIM(metadata #>> '{scope,project}'), '') IS NOT NULL
-                   AND NULLIF(BTRIM(metadata #>> '{scope,team}'), '') IS NOT NULL
+                SELECT agent.phase, scoped.tenant_id, scoped.project_id, scoped.team_id
+                  FROM agents agent
+                  JOIN worker_enrollment_agent_scopes scoped ON scoped.agent_id = agent.id
+                 WHERE agent.id = ?
+                   AND NULLIF(BTRIM(scoped.tenant_id), '') IS NOT NULL
+                   AND NULLIF(BTRIM(scoped.project_id), '') IS NOT NULL
+                   AND NULLIF(BTRIM(scoped.team_id), '') IS NOT NULL
                 """, this::registration, agentId).stream().findFirst();
     }
 
@@ -60,16 +58,13 @@ public class JdbcWorkerSessionRepository implements WorkerSessionRepository {
     @Override
     public Optional<WorkerSessionOwnership> findSessionForUpdate(UUID agentId, UUID sessionId) {
         return jdbc.query("""
-                SELECT session.revoked_at,
-                       NULLIF(BTRIM(agent.metadata #>> '{scope,tenant}'), '') AS tenant_id,
-                       NULLIF(BTRIM(agent.metadata #>> '{scope,project}'), '') AS project_id,
-                       NULLIF(BTRIM(agent.metadata #>> '{scope,team}'), '') AS team_id
+                SELECT session.revoked_at, scoped.tenant_id, scoped.project_id, scoped.team_id
                   FROM agent_sessions session
-                  JOIN agents agent ON agent.id = session.agent_id
+                  JOIN worker_enrollment_agent_scopes scoped ON scoped.agent_id = session.agent_id
                  WHERE session.agent_id = ? AND session.id = ?
-                   AND NULLIF(BTRIM(agent.metadata #>> '{scope,tenant}'), '') IS NOT NULL
-                   AND NULLIF(BTRIM(agent.metadata #>> '{scope,project}'), '') IS NOT NULL
-                   AND NULLIF(BTRIM(agent.metadata #>> '{scope,team}'), '') IS NOT NULL
+                   AND NULLIF(BTRIM(scoped.tenant_id), '') IS NOT NULL
+                   AND NULLIF(BTRIM(scoped.project_id), '') IS NOT NULL
+                   AND NULLIF(BTRIM(scoped.team_id), '') IS NOT NULL
                  FOR UPDATE OF session
                 """, (rs, row) -> new WorkerSessionOwnership(scope(rs), rs.getTimestamp("revoked_at") != null),
                 agentId, sessionId).stream().findFirst();

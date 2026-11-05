@@ -2,7 +2,7 @@
 
 **日期：** 2026-11-05  
 **审计对象：** `agentteams-java` Control Plane v0.1.5，源码 commit `0156f2c1fecdc868cb4a0f4f13fb068bb4162834`  
-**方式：** 只读检查迁移 SQL、Repository、授权服务和 Compose 连接配置；未修改 `agentteams-java`，未连接或读取 L5 数据库。
+**方式：** 只读检查迁移 SQL、Repository、授权服务和 Compose 连接配置；未修改 `agentteams-java`，未读取 L5 数据库表或 Secret 内容。另通过 L5 的 `readonly-pod-logs` 上下文检查 Pod 元信息与非敏感环境配置。
 
 ## 结论
 
@@ -56,6 +56,10 @@
 5. 在上述工作完成前，部署说明应继续明确：当前是应用层多租户授权加 Enrollment 表 RLS，不得称为全系统数据库强隔离。
 
 ## 凭证代理接入边界
+
+### L5 运行资源核验（2026-11-05，只读）
+
+`readonly-pod-logs` 可列出 `agentteams` 命名空间 Pod，并查看其描述和日志；不能读取 Secret/ConfigMap，也不能列出 Deployment、StatefulSet、Service 或 Ingress。Keycloak Pod 运行 `quay.io/keycloak/keycloak:25.0.6`，使用 `--http-port=8080`，Pod 描述中的 hostname 为 HTTP。Control Plane Pod 的非敏感环境配置确认 realm `agentteams`、issuer `http://192.168.122.55:30082/realms/agentteams`、内部 JWKS `http://keycloak:8080/realms/agentteams/protocol/openid-connect/certs`、audience `agentteams-api`，以及 Tenant/Project/Team/Permissions claim 分别为 `tenant`、`project`、`team`、`permissions`。Worker Pod 描述确认模型访问 Token Secret 名称为 `agentteams-chatgpt-oauth-session`，只读挂载路径 `/var/run/agentteams/chatgpt/token`；未读取 Secret 数据。该环境没有可直接用于新 Compose 的本机模型凭据文件，且当前 OIDC issuer/JWKS 不满足新项目的 HTTPS 生产契约。下一次真实联调需要运维提供可信 HTTPS issuer/JWKS 地址（或为 L5 配置 HTTPS 入口），以及在运行新项目的主机上创建/指定独立模型凭据文件；不应复制 L5 Secret 到仓库或新环境。现有 L5 工作负载未改动。
 
 固定 Worker 源码 `agent-worker/src/main/java/io/agentteams/worker/chatgpt/ChatGptPlanModel.java` 支持通过 `AGENTTEAMS_CHATGPT_RESPONSES_URL` 覆盖 Responses API 地址；`ChatGptPlanTokenSource.fromPath()` 每次模型请求都会重新读取 `AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE` 指向的文件。因此 `agentteams-new` 可以把该 endpoint 指向凭证代理，并让 Worker 文件只保存代理消费凭据，无需修改旧源码。
 
