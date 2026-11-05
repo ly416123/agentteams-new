@@ -125,6 +125,32 @@ index 0000000..b563fdc
 +        return (taskId, command, projection) -> false;
 +    }
 +}
+diff --git a/control-plane/src/main/java/io/agentteams/controlplane/quality/JdbcArtifactQualityEventRepository.java b/control-plane/src/main/java/io/agentteams/controlplane/quality/JdbcArtifactQualityEventRepository.java
+index 12310d6..b348df9 100644
+--- a/control-plane/src/main/java/io/agentteams/controlplane/quality/JdbcArtifactQualityEventRepository.java
++++ b/control-plane/src/main/java/io/agentteams/controlplane/quality/JdbcArtifactQualityEventRepository.java
+@@ -38,0 +39,21 @@ public class JdbcArtifactQualityEventRepository implements ArtifactQualityEventR
++        if (event.taskId() != null) {
++            Boolean taskRunMatches = jdbc.queryForObject("""
++                    SELECT EXISTS (
++                        SELECT 1
++                          FROM task_runs run
++                          JOIN resource_scopes task_scope
++                            ON task_scope.resource_type = 'TASK'
++                           AND task_scope.resource_id = run.task_id
++                         WHERE run.id = ?
++                           AND run.task_id = ?
++                           AND run.organization_id = ?
++                           AND run.tenant_id = ?
++                           AND task_scope.tenant_id = ?
++                           AND task_scope.project_id = ?
++                    )
++                    """, Boolean.class, event.runId(), event.taskId(), context.organizationId(),
++                    context.tenantId(), context.tenantId(), projectId.toString());
++            if (!Boolean.TRUE.equals(taskRunMatches)) {
++                throw new IllegalArgumentException("event task/run must belong to trusted execution scope");
++            }
++        }
 diff --git a/control-plane/src/main/java/io/agentteams/controlplane/skill/SkillController.java b/control-plane/src/main/java/io/agentteams/controlplane/skill/SkillController.java
 index 13de114..83fc603 100644
 --- a/control-plane/src/main/java/io/agentteams/controlplane/skill/SkillController.java
@@ -366,6 +392,53 @@ index e27b905..de37996 100644
 +        org.mockito.Mockito.verify(lifecycle, org.mockito.Mockito.never()).findApply(any(), any());
 +        org.mockito.Mockito.verify(lifecycle, org.mockito.Mockito.never()).recordApply(any());
 +        org.mockito.Mockito.verify(lifecycle, org.mockito.Mockito.never()).recordResourceApply(any());
++    }
++
+diff --git a/control-plane/src/test/java/io/agentteams/controlplane/quality/JdbcArtifactQualityEventRepositoryTest.java b/control-plane/src/test/java/io/agentteams/controlplane/quality/JdbcArtifactQualityEventRepositoryTest.java
+index b9002de..f0cf253 100644
+--- a/control-plane/src/test/java/io/agentteams/controlplane/quality/JdbcArtifactQualityEventRepositoryTest.java
++++ b/control-plane/src/test/java/io/agentteams/controlplane/quality/JdbcArtifactQualityEventRepositoryTest.java
+@@ -5,0 +6 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertThrows;
+@@ -48,0 +50 @@ final class JdbcArtifactQualityEventRepositoryTest {
++        seedTask(taskId, runId, "org", "tenant", projectId);
+@@ -79,0 +82,28 @@ final class JdbcArtifactQualityEventRepositoryTest {
++    @Test
++    void rejectsEventWhoseTaskBelongsToAnotherTenantAndProject() {
++        UUID foreignProject = UUID.randomUUID();
++        UUID foreignTask = UUID.randomUUID();
++        UUID foreignRun = UUID.randomUUID();
++        jdbc.update("INSERT INTO projects(id, tenant_id, name, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, now(), now())",
++                foreignProject, "tenant-b", "foreign", "test");
++        seedTask(foreignTask, foreignRun, "org-b", "tenant-b", foreignProject);
++        ArtifactQualityEvent forged = new ArtifactQualityEvent(UUID.randomUUID(), "org", "tenant", projectId,
++                foreignTask, foreignRun, 0, "QUALITY_CHECK", "report.pdf", null, null, null, "pdf_missing",
++                "artifact_pdf", null, "FAILED", null, null, "PDF artifact missing", "LIVE",
++                "runtime:evaluation:" + foreignRun, "HIGH", "foreign-task", Instant.now());
++
++        assertThrows(IllegalArgumentException.class, () -> repository.append(context, forged));
++    }
++
++    @Test
++    void rejectsRunThatDoesNotBelongToEventTask() {
++        UUID unrelatedTask = UUID.randomUUID();
++        seedTask(unrelatedTask, UUID.randomUUID(), "org", "tenant", projectId);
++        ArtifactQualityEvent forged = new ArtifactQualityEvent(UUID.randomUUID(), "org", "tenant", projectId,
++                unrelatedTask, runId, 0, "QUALITY_CHECK", "report.pdf", null, null, null, "pdf_missing",
++                "artifact_pdf", null, "FAILED", null, null, "PDF artifact missing", "LIVE",
++                "runtime:evaluation:" + runId, "HIGH", "wrong-run-task", Instant.now());
++
++        assertThrows(IllegalArgumentException.class, () -> repository.append(context, forged));
++    }
++
+@@ -120,0 +151,9 @@ final class JdbcArtifactQualityEventRepositoryTest {
++    private void seedTask(UUID seededTaskId, UUID seededRunId, String organization, String tenant, UUID project) {
++        jdbc.update("INSERT INTO tasks(id, title, description, phase, priority, spec, actor, source, created_at, updated_at) "
++                + "VALUES (?, 'test', '', 'QUEUED', 0, '{}'::jsonb, 'test', 'test', now(), now())", seededTaskId);
++        jdbc.update("INSERT INTO task_runs(id, task_id, organization_id, tenant_id, status, created_at, updated_at) "
++                + "VALUES (?, ?, ?, ?, 'QUEUED', now(), now())", seededRunId, seededTaskId, organization, tenant);
++        jdbc.update("INSERT INTO resource_scopes(resource_type, resource_id, tenant_id, project_id, team, created_at, updated_at) "
++                + "VALUES ('TASK', ?, ?, ?, 'team', now(), now())", seededTaskId, tenant, project.toString());
 +    }
 +
 diff --git a/control-plane/src/test/java/io/agentteams/controlplane/skill/SkillControllerTest.java b/control-plane/src/test/java/io/agentteams/controlplane/skill/SkillControllerTest.java

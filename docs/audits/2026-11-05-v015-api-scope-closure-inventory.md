@@ -25,7 +25,7 @@ Controller 源码中能直接看到 `PrincipalContext`、`ProjectApiAuthorizatio
 | Team、membership、policy、revision 与 deployment | `/api/v1/teams/**` | Controller 部分检查项目 scope；Service 使用 `resource_scopes` 检查 Team/Worker 可见性 | 已追踪主要 service 边界；需核验管理角色、未认证开发模式及缺 scope 配置时的 fail-closed |
 | Conversation 与 Memory | Conversation 由 Task/Timeline 服务访问；`/api/v1/memory/**` | Conversation Service 显式接收 `ExecutionContext`；Memory Controller 从 Principal 解析上下文 | 已追踪核心服务/查询链；仍需核对所有调用入口、检索路径与后台写入 |
 | MCP Server、Connection 与 Route | `/api/v1/mcp-servers/**`、`/api/v1/mcp/connections/**` | Server 通过 `resource_scopes`；Connection 使用 `ExecutionContext` ownership；Route 要求上下文 | 已追踪管理主路径；需核对 discovery/probe 的 outbound 与凭据边界、Attempt 调用授权和 Route 租户绑定 |
-| Evaluation、Artifact Quality 与 Webhook | `/api/v1/evaluations/**`、`/api/v1/artifact-quality/**`、`/api/v1/webhooks/**` | Controller 未见直接调用 | 待确认数据归属、导出可见范围、投递/查询过滤及租户配置授权 |
+| Evaluation、Artifact Quality 与 Webhook | `/api/v1/evaluations/**`、`/api/v1/artifact-quality/**`、`/api/v1/webhooks/**` | Controller 未见直接调用 | Artifact Quality 查询按组织/Tenant/Project 过滤；派生补丁现在校验事件 Task/Run 父级 scope。其他导出、投递与租户配置授权仍待验收 |
 | Organization / Tenant 管理 | `/api/v1/management/organizations/**`、`tenants/**`、`memberships/**`、`integrations/**`、`users/**`、`authorizations/**` | 管理授权另有入口 | 待分别验证 Platform Admin、Organization Admin、Tenant Admin 与普通 Project member 的边界 |
 | 配置与 Matrix Room binding | `/api/v1/config/**`、Matrix binding 回调 | Controller 直接 scope 调用不完整 | 待判明 public/runtime 配置与租户配置，验证 Matrix room 与 Tenant/Project 映射不可伪造 |
 | Sandbox 与内部服务接口 | `/api/v1/sandboxes/**`、`/internal/v1/artifacts/**`、`/internal/v1/token-ledger/**`、`/internal/v1/task-state-consistency/**` | Sandbox 有直接调用；其余为内部入口 | Compose 已验证 Worker 网络不可达；内部 token 为空时 fail-closed。其他部署入口、后台任务 scope 与最小权限仍需验收 |
@@ -56,6 +56,12 @@ Controller 源码中能直接看到 `PrincipalContext`、`ProjectApiAuthorizatio
 - Compose 声明并运行态回读均确认 Control Plane 只映射宿主机 `127.0.0.1:18080`；Worker 加入 `worker-egress`，不加入 `host-ingress` 或 `data`。Gateway、PostgreSQL、NATS 没有宿主机端口映射。先前同 Worker 网络的无凭据探针也确认无法直连 Control Plane 的 data-network IP，而 Gateway gRPC 可达。故当前 POC 中 Worker 无法通过 Compose 网络访问上述 Control Plane 内部 HTTP 路由。
 - 这项结论只覆盖仓库 Compose 与本机验证环境。宿主机本地进程可以访问 loopback 映射；生产反向代理、云负载均衡、sidecar/管理网络和其他部署清单尚未核验。若部署方配置内部 token，仍需保持高熵、分服务隔离和轮换，并限制 `/internal/**` 的网络入口。内部 token 是服务身份，不代表 Tenant scope；内部操作仍要从数据库父资源校验 Task、Attempt、Agent 与租户关系。
 - Task State Consistency 的 Issues 查询返回跨租户运维记录，属于全局内部诊断能力；其安全边界是内部 token 与网络入口，而不是调用方 Tenant 过滤。部署时只能授予受信任运维主体，不能将该 token 放入 Worker 或租户可见配置。
+
+## Artifact Quality Outbox 父资源 scope 缺口与派生补丁（2026-11-06）
+
+- 固定 v0.1.5 的 `JdbcArtifactQualityEventRepository.append()` 原先只验证事件中的 organization/Tenant/Project 与传入 `ExecutionContext` 相同，没有回查 `task_runs` 与 `resource_scopes` 验证 `runId → taskId → Tenant/Project` 父子关系。直接以 Tenant A 上下文调用 Repository、同时引用 Tenant B 的有效 Task/Run 时，原实现会接受并写入质量事件，证明 Repository 层缺少父级完整性门禁；本次未证明存在可由外部用户直接触发该组合的公开 API 路径。
+- 新仓库维护的固定 v0.1.5 派生补丁在写入 Task 关联事件前，以同一数据库查询验证 Run 属于事件 Task、组织和 Tenant，且 Task 的 `TASK` resource scope 属于当前 Tenant/Project；不匹配则拒绝。无 Task 的历史事件继续走历史记录路径。
+- 新增两个 PostgreSQL 负向用例：拒绝另一 Tenant/Project 的 Task/Run，以及拒绝不属于事件 Task 的 Run。两项在原始 v0.1.5 基线上均失败、补丁后通过；Repository 测试类 6/6、0 skipped。固定补丁构建门禁因此扩展为 Control Plane 30/30（原 24 加质量 Repository 6）与真实 Gateway→NATS→Control Plane 消息链 2/2、0 skipped，并构建派生镜像。此项关闭 Artifact Quality 事件写入的父关系缺口，不代表该资源族全部 API、后台消费者与跨租户读取路径已闭环。
 
 ## 已追踪的 Task API 调用链
 
