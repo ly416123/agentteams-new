@@ -69,6 +69,8 @@ Controller 源码中能直接看到 `PrincipalContext`、`ProjectApiAuthorizatio
 ## 已追踪的异步执行与 Scheduled Task 链
 
 - `NatsExecutionEventConsumer` 是可信内部消费者，事件数据本身不是授权凭据。TASK transition 会在 `ExecutionEventService` 回查 Task、Attempt、Lease，并验证 `taskId == attempt.taskId`、Attempt/Lease 双向 ID 关系和事件 actor 等于 Lease 所属 Agent；REJECTION 和 LEASE_RENEWAL 也检查相同执行身份关系。transition 附带 Artifact 需属于同一 Task 与当前 Attempt。JetStream 负责重投递/幂等，但仍需核查 TASK_EVENT 与 CONFIG_APPLIED 分支各自写入服务的资源绑定，并通过篡改关联 ID 的集成负向用例验收。
+- Task Event 数据查询 SQL 将 aggregate id 与 `resource_scopes` 的 tenant/team、Project 记录以及调用者 active membership 联合过滤；HTTP `TaskService.events()` 先通过 `get(taskId)` scope guard，之后只把已认证 Principal 交给查询。`TaskEventController` 对 SSE payload 再做敏感字段与 credential 字符串脱敏。还需在固定镜像跨 Tenant/撤销 membership 后做重放和游标测试。
+- CONFIG_APPLIED 分支由 `ConfigDeploymentService` 验证 snapshot 版本、binding 的 Agent/snapshot 归属、apply event ID 和观察版本，再记录 ACK；Team deployment ACK 需命中对应的 Team member binding + Agent + snapshot/apply generation，冻结绑定作为 Gateway/NATS 内部身份的授权栅栏。仍需伪造 binding/Agent/snapshot 组合的集成负向用例覆盖。
 - `OutboxRelay` 通过持久 Outbox store 领取 due 事件并发布，按聚合 ID/版本排序；Relay 自身负责投递语义，不承担租户授权。消费侧需依据父级资源重验，因此 Outbox payload/subject 不能作为权限来源。
 - Scheduled Task HTTP 创建/列表/读取/暂停/恢复/触发等入口从当前 Principal 校验 tenant/project；配置 Repository 的查询与更新按 organization/tenant/project 条件过滤。后台 `ScheduledTaskScheduler` 通过单活 Scheduler lease 领取全局 due schedule，再从每条 schedule 的持久化 scope 构造受限 Principal，写入 Task spec 并调用正常 `TaskService.create`，run ID/Task ID 通过 schedule occurrence 做幂等关联。该后台角色是系统调度身份，须单独测试伪造/损坏 schedule scope、跨 Tenant 查询输入、lease 并发和重复触发恢复。
 - Task recovery checkpoint/state repository 多按 Task ID 查询，授权边界依赖触发者先通过 Task scope，或后台恢复器仅基于数据库事实执行。尚未确认所有恢复/一致性/质量消费者都在执行写入前验证父 Task/Attempt scope；这些消费者及其幂等/重试边界仍是 2A 未闭环项。
@@ -82,6 +84,8 @@ Controller 源码中能直接看到 `PrincipalContext`、`ProjectApiAuthorizatio
 - `ProjectController` 委托 `ProjectAuthorizationService` 与 invitation service；组织管理服务按 Platform Admin、Organization Admin 与显式 permission 检查入口。需要用普通项目成员、Tenant Admin、Organization Admin、Platform Admin 四类身份建立矩阵，不能只用 Controller route coverage 测试代替角色验证。
 - Internal Quota、Token Ledger、Task State Consistency 等端点使用 `X-AgentTeams-Internal-Token`，其中 Task State Consistency 使用常量时间比较；该共享 bearer token 不是 Tenant 身份。部署上必须通过私有网络入口隔离、各服务独立轮换凭据、严禁 worker-facing ingress 暴露这些路由，并在应用层验证请求中的 Task/Run scope 与真实父记录一致。
 - Skill 列表/读写通过 `SKILL` resource scope 可见性过滤；创建时允许全局或 Tenant/Organization ownership，须继续确认创建者权限、发布/扫描审批、包下载 URL 与后台扫描任务的 Tenant 归属。Audit、Usage 和 quota 的查询/汇总也需要确认先绑定 caller 可见项目集合，再做聚合，避免通过计数或筛选侧信道泄露其他 Tenant 信息。
+- `JdbcAuditQueryService` 在有 Principal 时把 audit 查询限定为 Principal 的 tenant/project；Organization/Platform management 权限由 `ManagementAuthorizationService` 单独检查角色。Tenant/Organization 管理数据允许对应管理角色跨 Project 查询，这是有意的管理面权限，必须与普通 Project member 的响应集合做区分验收。
+- Usage Budget Repository 对单租户写读使用 tenant/project 复合条件；周期任务由单活 lease 领取所有 active policy 时，需要确认每个 event 保留 policy 的 Tenant/Project 且告警 delivery 无跨 scope 汇总。Webhook Repository 的订阅查询按 organization/tenant/project 过滤；delivery worker 是系统身份，发送前要以 delivery row 所属订阅/secretRef 做一致性校验和 SSRF 保护。
 
 ## 证据级别与后续门槛
 
