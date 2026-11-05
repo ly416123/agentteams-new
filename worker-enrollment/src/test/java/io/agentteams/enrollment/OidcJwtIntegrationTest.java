@@ -173,6 +173,30 @@ class OidcJwtIntegrationTest {
     }
 
     @Test
+    void rejectsCrossTenantSessionRevocationAndLeavesSessionCredentialsActive() throws Exception {
+        MvcResult issueResult = mvc.perform(post("/api/v1/agents/{agentId}/sessions", AGENT_ID)
+                        .header("Authorization", "Bearer " + token(ISSUER, AUDIENCE))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"ttlSeconds\":3600,\"modelCredentialRef\":"
+                                + "\"vault://tenant-a/project-a/chatgpt\"}"))
+                .andExpect(status().isOk())
+                .andReturn();
+        JsonNode issued = objectMapper.readTree(issueResult.getResponse().getContentAsString());
+        UUID sessionId = UUID.fromString(issued.required("sessionId").asText());
+        UUID proxyCredentialId = UUID.fromString(issued.required("modelProxyCredentialId").asText());
+
+        mvc.perform(delete("/api/v1/agents/{agentId}/sessions/{sessionId}", AGENT_ID, sessionId)
+                        .header("Authorization", "Bearer "
+                                + token(ISSUER, AUDIENCE, "tenant-b", "project-a", "team-a")))
+                .andExpect(status().isNotFound());
+
+        assertThat(jdbc.queryForObject("SELECT revoked_at IS NULL FROM agent_sessions WHERE id = ?",
+                Boolean.class, sessionId)).isTrue();
+        assertThat(jdbc.queryForObject("SELECT revoked_at IS NULL FROM worker_model_proxy_credentials WHERE id = ?",
+                Boolean.class, proxyCredentialId)).isTrue();
+    }
+
+    @Test
     void rejectsLocallySignedTokenWithWrongAudience() throws Exception {
         mvc.perform(post("/api/v1/agents/{agentId}/sessions", AGENT_ID)
                         .header("Authorization", "Bearer " + token(ISSUER, "other-api")))
