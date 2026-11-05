@@ -72,6 +72,8 @@
 
 **Attempt 数据库查询实现（2026-11-05）：** `credential-proxy` 增加 JDBC repository，通过 PostgreSQL `SECURITY DEFINER` 函数查询唯一活动 Assignment/Attempt/Lease，并同时匹配 Agent 的 `WORKER` scope 与任务的 `TASK` scope。非登录函数 owner 只获必要列的 SELECT，代理查询组无底层表权限，只获函数 EXECUTE；脚本要求在共享 schema v121 完成后由数据库管理员应用。新增 4 项 PostgreSQL Testcontainers 验收（精确租户匹配、过期/其他租户过滤、多活动执行保留给 Resolver 拒绝、运行角色无法直接 SELECT）。本机没有 Docker，4 项集成测试本机跳过；CI 门禁要求 4 项全部真实执行。首次 CI 执行发现有效 Lease 测试夹具误设为立即到期，已修正；PR #1 GitHub Actions [run 42000585636](https://github.com/ly416123/agentteams-new/actions/runs/42000585636) 已通过 Maven、原 17 项 PostgreSQL/OIDC/Gateway 测试、新增 4 项 PostgreSQL 凭证代理测试、9 项 Resolver 测试及 Compose/shell 检查，均无跳过。模型代理凭据哈希查验、运行登录角色签发、Provider Secret 解析和 HTTP 流式转发仍未完成。
 
+**模型代理凭据签发与撤销绑定（2026-11-05）：** Enrollment API 现在可在 Worker session 签发请求中接收非敏感 `modelCredentialRef`，返回独立 `atp_` 模型代理 Token；Gateway Token 与代理 Token 分别只存 SHA-256，代理记录绑定 session、Agent、Tenant/Project/Team、凭据引用和相同到期时间。Enrollment DB role 只获同 scope 的代理凭据插入、撤销及最少元数据读取权，不能读取 Token 哈希或模型凭据引用；撤销 Gateway session 会在同一事务撤销关联代理凭据。`enroll-worker.sh` 可把两种 Token 写入各自 `0600` 文件。CI [run 42006053503](https://github.com/ly416123/agentteams-new/actions/runs/42006053503) 通过 18 项 PostgreSQL/OIDC/Gateway 集成、4 项 Credential Proxy PostgreSQL 测试、9 项 Resolver 单测及 Compose/shell 门禁，零跳过；新增测试验证代理 Token 哈希持久化、scope 限制和 Session 联动撤销。本机 8 项 Enrollment 服务单测通过，但本机没有 Docker，PostgreSQL 集成由 CI 执行。代理 HTTP 认证、Provider Secret 解析和流式转发尚未实现，`atp_` Token 当前不可直接用于模型调用。
+
 ## 批次 1：无 Kubernetes 固定容量 Compose POC
 
 1. 先从旧仓库构建并发布 Control Plane、Gateway、Worker 的固定版本 OCI 镜像；记录镜像 digest 和源 commit。
