@@ -46,6 +46,8 @@ Controller 源码中能直接看到 `PrincipalContext`、`ProjectApiAuthorizatio
 | Outbox / Domain Event / 后台 Job | `outbox_events`、`domain_events`、各类 reconciliation/recovery/quality 作业表 | 消费者从父资源回查 scope；payload/header 不单独授予权限；重投递保持幂等 |
 | PostgreSQL 运行身份 | Compose 当前让 Control Plane 使用初始化用户 `agentteams` | 必须先拆迁移/初始化与运行身份；超级用户/表 owner 会绕过普通 RLS，单独加 policy 不够 |
 
+对 v0.1.5 固定 tag 的迁移目录做只读扫描，没有发现业务迁移启用 `ENABLE ROW LEVEL SECURITY`、`FORCE ROW LEVEL SECURITY` 或 `CREATE POLICY`。因此当前业务表的租户边界是应用层 SQL/Service scope 检查，不是数据库全表 RLS。数据模型也混合三种模式：Conversation、Scheduled Task、MCP Connection、Token Ledger 等直接存 organization/tenant/project；Task、Agent、Team 等通过 `resource_scopes` 建立 scope；Task File、Artifact 等子对象依赖父 Task/Attempt 关联。`resource_scopes` 本身无指向各业务表的外键，跨资源一致性由写入服务维护。全表 RLS 的前置工作应先完成非 owner/非 superuser Control Plane 运行角色、可信事务 scope 注入、关键父子复合约束/触发器与逐表越权测试；只给现有 owner 角色加 policy 不形成有效隔离。
+
 异步路径包括 Outbox Relay、NATS execution event consumer、Task recovery/checkpoint、Scheduled Task、Team deployment timeout、Agent presence consistency、Artifact quality delivery 和内部一致性检查。它们不能复用“HTTP Principal 缺省即系统全权”的隐式规则；每种作业需有明确的系统身份和父资源 scope 验证。
 
 ## 已追踪的 Task API 调用链
@@ -90,7 +92,7 @@ Controller 源码中能直接看到 `PrincipalContext`、`ProjectApiAuthorizatio
 ## 证据级别与后续门槛
 
 - **源码发现：** v0.1.5 有 Project membership、`resource_scopes` 和应用层授权路径；`tasks` 等核心实体并非都直接存 Tenant/Project/Team 列。已有 Enrollment RLS 仅保护 `agents` 与 `agent_sessions` 的受限路径。
-- **尚未证明：** 上表所有 Controller 与服务调用链均无越权；MCP、Team、Skill、Audit/Usage 和管理 API 的所有读写、汇总及下载路径均执行正确 Tenant/Project/Team 检查；NATS TASK_EVENT/CONFIG_APPLIED 与所有恢复/一致性/质量消费者对篡改关联 ID 一律拒绝；所有逐行 Outbox 的 payload tenant 与父资源一致；固定 Compose 中 A/B Tenant 并发与同 Worker 连续 Attempt 的 Conversation/Workspace/Tool/Artifact 无残留；全业务表 RLS 可强制执行。
+- **尚未证明：** 上表所有 Controller 与服务调用链均无越权；MCP、Team、Skill、Audit/Usage 和管理 API 的所有读写、汇总及下载路径均执行正确 Tenant/Project/Team 检查；NATS TASK_EVENT/CONFIG_APPLIED 与所有恢复/一致性/质量消费者对篡改关联 ID 一律拒绝；所有逐行 Outbox 的 payload tenant 与父资源一致；固定 Compose 中 A/B Tenant 并发与同 Worker 连续 Attempt 的 Conversation/Workspace/Tool/Artifact 无残留；v0.1.5 业务 schema 没有 RLS，未来 RLS 方案尚未实现或验证。
 - **下一步 2A：** Conversation/Memory、Artifact/File、NATS 主执行事件、Scheduled Task、Team/MCP、组织管理和部分单活/Outbox 作业已追踪，但尚未形成逐方法仓储/迁移/测试闭环。继续完成 Task Event/Config event、恢复/质量/其他后台消费者、Skill/Audit/Usage 和内部端点的父级校验，再按身份矩阵核验角色；为每族记录有效身份、scope 来源、拒绝响应、现有测试和缺失测试。
 - **2A 出口条件：** 所有可访问 API 与异步消费者都映射到真实表和 scope 来源；每项未授权路径有可复现负向用例或明确的修复任务；任何尚未被证明的共享 Control Plane 能力继续标记为未验收。
 - **环境边界：** L5 的 v0.1.5 IdP issuer/JWKS 是 HTTP，当前只读 RBAC 不能确认 HTTPS Ingress；不能用 L5 旧 Worker Secret 替代新项目 Provider 凭据。上述源码盘点不宣称运行时多租户验收。
