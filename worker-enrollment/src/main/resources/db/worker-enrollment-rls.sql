@@ -7,10 +7,23 @@ CREATE TABLE IF NOT EXISTS worker_enrollment_agent_scopes (
     team_id TEXT NOT NULL
 );
 
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'worker_enrollment_scope_owner') THEN
+        CREATE ROLE worker_enrollment_scope_owner
+            NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+    END IF;
+END;
+$$;
+ALTER ROLE worker_enrollment_scope_owner
+    WITH NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+ALTER TABLE worker_enrollment_agent_scopes OWNER TO worker_enrollment_scope_owner;
+
 CREATE OR REPLACE FUNCTION worker_enrollment_sync_agent_scope()
 RETURNS trigger
 LANGUAGE plpgsql
-SET search_path = pg_catalog, public
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
     agent_scope JSONB := NEW.metadata -> 'scope';
@@ -30,6 +43,9 @@ BEGIN
     RETURN NEW;
 END;
 $$;
+
+ALTER FUNCTION worker_enrollment_sync_agent_scope() OWNER TO worker_enrollment_scope_owner;
+REVOKE ALL ON FUNCTION worker_enrollment_sync_agent_scope() FROM PUBLIC;
 
 DROP TRIGGER IF EXISTS worker_enrollment_sync_agent_scope ON agents;
 CREATE TRIGGER worker_enrollment_sync_agent_scope

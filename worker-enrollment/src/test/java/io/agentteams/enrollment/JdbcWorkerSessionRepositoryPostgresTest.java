@@ -62,6 +62,7 @@ class JdbcWorkerSessionRepositoryPostgresTest {
         jdbc.execute("CREATE ROLE worker_enrollment LOGIN PASSWORD 'enrollment-test-password' NOSUPERUSER NOBYPASSRLS");
         jdbc.execute("GRANT CONNECT ON DATABASE enrollment_test TO worker_enrollment");
         jdbc.execute("GRANT USAGE ON SCHEMA public TO worker_enrollment");
+        jdbc.execute("CREATE ROLE worker_enrollment_scope_owner LOGIN BYPASSRLS");
         applyEnrollmentRls();
         repository = new JdbcWorkerSessionRepository(jdbc);
     }
@@ -146,6 +147,47 @@ class JdbcWorkerSessionRepositoryPostgresTest {
         assertThatThrownBy(
                 () -> restrictedJdbc.update("UPDATE agents SET phase = 'TERMINATED' WHERE id = ?", AGENT_ID))
                 .isInstanceOf(org.springframework.dao.DataAccessException.class);
+    }
+
+    @Test
+    void agentScopeTriggerCanSyncWithoutGrantingWriterDirectScopeTableAccess() {
+        UUID writerAgentId = UUID.fromString("66000000-0000-0000-0000-000000000006");
+        jdbc.execute("CREATE ROLE agent_writer LOGIN PASSWORD 'agent-writer-test-password' NOSUPERUSER NOBYPASSRLS");
+        jdbc.execute("GRANT USAGE ON SCHEMA public TO agent_writer");
+        jdbc.execute("GRANT SELECT (id) ON agents TO agent_writer");
+        jdbc.execute("GRANT INSERT (id, name, phase, metadata) ON agents TO agent_writer");
+        jdbc.execute("GRANT UPDATE (metadata) ON agents TO agent_writer");
+        jdbc.execute("CREATE POLICY agent_writer_read ON agents FOR SELECT TO agent_writer USING (true)");
+        jdbc.execute("CREATE POLICY agent_writer_write ON agents FOR ALL TO agent_writer USING (true) WITH CHECK (true)");
+        JdbcTemplate writer = new JdbcTemplate(new DriverManagerDataSource(
+                POSTGRES.getJdbcUrl(), "agent_writer", "agent-writer-test-password"));
+
+        writer.update(
+                "INSERT INTO agents(id, name, phase, metadata) VALUES (?, ?, ?, ?::jsonb)",
+                writerAgentId, "agent-writer", "READY",
+                "{\"scope\":{\"tenant\":\"tenant-a\",\"project\":\"project-a\",\"team\":\"team-a\"}}");
+        assertThat(jdbc.queryForMap("SELECT tenant_id, project_id, team_id "
+                        + "FROM worker_enrollment_agent_scopes WHERE agent_id = ?", writerAgentId))
+                .containsEntry("tenant_id", "tenant-a")
+                .containsEntry("project_id", "project-a")
+                .containsEntry("team_id", "team-a");
+        writer.update("UPDATE agents SET metadata = ?::jsonb WHERE id = ?",
+                "{\"scope\":{\"tenant\":\"tenant-b\",\"project\":\"project-b\",\"team\":\"team-b\"}}",
+                writerAgentId);
+        assertThat(jdbc.queryForMap("SELECT tenant_id, project_id, team_id "
+                        + "FROM worker_enrollment_agent_scopes WHERE agent_id = ?", writerAgentId))
+                .containsEntry("tenant_id", "tenant-b")
+                .containsEntry("project_id", "project-b")
+                .containsEntry("team_id", "team-b");
+        writer.update("UPDATE agents SET metadata = '{}'::jsonb WHERE id = ?", writerAgentId);
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM worker_enrollment_agent_scopes WHERE agent_id = ?",
+                Long.class, writerAgentId)).isZero();
+        assertThat(jdbc.queryForObject("SELECT rolsuper OR rolbypassrls OR rolcanlogin "
+                        + "FROM pg_roles WHERE rolname = 'worker_enrollment_scope_owner'", Boolean.class))
+                .isFalse();
+        assertThat(jdbc.queryForObject("SELECT has_table_privilege('agent_writer', "
+                        + "'worker_enrollment_agent_scopes', 'INSERT')", Boolean.class))
+                .isFalse();
     }
 
     @Test
@@ -256,6 +298,14 @@ class JdbcWorkerSessionRepositoryPostgresTest {
     }
 
     private void removeTestRoleIfPresent() {
+        Boolean writerExists = jdbc.queryForObject(
+                "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'agent_writer')", Boolean.class);
+        if (Boolean.TRUE.equals(writerExists)) {
+            jdbc.execute("DROP POLICY IF EXISTS agent_writer_write ON agents");
+            jdbc.execute("DROP POLICY IF EXISTS agent_writer_read ON agents");
+            jdbc.execute("DROP OWNED BY agent_writer");
+            jdbc.execute("DROP ROLE agent_writer");
+        }
         Boolean exists = jdbc.queryForObject(
                 "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'worker_enrollment')", Boolean.class);
         if (Boolean.TRUE.equals(exists)) {
@@ -265,12 +315,13 @@ class JdbcWorkerSessionRepositoryPostgresTest {
                     + "ON worker_enrollment_agent_scopes");
             jdbc.execute("ALTER TABLE agents DISABLE ROW LEVEL SECURITY");
             jdbc.execute("ALTER TABLE agent_sessions DISABLE ROW LEVEL SECURITY");
-            jdbc.execute("ALTER TABLE worker_enrollment_agent_scopes DISABLE ROW LEVEL SECURITY");
             jdbc.execute("DROP TRIGGER IF EXISTS worker_enrollment_sync_agent_scope ON agents");
             jdbc.execute("DROP FUNCTION IF EXISTS worker_enrollment_sync_agent_scope()");
             jdbc.execute("DROP OWNED BY worker_enrollment");
             jdbc.execute("DROP ROLE worker_enrollment");
             jdbc.execute("DROP TABLE IF EXISTS worker_enrollment_agent_scopes");
+            jdbc.execute("DROP OWNED BY worker_enrollment_scope_owner");
+            jdbc.execute("DROP ROLE worker_enrollment_scope_owner");
         }
     }
 }

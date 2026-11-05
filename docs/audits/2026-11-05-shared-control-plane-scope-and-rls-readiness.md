@@ -49,7 +49,7 @@
 
 ## RLS 结论与实施顺序
 
-1. 保持当前 Enrollment RLS：独立角色、非表 owner、无 `BYPASSRLS`、事务局部 scope、缺失 scope 默认拒绝。
+1. 保持当前 Enrollment RLS：独立角色、非表 owner、无 `BYPASSRLS`、事务局部 scope、缺失 scope 默认拒绝。Enrollment 不读取 `agents.metadata`；数据库触发器同步 scope 窄列表。触发函数归属只拥有该索引的 `NOLOGIN`、非 superuser、无 `BYPASSRLS` 角色，写 Agent 的服务角色无权直接改 scope 索引。
 2. 在使用固定 Control Plane 前，以真实 OIDC Principal 对 Task、Attempt、Conversation、Artifact、MCP/Skill/Model 及管理 API 执行跨 Tenant/Project/Team ID 猜测和变更负向测试；检查所有 Controller、后台消费者与运维端点。
 3. 若要求 PostgreSQL 本身强制全系统隔离，先拆分超级用户初始化/迁移账号与非 superuser、非 owner 的 Control Plane 运行角色；再在目标运行时实现每请求事务级 `ExecutionContext` 注入，并给后台消费者独立的系统 scope。
 4. 按实际外键逐表启用 RLS：父子资源使用 `USING` 与 `WITH CHECK`；`resource_scopes` 资源验证真实父 Project；Outbox 先显式携带并验证 scope。连接池同物理连接跨 Tenant 复用、无 scope、写入越权和角色绕过测试均纳入门禁。
