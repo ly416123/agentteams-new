@@ -2,68 +2,36 @@ diff --git a/control-plane/src/main/java/io/agentteams/controlplane/ControlPlane
 index 3e59349..693a19f 100644
 --- a/control-plane/src/main/java/io/agentteams/controlplane/ControlPlaneConfiguration.java
 +++ b/control-plane/src/main/java/io/agentteams/controlplane/ControlPlaneConfiguration.java
-@@ -5,6 +5,7 @@ import io.agentteams.application.api.ConfigEventPort;
- import io.agentteams.application.api.TaskExecutionObservationPort;
- import io.agentteams.application.api.TaskCommandPort;
- import io.agentteams.controlplane.application.ControlPlaneExecutionEventAdapter;
+@@ -7,0 +8 @@ import io.agentteams.controlplane.application.ControlPlaneExecutionEventAdapter;
 +import io.agentteams.controlplane.application.TaskEventScopeGuard;
- import io.agentteams.controlplane.application.ControlPlaneTaskCommandAdapter;
- import io.agentteams.controlplane.application.ControlPlaneConfigEventAdapter;
- import io.agentteams.controlplane.outbox.EventPublisher;
-@@ -720,9 +721,10 @@ public class ControlPlaneConfiguration {
-     @Bean
-     @org.springframework.boot.autoconfigure.condition.ConditionalOnBean(ExecutionEventService.class)
-     ExecutionEventPort executionEventPort(ExecutionEventService executionEvents, DataSource dataSource,
+@@ -723 +724,2 @@ public class ControlPlaneConfiguration {
 -            TaskExecutionObservationPort observations) {
 +            TaskExecutionObservationPort observations, TaskEventScopeGuard taskEventScopeGuard) {
 +        org.springframework.jdbc.core.JdbcTemplate jdbc = new org.springframework.jdbc.core.JdbcTemplate(dataSource);
-         return new ControlPlaneExecutionEventAdapter(executionEvents,
+@@ -725 +727 @@ public class ControlPlaneConfiguration {
 -                new JdbcModelCallAuditRecorder(new org.springframework.jdbc.core.JdbcTemplate(dataSource)), observations);
 +                new JdbcModelCallAuditRecorder(jdbc), observations, taskEventScopeGuard);
-     }
- 
-     @Bean
 diff --git a/control-plane/src/main/java/io/agentteams/controlplane/application/ControlPlaneExecutionEventAdapter.java b/control-plane/src/main/java/io/agentteams/controlplane/application/ControlPlaneExecutionEventAdapter.java
 index dcc48ef..4568d23 100644
 --- a/control-plane/src/main/java/io/agentteams/controlplane/application/ControlPlaneExecutionEventAdapter.java
 +++ b/control-plane/src/main/java/io/agentteams/controlplane/application/ControlPlaneExecutionEventAdapter.java
-@@ -23,6 +23,7 @@ public final class ControlPlaneExecutionEventAdapter implements ExecutionEventPo
-     private final ExecutionEventService executionEvents;
-     private final ModelCallAuditRecorder modelCallAudits;
-     private final TaskExecutionObservationPort observations;
+@@ -25,0 +26 @@ public final class ControlPlaneExecutionEventAdapter implements ExecutionEventPo
 +    private final TaskEventScopeGuard taskEventScopeGuard;
- 
-     public ControlPlaneExecutionEventAdapter(ExecutionEventService executionEvents) {
-         this(executionEvents, ModelCallAuditRecorder.noop(), TaskExecutionObservationPort.noop());
-@@ -35,9 +36,16 @@ public final class ControlPlaneExecutionEventAdapter implements ExecutionEventPo
- 
-     public ControlPlaneExecutionEventAdapter(ExecutionEventService executionEvents,
-             ModelCallAuditRecorder modelCallAudits, TaskExecutionObservationPort observations) {
+@@ -37,0 +39,6 @@ public final class ControlPlaneExecutionEventAdapter implements ExecutionEventPo
 +        this(executionEvents, modelCallAudits, observations, TaskEventScopeGuard.rejectAll());
 +    }
 +
 +    public ControlPlaneExecutionEventAdapter(ExecutionEventService executionEvents,
 +            ModelCallAuditRecorder modelCallAudits, TaskExecutionObservationPort observations,
 +            TaskEventScopeGuard taskEventScopeGuard) {
-         this.executionEvents = Objects.requireNonNull(executionEvents, "executionEvents");
-         this.modelCallAudits = Objects.requireNonNull(modelCallAudits, "modelCallAudits");
-         this.observations = Objects.requireNonNull(observations, "observations");
+@@ -40,0 +48 @@ public final class ControlPlaneExecutionEventAdapter implements ExecutionEventPo
 +        this.taskEventScopeGuard = Objects.requireNonNull(taskEventScopeGuard, "taskEventScopeGuard");
-     }
- 
-     @Override
-@@ -96,8 +104,9 @@ public final class ControlPlaneExecutionEventAdapter implements ExecutionEventPo
-         Objects.requireNonNull(command, "command");
-         // runId 与既有 observe(...) 相同：run == attempt。白名单与范围校验
-         // 由观测适配器二次校验（不信任上游）。
+@@ -99,2 +107,3 @@ public final class ControlPlaneExecutionEventAdapter implements ExecutionEventPo
 -        observations.observed(taskId, command.attemptId(), command.eventId(), command.occurredAt(),
 -                command.correlationId(), command.eventType(), command.payloadJson());
 +        taskEventScopeGuard.runIfActive(taskId, command, () -> observations.observed(taskId,
 +                command.attemptId(), command.eventId(), command.occurredAt(), command.correlationId(),
 +                command.eventType(), command.payloadJson()));
-     }
- 
-     private static ArtifactRecord toRecord(UUID taskId, UUID attemptId, UUID eventId, Instant at,
 diff --git a/control-plane/src/main/java/io/agentteams/controlplane/application/JdbcTaskEventScopeGuard.java b/control-plane/src/main/java/io/agentteams/controlplane/application/JdbcTaskEventScopeGuard.java
 new file mode 100644
 index 0000000..fafe4d9
@@ -161,19 +129,10 @@ diff --git a/control-plane/src/test/java/io/agentteams/controlplane/application/
 index b576d6e..22dd0b4 100644
 --- a/control-plane/src/test/java/io/agentteams/controlplane/application/ControlPlaneExecutionEventAdapterTest.java
 +++ b/control-plane/src/test/java/io/agentteams/controlplane/application/ControlPlaneExecutionEventAdapterTest.java
-@@ -4,6 +4,8 @@ import static org.mockito.ArgumentMatchers.any;
- import static org.mockito.ArgumentMatchers.eq;
- import static org.mockito.Mockito.mock;
- import static org.mockito.Mockito.verify;
+@@ -6,0 +7,2 @@ import static org.mockito.Mockito.verify;
 +import static org.mockito.Mockito.never;
 +import static org.mockito.Mockito.when;
- 
- import io.agentteams.application.api.ExecutionEventPort;
- import io.agentteams.application.api.TaskExecutionObservationPort;
-@@ -15,6 +17,44 @@ import java.util.UUID;
- import org.junit.jupiter.api.Test;
- 
- class ControlPlaneExecutionEventAdapterTest {
+@@ -17,0 +20,38 @@ class ControlPlaneExecutionEventAdapterTest {
 +    @Test
 +    void dropsTaskEventWhenActiveExecutionScopeDoesNotMatch() {
 +        UUID taskId = UUID.randomUUID();
@@ -212,20 +171,13 @@ index b576d6e..22dd0b4 100644
 +                eq(command.payloadJson()));
 +    }
 +
-     @Test
-     void publishesTerminalSuccessToTheTaskExecutionObservationProjection() {
-         UUID taskId = UUID.randomUUID();
-@@ -39,4 +79,10 @@ class ControlPlaneExecutionEventAdapterTest {
-         verify(observations).completed(eq(taskId), eq(attemptId), eq(eventId), eq(occurredAt), eq("corr-1"),
-                 eq(""), eq(List.of(artifact)));
-     }
+@@ -41,0 +82,6 @@ class ControlPlaneExecutionEventAdapterTest {
 +
 +    private static ExecutionEventPort.TaskEventReportCommand taskEventCommand() {
 +        return new ExecutionEventPort.TaskEventReportCommand(UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID(),
 +                Instant.parse("2026-09-07T00:00:00Z"), UUID.randomUUID().toString(), "tool.started", "{}", 1,
 +                "corr-1");
 +    }
- }
 diff --git a/control-plane/src/test/java/io/agentteams/controlplane/application/JdbcTaskEventScopeGuardPostgresTest.java b/control-plane/src/test/java/io/agentteams/controlplane/application/JdbcTaskEventScopeGuardPostgresTest.java
 new file mode 100644
 index 0000000..da9d31b
@@ -371,19 +323,338 @@ diff --git a/deploy/docker/control-plane.Dockerfile b/deploy/docker/control-plan
 index 66e64ff..4981640 100644
 --- a/deploy/docker/control-plane.Dockerfile
 +++ b/deploy/docker/control-plane.Dockerfile
-@@ -1,13 +1,13 @@
- # Java bytecode is platform independent; compile on BUILDPLATFORM and keep
- # only the runtime image on TARGETPLATFORM.
+@@ -3 +3 @@
 -FROM --platform=$BUILDPLATFORM maven:3.9.16-eclipse-temurin-21 AS build
 +FROM --platform=$BUILDPLATFORM dockerproxy.net/library/maven@sha256:99e61abcff91a9b1333463bd8451fb18495d6eba9250ac66a338b518f8278320 AS build
- WORKDIR /workspace
- COPY deploy/docker/maven-settings.xml /root/.m2/settings.xml
- COPY . .
- RUN mvn -q -pl control-plane -am -DskipTests install
- RUN mvn -q -pl control-plane -DskipTests package spring-boot:repackage
- 
+@@ -10 +10 @@ RUN mvn -q -pl control-plane -DskipTests package spring-boot:repackage
 -FROM eclipse-temurin:21-jre
 +FROM dockerproxy.net/library/eclipse-temurin@sha256:0b99b3376fbb50dbf9c0af8535fdd5b8eb0d3fdfc8b1e4967f383b6919f6901a
- WORKDIR /app
- COPY --from=build /workspace/control-plane/target/agentteams-control-plane-0.1.0-SNAPSHOT.jar /app/app.jar
- USER 10001
+diff --git a/integration-tests/src/test/java/io/agentteams/it/FakeAgent.java b/integration-tests/src/test/java/io/agentteams/it/FakeAgent.java
+index 60c40b6..23e1a46 100644
+--- a/integration-tests/src/test/java/io/agentteams/it/FakeAgent.java
++++ b/integration-tests/src/test/java/io/agentteams/it/FakeAgent.java
+@@ -19,0 +20 @@ import io.agentteams.contracts.v1.TaskProgress;
++import io.agentteams.contracts.v1.TaskEventReport;
+@@ -156,0 +158,13 @@ final class FakeAgent implements AutoCloseable {
++    void reportTaskEventForTask(TaskAssigned assignment, String targetTaskId, String eventId) {
++        EventMetadata metadata = taskMetadata(assignment, eventId, 6).toBuilder()
++                .setTaskId(targetTaskId)
++                .setAttemptId(UUID.randomUUID().toString())
++                .build();
++        requests.onNext(AgentMessage.newBuilder().setTaskEventReport(TaskEventReport.newBuilder()
++                .setMetadata(metadata)
++                .setSequence(1)
++                .setEventType("tool.called")
++                .setPayload(com.google.protobuf.ByteString.copyFromUtf8("{\"marker\":\"cross-tenant\"}"))
++                .build()).build());
++    }
++
+diff --git a/integration-tests/src/test/java/io/agentteams/it/TaskEventScopeEndToEndIT.java b/integration-tests/src/test/java/io/agentteams/it/TaskEventScopeEndToEndIT.java
+new file mode 100644
+index 0000000..d0b1985
+--- /dev/null
++++ b/integration-tests/src/test/java/io/agentteams/it/TaskEventScopeEndToEndIT.java
+@@ -0,0 +1,303 @@
++package io.agentteams.it;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++import com.fasterxml.jackson.databind.JsonNode;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import io.agentteams.contracts.v1.ProtocolVersion;
++import io.agentteams.gateway.AgentGatewayGrpcServer;
++import io.agentteams.gateway.AgentStatePort;
++import io.agentteams.gateway.JdbcAgentStateStore;
++import io.nats.client.Connection;
++import io.nats.client.JetStreamManagement;
++import io.nats.client.Nats;
++import io.nats.client.api.StorageType;
++import io.nats.client.api.StreamConfiguration;
++import java.net.URI;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
++import java.security.MessageDigest;
++import java.security.SecureRandom;
++import java.time.Duration;
++import java.util.Base64;
++import java.util.Map;
++import java.util.UUID;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.TimeUnit;
++import java.util.function.BooleanSupplier;
++import javax.sql.DataSource;
++import org.junit.jupiter.api.AfterAll;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.Test;
++import org.springframework.boot.builder.SpringApplicationBuilder;
++import org.springframework.boot.web.context.WebServerApplicationContext;
++import org.springframework.context.ConfigurableApplicationContext;
++import org.springframework.jdbc.core.JdbcTemplate;
++import org.testcontainers.containers.GenericContainer;
++import org.testcontainers.containers.PostgreSQLContainer;
++import org.testcontainers.junit.jupiter.Container;
++import org.testcontainers.junit.jupiter.Testcontainers;
++import org.testcontainers.utility.DockerImageName;
++
++/** Real gRPC -> Gateway -> JetStream -> Control Plane negative tenant-boundary acceptance. */
++@Testcontainers(disabledWithoutDocker = true)
++class TaskEventScopeEndToEndIT {
++    private static final String DATABASE_USER = "agentteams";
++    private static final String DATABASE_PASSWORD = "agentteams-dev";
++    private static final String TENANT_A = "tenant-a";
++    private static final String PROJECT_A = "project-a";
++    private static final String TEAM_A = "team-a";
++    private static final SecureRandom RANDOM = new SecureRandom();
++    private static final Map<UUID, String> SESSION_TOKENS = new ConcurrentHashMap<>();
++    private static final ObjectMapper JSON = new ObjectMapper();
++
++    @Container
++    static final PostgreSQLContainer<?> POSTGRES = new PostgreSQLContainer<>(DockerImageName.parse("postgres:16-alpine"))
++            .withDatabaseName("agentteams").withUsername(DATABASE_USER).withPassword(DATABASE_PASSWORD);
++
++    @Container
++    static final GenericContainer<?> NATS = new GenericContainer<>(DockerImageName.parse("nats:2.10-alpine"))
++            .withCommand("-js").withExposedPorts(4222);
++
++    private static ConfigurableApplicationContext controlPlane;
++    private static ConfigurableApplicationContext gateway;
++    private static Connection natsConnection;
++
++    @BeforeAll
++    static void startApplications() throws Exception {
++        natsConnection = Nats.connect(natsUrl());
++        createStreams(natsConnection.jetStreamManagement());
++        controlPlane = new SpringApplicationBuilder(io.agentteams.controlplane.ControlPlaneApplication.class)
++                .run(commandLineProperties(controlPlaneProperties()));
++        gateway = new SpringApplicationBuilder(io.agentteams.gateway.AgentGatewayApplication.class)
++                .run(commandLineProperties(gatewayProperties()));
++    }
++
++    @AfterAll
++    static void stopApplications() {
++        if (gateway != null) gateway.close();
++        if (controlPlane != null) controlPlane.close();
++        if (natsConnection != null) {
++            try { natsConnection.close(); } catch (InterruptedException interrupted) {
++                Thread.currentThread().interrupt();
++            }
++        }
++    }
++
++    @Test
++    void rejectsCrossTenantTaskEventWithoutRunProcessOrWebhookSideEffects() throws Exception {
++        assertNotNull(controlPlane);
++        assertEquals(JdbcAgentStateStore.class, gateway.getBean(AgentStatePort.class).getClass());
++        UUID agentId = createAgent();
++        try (FakeAgent agent = FakeAgent.connect("127.0.0.1", gatewayPort(), agentId.toString(),
++                ProtocolVersion.newBuilder().setMajor(2).setMinor(3).build(), Map.of("tasks", "1"),
++                SESSION_TOKENS.get(agentId))) {
++            agent.awaitReady();
++            UUID sourceTaskId = createQueuedTask();
++            var assignment = agent.awaitTaskAssigned(sourceTaskId.toString());
++            agent.accept(assignment);
++            agent.progress(assignment);
++            awaitTaskPhase(sourceTaskId, "RUNNING");
++            UUID targetTaskId = createUnqueuedTenantBTask();
++            UUID eventId = UUID.randomUUID();
++            createTenantBWebhook();
++            long previousStreamSequence = natsConnection.jetStreamManagement()
++                    .getStreamInfo("AGENT_EVENTS").getStreamState().getLastSequence();
++
++            agent.reportTaskEventForTask(assignment, targetTaskId.toString(), eventId.toString());
++            long eventStreamSequence = awaitPublishedTaskEvent(previousStreamSequence, targetTaskId, eventId);
++            awaitConsumerAck(eventStreamSequence);
++
++            assertEquals(0, countByTask("task_runs", targetTaskId), "cross-tenant event must not create a Run");
++            assertEquals(0, countByTask("task_process_events", targetTaskId),
++                    "cross-tenant event must not write a process event");
++            assertEquals(0, countByEvent("webhook_deliveries", eventId),
++                    "cross-tenant event must not enqueue a Webhook delivery");
++        }
++    }
++
++    private static UUID createAgent() throws Exception {
++        JsonNode response = postJson("/api/v1/agents", "agent-" + UUID.randomUUID(), """
++                {"name":"scope-e2e-%s","runtime":"fake-agent","capabilities":{"tasks":"1"},"metadata":{}}
++                """.formatted(UUID.randomUUID()));
++        UUID agentId = UUID.fromString(response.path("id").asText());
++        bindScope("WORKER", agentId, TENANT_A, PROJECT_A, TEAM_A);
++        String token = "ats_" + Base64.getUrlEncoder().withoutPadding().encodeToString(randomBytes(32));
++        jdbc().update("""
++                INSERT INTO agent_sessions(id, agent_id, token_sha256, expires_at, created_at)
++                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
++                """, UUID.randomUUID(), agentId, sha256(token.getBytes(StandardCharsets.UTF_8)),
++                java.sql.Timestamp.from(java.time.Instant.now().plus(Duration.ofHours(1))));
++        SESSION_TOKENS.put(agentId, token);
++        return agentId;
++    }
++
++    private static UUID createQueuedTask() throws Exception {
++        UUID taskId = createTask("tenant A active worker task");
++        bindScope("TASK", taskId, TENANT_A, PROJECT_A, TEAM_A);
++        postJson("/api/v1/tasks/" + taskId + "/queue", "queue-" + UUID.randomUUID(), "{}");
++        return taskId;
++    }
++
++    private static UUID createUnqueuedTenantBTask() throws Exception {
++        UUID taskId = createTask("tenant B target task");
++        bindScope("TASK", taskId, "tenant-b", "project-b", "team-b");
++        return taskId;
++    }
++
++    private static UUID createTask(String title) throws Exception {
++        JsonNode response = postJson("/api/v1/tasks", "task-" + UUID.randomUUID(), """
++                {"title":"%s","description":"TASK_EVENT scope acceptance","spec":{"taskType":"demo"}}
++                """.formatted(title));
++        return UUID.fromString(response.path("id").asText());
++    }
++
++    private static void createTenantBWebhook() {
++        jdbc().update("""
++                INSERT INTO webhook_subscriptions
++                    (id, organization_id, tenant_id, project_id, endpoint, secret_ref, event_types, enabled,
++                     version, created_at, updated_at)
++                VALUES (?, 'legacy:tenant-b', 'tenant-b', 'project-b', ?, ?, ?::jsonb, TRUE, 0,
++                        CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
++                """, UUID.randomUUID(), "http://127.0.0.1:9/cross-tenant-test", "integration-secret-ref",
++                "[\"task.process\"]");
++    }
++
++    private static void bindScope(String type, UUID id, String tenant, String project, String team) {
++        jdbc().update("""
++                INSERT INTO resource_scopes(resource_type, resource_id, tenant_id, project_id, team,
++                                            created_at, updated_at)
++                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
++                """, type, id, tenant, project, team);
++    }
++
++    private static void awaitTaskPhase(UUID taskId, String expected) {
++        long deadline = System.nanoTime() + Duration.ofSeconds(15).toNanos();
++        while (System.nanoTime() < deadline) {
++            String phase = jdbc().queryForObject("SELECT phase FROM tasks WHERE id = ?", String.class, taskId);
++            if (expected.equals(phase)) return;
++            Thread.yield();
++        }
++        assertEquals(expected, jdbc().queryForObject("SELECT phase FROM tasks WHERE id = ?", String.class, taskId));
++    }
++
++    private static int countByTask(String table, UUID taskId) {
++        if (!java.util.Set.of("task_runs", "task_process_events").contains(table)) {
++            throw new IllegalArgumentException("unsupported table");
++        }
++        Integer count = jdbc().queryForObject("SELECT count(*) FROM " + table + " WHERE task_id = ?",
++                Integer.class, taskId);
++        return count == null ? 0 : count;
++    }
++
++    private static int countByEvent(String table, UUID eventId) {
++        if (!"webhook_deliveries".equals(table)) throw new IllegalArgumentException("unsupported table");
++        Integer count = jdbc().queryForObject("SELECT count(*) FROM webhook_deliveries WHERE event_id = ?",
++                Integer.class, eventId);
++        return count == null ? 0 : count;
++    }
++
++    private static long awaitPublishedTaskEvent(long previousSequence, UUID taskId, UUID eventId) throws Exception {
++        long deadline = System.nanoTime() + Duration.ofSeconds(15).toNanos();
++        while (System.nanoTime() < deadline) {
++            long lastSequence = natsConnection.jetStreamManagement()
++                    .getStreamInfo("AGENT_EVENTS").getStreamState().getLastSequence();
++            for (long sequence = previousSequence + 1; sequence <= lastSequence; sequence++) {
++                JsonNode envelope = JSON.readTree(natsConnection.jetStreamManagement()
++                        .getMessage("AGENT_EVENTS", sequence).getData());
++                if (eventId.toString().equals(envelope.path("taskEventReport").path("eventId").asText())) {
++                    assertEquals("TASK_EVENT", envelope.path("type").asText());
++                    assertEquals(taskId.toString(), envelope.path("taskId").asText());
++                    return sequence;
++                }
++            }
++            Thread.yield();
++        }
++        throw new AssertionError("Gateway must publish the cross-tenant TASK_EVENT to JetStream");
++    }
++
++    private static void awaitConsumerAck(long expectedSequence) {
++        long deadline = System.nanoTime() + Duration.ofSeconds(15).toNanos();
++        while (System.nanoTime() < deadline) {
++            try {
++                var info = natsConnection.jetStreamManagement()
++                        .getConsumerInfo("AGENT_EVENTS", "control-plane-execution-events");
++                if (info.getAckFloor() != null && info.getAckFloor().getStreamSequence() >= expectedSequence) return;
++            } catch (Exception ignored) { }
++            Thread.yield();
++        }
++        assertTrue(false, "Control Plane must ACK the injected TASK_EVENT");
++    }
++
++    private static void createStreams(JetStreamManagement management) throws Exception {
++        management.addStream(StreamConfiguration.builder().name("TASK_EVENTS")
++                .subjects("task.events.*").storageType(StorageType.Memory).build());
++        management.addStream(StreamConfiguration.builder().name("AGENT_EVENTS")
++                .subjects("agent.events.*").storageType(StorageType.Memory).build());
++    }
++
++    private static String[] controlPlaneProperties() {
++        return new String[] {"server.address=127.0.0.1", "server.port=0", "spring.datasource.url=" + POSTGRES.getJdbcUrl(),
++                "spring.datasource.username=" + DATABASE_USER, "spring.datasource.password=" + DATABASE_PASSWORD,
++                "agentteams.scheduler.enabled=true", "agentteams.scheduler.poll-interval-ms=100",
++                "agentteams.nats.enabled=true", "agentteams.nats.url=" + natsUrl(),
++                "agentteams.outbox.relay.enabled=true", "agentteams.outbox.relay.poll-interval-ms=100",
++                "agentteams.storage.enabled=false"};
++    }
++
++    private static String[] gatewayProperties() {
++        return new String[] {"spring.main.web-application-type=none", "spring.datasource.url=" + POSTGRES.getJdbcUrl(),
++                "spring.datasource.username=" + DATABASE_USER, "spring.datasource.password=" + DATABASE_PASSWORD,
++                "spring.flyway.enabled=false", "management.endpoint.health.group.readiness.include=readinessState",
++                "management.endpoint.health.validate-group-membership=false", "agentteams.gateway.grpc.port=0",
++                "agentteams.gateway.nats.enabled=true", "agentteams.gateway.nats.url=" + natsUrl(),
++                "agentteams.gateway.nats.subject=task.events.*",
++                "agentteams.gateway.nats.durable=agent-gateway-task-event-scope-it",
++                "agentteams.gateway.nats.instance-id=task-event-scope-it"};
++    }
++
++    private static String[] commandLineProperties(String[] values) {
++        return java.util.Arrays.stream(values).map(value -> "--" + value).toArray(String[]::new);
++    }
++
++    private static JsonNode postJson(String path, String idempotencyKey, String body) throws Exception {
++        var request = HttpRequest.newBuilder().uri(URI.create("http://127.0.0.1:" + controlPlanePort() + path))
++                .header("Content-Type", "application/json").header("Idempotency-Key", idempotencyKey)
++                .POST(HttpRequest.BodyPublishers.ofString(body)).build();
++        HttpResponse<String> response = HttpClient.newHttpClient().send(request, HttpResponse.BodyHandlers.ofString());
++        assertTrue(response.statusCode() >= 200 && response.statusCode() < 300,
++                "unexpected HTTP " + response.statusCode() + ": " + response.body());
++        return JSON.readTree(response.body());
++    }
++
++    private static void awaitReady(BooleanSupplier ready, String message) {
++        long deadline = System.nanoTime() + Duration.ofSeconds(15).toNanos();
++        while (System.nanoTime() < deadline) {
++            if (ready.getAsBoolean()) return;
++            Thread.yield();
++        }
++        assertTrue(ready.getAsBoolean(), message);
++    }
++
++    private static int controlPlanePort() {
++        return ((WebServerApplicationContext) controlPlane).getWebServer().getPort();
++    }
++
++    private static int gatewayPort() {
++        return gateway.getBean(AgentGatewayGrpcServer.class).port();
++    }
++
++    private static JdbcTemplate jdbc() { return new JdbcTemplate(controlPlane.getBean(DataSource.class)); }
++
++    private static String natsUrl() { return "nats://" + NATS.getHost() + ":" + NATS.getMappedPort(4222); }
++
++    private static byte[] randomBytes(int size) { byte[] value = new byte[size]; RANDOM.nextBytes(value); return value; }
++
++    private static String sha256(byte[] value) throws Exception {
++        return java.util.HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(value));
++    }
++}

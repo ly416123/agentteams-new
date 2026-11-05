@@ -70,6 +70,12 @@ def require_tests(source: Path) -> None:
                 or suite.attrib["failures"] != "0" or suite.attrib["errors"] != "0"):
             raise RuntimeError(f"required Control Plane test gate failed: {class_name}: {suite.attrib}")
 
+    report = source / "integration-tests/target/failsafe-reports/TEST-io.agentteams.it.TaskEventScopeEndToEndIT.xml"
+    suite = ET.parse(report).getroot()
+    if (suite.attrib["tests"] != "1" or suite.attrib["skipped"] != "0"
+            or suite.attrib["failures"] != "0" or suite.attrib["errors"] != "0"):
+        raise RuntimeError(f"required Gateway-to-Control-Plane tenant-scope test gate failed: {suite.attrib}")
+
 
 def main() -> int:
     image_tag = sys.argv[1] if len(sys.argv) == 2 else IMAGE_TAG
@@ -103,6 +109,17 @@ def main() -> int:
             "mvn", "--batch-mode", "--no-transfer-progress", "-pl", "control-plane", "-am",
             "-Dtest=ControlPlaneExecutionEventAdapterTest,JdbcTaskEventScopeGuardPostgresTest",
             "-Dsurefire.failIfNoSpecifiedTests=false", "test",
+        ], cwd=source)
+        run([
+            "mvn", "--batch-mode", "--no-transfer-progress",
+            "-P", "integration-tests,!colima-testcontainers",
+            "-pl", "integration-tests", "-am", "-DskipTests", "install",
+        ], cwd=source)
+        run([
+            "mvn", "--batch-mode", "--no-transfer-progress",
+            "-P", "integration-tests,!colima-testcontainers",
+            "-pl", "integration-tests", "-Dit.test=TaskEventScopeEndToEndIT",
+            "-Dfailsafe.failIfNoSpecifiedTests=false", "failsafe:integration-test", "failsafe:verify",
         ], cwd=source)
         require_tests(source)
         run([

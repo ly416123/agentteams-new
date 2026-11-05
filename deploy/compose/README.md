@@ -2,7 +2,7 @@
 
 本目录提供不依赖 Kubernetes API、CRD、Operator 或 Docker Socket 的单机/单节点部署入口。Compose 管理 PostgreSQL、NATS JetStream、Control Plane、Gateway 和最多 8 个预先定义的 Worker 槽位。Worker 数量通过启动脚本显式选择，不会随任务动态创建或扩缩。
 
-> 当前是 POC 部署档，不代表生产就绪。原版 v0.1.5 Control Plane/Gateway 存在 `TASK_EVENT` 按消息 Task ID 写入、未核对 Attempt/Lease/Agent 归属的跨租户事件注入缺口（[审计](../../docs/audits/2026-11-06-v015-task-event-scope-gap.md)）。`self-hosted-small` 现强制从 `agentteams-new` 固定补丁构建 Control Plane，并在数据库事实校验通过后才允许投影事件；补丁已有 PostgreSQL/适配器负向测试，且已在零 Worker Compose POC 运行。Gateway→NATS→Control Plane 的真实事件链及数据库/Webhook 无副作用断言仍未完成，因此多租户隔离不能记为通过。Worker Enrollment 已实现 OIDC scope 授权和哈希凭据；Credential Proxy 已加入固定 Worker 启动链，真实 IdP 下的端到端任务、跨租户隔离、真实 Provider 联调和 Worker drain 恢复仍待验收。
+> 当前是 POC 部署档，不代表生产就绪。原版 v0.1.5 Control Plane/Gateway 存在 `TASK_EVENT` 按消息 Task ID 写入、未核对 Attempt/Lease/Agent 归属的跨租户事件注入缺口（[审计](../../docs/audits/2026-11-06-v015-task-event-scope-gap.md)）。`self-hosted-small` 现强制从 `agentteams-new` 固定补丁构建 Control Plane，并在数据库事实校验通过后才允许投影事件；构建门禁要求 PostgreSQL/适配器测试和真实 Gateway→NATS→Control Plane 负向端到端测试均执行、零跳过。端到端测试已确认跨租户 Task 不新增 Run、Process Event 或 Webhook delivery，派生镜像在零 Worker Compose POC 可运行。此项关闭了异步 TASK_EVENT 写入边界，不代表全部多租户隔离已通过。Worker Enrollment 已实现 OIDC scope 授权和哈希凭据；Credential Proxy 已加入固定 Worker 启动链，真实 HTTPS IdP 下的登录与 Tenant A/B API、真实 Worker、Provider 联调和 Worker drain 恢复仍待验收。
 
 ## 前置条件
 
