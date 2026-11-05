@@ -54,6 +54,8 @@
 
 **批次 2C Enrollment RLS 子集（2026-11-05）：** 为独立 `worker_enrollment` 数据库角色在 `agents` 与 `agent_sessions` 表启用 RLS；scope 由已验证 JWT 进入事务局部 GUC，窄列权限禁止读取 Session Token Hash，角色设置为非 owner、非 superuser、无 `BYPASSRLS`。Testcontainers 验证缺 scope 默认拒绝、Tenant A/B 同连接隔离、跨 scope 写拒绝和事务结束清理，定向 PostgreSQL 测试 5/5 通过。其他任务/会话/Artifact 等表仍未采用 RLS。完整本机 `verify` 中复用 Gateway 镜像在 ARM64 Colima 上未能于 2 分钟开放 gRPC 端口；不含该镜像用例的 23 项通过。推送后 Ubuntu CI run [41981566128](https://github.com/ly416123/agentteams-new/actions/runs/41981566128) 完整通过，要求的 PostgreSQL、签名 OIDC→数据库和固定 Gateway 握手 16 项均执行、无跳过；Compose 配置和 shell 检查通过。
 
+**复用 Control Plane 的 RLS 边界审计（2026-11-05）：** 对固定 v0.1.5 的迁移 SQL、scope Repository、Task 查询与 Compose 数据库身份做只读检查，记录见[共享 Control Plane scope 与 RLS 就绪度审计](../audits/2026-11-05-shared-control-plane-scope-and-rls-readiness.md)。Task/Attempt/Assignment/Lease 等需沿 `resource_scopes` 与父子关系判定 scope；Conversation 有自身 scope。当前 Compose 使用 `POSTGRES_USER=agentteams` 初始化超级用户作为 Control Plane 连接，源码查询未设置事务级 GUC，因此单独从新仓库启用业务表 RLS无法保护 Control Plane。全系统 RLS 前置是拆分非 superuser/非 owner 运行角色、实现所有 API 和后台作业的事务 scope，并验证跨 Tenant 的业务 API；当前不宣称强隔离。
+
 ## 批次 1：无 Kubernetes 固定容量 Compose POC
 
 1. 先从旧仓库构建并发布 Control Plane、Gateway、Worker 的固定版本 OCI 镜像；记录镜像 digest 和源 commit。
