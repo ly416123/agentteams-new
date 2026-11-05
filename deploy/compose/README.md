@@ -17,7 +17,7 @@ cd deploy/compose
 cp .env.example .env
 ```
 
-编辑 `.env`：填入随机且互不相同的 `POSTGRES_PASSWORD`、`WORKER_ENROLLMENT_DB_PASSWORD` 和 `CREDENTIAL_PROXY_DB_PASSWORD`。将 `CREDENTIAL_PROXY_UID`、`CREDENTIAL_PROXY_GID` 设为运行部署用户的数字 UID/GID；Compose 中 Worker 和 Credential Proxy 都以此身份运行，以便它们只读各自挂载的 `0600` 文件。镜像已固定到发布 digest，升级时从签名 release manifest 获取新 digest 后一起更新。`POST /api/v1/agents` 只创建 Worker 记录，不会签发会话 Token。
+编辑 `.env`：填入随机且互不相同的 `POSTGRES_PASSWORD`、`CONTROL_PLANE_DB_PASSWORD`、`WORKER_ENROLLMENT_DB_PASSWORD` 和 `CREDENTIAL_PROXY_DB_PASSWORD`（各至少 24 字符）。PostgreSQL 初始化用户 `agentteams` 只供 Flyway 迁移和数据库角色初始化使用；Control Plane SQL 使用非超级用户 `agentteams_runtime`。将 `CREDENTIAL_PROXY_UID`、`CREDENTIAL_PROXY_GID` 设为运行部署用户的数字 UID/GID；Compose 中 Worker 和 Credential Proxy 都以此身份运行，以便它们只读各自挂载的 `0600` 文件。镜像已固定到发布 digest，升级时从签名 release manifest 获取新 digest 后一起更新。`POST /api/v1/agents` 只创建 Worker 记录，不会签发会话 Token。
 
 创建 `PROVIDER_CREDENTIALS_DIR` 指定的目录，并按 `file:<tenant>/<project>/<team>/<credential-name>` 的引用组织凭据。例如 `.env` 中 `WORKER_1_MODEL_CREDENTIAL_REF=file:tenant-a/project-a/team-a/chatgpt` 对应文件 `secrets/provider/tenant-a/project-a/team-a/chatgpt`。引用中的 Tenant、Project、Team 必须与数据库活动 Attempt 的 scope 完全一致。目录和所有子目录权限设为 `0700`，凭据文件设为 `0600`，所有者 UID 与 `CREDENTIAL_PROXY_UID` 一致。Credential Proxy 只读挂载此目录；Worker 网络为 internal 网络，只能访问 Gateway 和 Proxy，Provider 出站只由 Proxy 所在网络提供。每个活动 Worker 还需要各自的 `WORKER_n_MODEL_PROXY_TOKEN_FILE`，由 Enrollment 命令生成；这些 `atp_` 文件也须为 `0600` 且由同一 UID 拥有。只需为活动槽位准备模型代理 Token 和其引用的 Provider 凭据文件。
 
@@ -25,7 +25,7 @@ cp .env.example .env
 
 Worker 池启用前，配置真实 HTTPS OIDC issuer、JWKS URL、audience，并设置唯一的 `WORKER_ENROLLMENT_DB_PASSWORD` 和 `CREDENTIAL_PROXY_DB_PASSWORD`（各至少 24 字符）；将 `API_AUTH_ENABLED=true`。这个开关同时开启 Control Plane API OIDC 安全和 Enrollment OIDC 验证。不要手工向数据库写 Token。Control Plane 和 Enrollment HTTP 端口只绑定到 `127.0.0.1`，不可改为公网或局域网监听；如需远端访问，应放在完成 TLS 和身份校验的可信入口后。
 
-Enrollment 和 Credential Proxy 使用不同的非特权数据库登录角色。setup 会为两者启用窄列授权、RLS 和 `SECURITY DEFINER` 查询函数；Credential Proxy 运行角色只能执行活动 Attempt/模型 Token 查询函数，不能直接读取 Token 哈希或业务表。该 RLS 覆盖仍不代表 Task、Attempt、Artifact 等资源已完成全系统隔离。
+Control Plane、Enrollment 和 Credential Proxy 使用分离的数据库登录角色。`database-role-setup` 在启动 Control Plane 前创建非超级用户 `agentteams_runtime`，授予现有及 Flyway 后续创建对象所需权限；Control Plane 运行 SQL 使用该角色，Flyway 单独使用初始化账户。Enrollment 与 Credential Proxy setup 再为各自角色启用窄列授权、RLS 和 `SECURITY DEFINER` 查询函数；Credential Proxy 运行角色只能执行活动 Attempt/模型 Token 查询函数，不能直接读取 Token 哈希或业务表。为兼容 Control Plane 现有应用层授权，RLS 对 `agentteams_runtime` 在 `agents`、`agent_sessions` 上仍允许全表操作；此策略不提供租户级数据库隔离。该角色目前仍可访问其 schema 中的业务表，且 Flyway 凭据与应用进程同处一个容器环境，因此本次改动仅消除日常 SQL 的 PostgreSQL 超级用户权限，不代表业务表已完成 RLS 或迁移凭据已隔离。
 
 Enrollment 端口默认为 `127.0.0.1:8090`；若 `.env` 中覆盖 `ENROLLMENT_PORT`，该值仅影响宿主机端口映射，绑定地址仍固定为 loopback。`enroll-worker.sh` 需要 `curl`、`jq` 和由 OIDC Provider 签发且 scope/audience 匹配的临时 access token 文件。Credential Proxy 默认只转发到 `https://api.openai.com/v1/responses`，只允许 `.env` 的模型 allowlist；自定义上游地址应使用 HTTPS，HTTP 仅允许 loopback 测试地址。
 
@@ -33,7 +33,7 @@ Enrollment 端口默认为 `127.0.0.1:8090`；若 `.env` 中覆盖 `ENROLLMENT_P
 
 ## 校验与启动
 
-不启动 Worker 的基础服务：
+不启动 Worker 的基础服务（依赖会自动运行 `database-role-setup`）：
 
 ```sh
 ./validate-config.sh .env

@@ -103,6 +103,21 @@ ALTER TABLE agents ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agent_sessions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE worker_model_proxy_credentials ENABLE ROW LEVEL SECURITY;
 
+-- Preserve the Control Plane's current application-layer authorization model
+-- after it stops connecting as PostgreSQL superuser. These policies intentionally
+-- allow the runtime role to access all rows and are not tenant isolation.
+DROP POLICY IF EXISTS control_plane_runtime_agents ON agents;
+CREATE POLICY control_plane_runtime_agents ON agents
+    FOR ALL TO agentteams_runtime
+    USING (true)
+    WITH CHECK (true);
+
+DROP POLICY IF EXISTS control_plane_runtime_sessions ON agent_sessions;
+CREATE POLICY control_plane_runtime_sessions ON agent_sessions
+    FOR ALL TO agentteams_runtime
+    USING (true)
+    WITH CHECK (true);
+
 REVOKE ALL ON TABLE worker_enrollment_agent_scopes FROM worker_enrollment;
 REVOKE ALL ON TABLE agents FROM worker_enrollment;
 REVOKE ALL ON TABLE agent_sessions FROM worker_enrollment;

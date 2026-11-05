@@ -110,6 +110,9 @@ class OidcJwtIntegrationTest {
         jdbc.execute("DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'worker_enrollment') THEN "
                 + "CREATE ROLE worker_enrollment LOGIN PASSWORD 'enrollment-test-password' "
                 + "NOSUPERUSER NOBYPASSRLS; END IF; END $$");
+        jdbc.execute("DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'agentteams_runtime') THEN "
+                + "CREATE ROLE agentteams_runtime NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS; "
+                + "END IF; END $$");
         jdbc.execute("""
                 CREATE TABLE agents (
                     id UUID PRIMARY KEY,

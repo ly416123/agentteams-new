@@ -128,7 +128,8 @@ jobs:
           bash -n deploy/compose/*.sh
           python3 -m unittest \
             verification.test_compose_fixed_worker_capacity \
-            verification.test_compose_oidc_url_contract -v
+            verification.test_compose_oidc_url_contract \
+            verification.test_compose_control_plane_database_roles -v
 
       - name: Build Credential Proxy container
         run: docker build --secret id=maven_settings,src="$HOME/.m2/settings.xml" --tag agentteams-credential-proxy:ci --file credential-proxy/Dockerfile .

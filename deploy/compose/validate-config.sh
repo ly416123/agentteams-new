@@ -64,6 +64,13 @@ if [ "$api_auth_enabled" = "true" ]; then
   fi
 fi
 
+control_plane_db_password=$(value CONTROL_PLANE_DB_PASSWORD)
+if [ "${#control_plane_db_password}" -lt 24 ] \
+    || [ "$control_plane_db_password" = "replace-with-a-unique-control-plane-db-password" ]; then
+  echo "Set a unique CONTROL_PLANE_DB_PASSWORD of at least 24 characters" >&2
+  exit 2
+fi
+
 password=$(value POSTGRES_PASSWORD)
 if [ "${#password}" -lt 24 ] || [ "$password" = "replace-with-a-long-random-password" ]; then
   echo "Set POSTGRES_PASSWORD to a unique value of at least 24 characters in $env_file" >&2

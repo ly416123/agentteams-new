@@ -6,9 +6,11 @@
 
 ## 结论
 
-当前 Control Plane 通过应用层 OIDC Principal、Project membership 和 `resource_scopes` 做多租户授权。其业务数据表不是统一携带 Tenant/Project/Team 列：Task 等数据依赖独立 scope 映射表，Conversation 则保存自身 scope。固定 v0.1.5 的 Repository 会把 `ExecutionContext` 放进部分查询条件，但源码没有给 PostgreSQL 事务设置 scope GUC。Compose 把 `agentteams` 同时设为 PostgreSQL 初始化用户和 Control Plane 数据库用户；官方 PostgreSQL 镜像会把初始化用户创建为超级用户。
+当前 Control Plane 通过应用层 OIDC Principal、Project membership 和 `resource_scopes` 做多租户授权。其业务数据表不是统一携带 Tenant/Project/Team 列：Task 等数据依赖独立 scope 映射表，Conversation 则保存自身 scope。固定 v0.1.5 的 Repository 会把 `ExecutionContext` 放进部分查询条件，但源码没有给 PostgreSQL 事务设置 scope GUC。审计时 Compose 把 `agentteams` 同时设为 PostgreSQL 初始化用户和 Control Plane 数据库用户；后续 `agentteams-new` Compose 改为 `agentteams_runtime` 非超级用户运行 SQL，`agentteams` 仅供 Flyway 与数据库初始化。
 
 因此，单在 `agentteams-new` 增加其他业务表的 RLS policy，不能形成完整隔离：当前 Control Plane 超级用户可绕过所有 RLS；即使先把它降权，表 owner 在未启用 `FORCE ROW LEVEL SECURITY` 时也会绕过策略。若启用 FORCE，现有请求又没有设置策略所需的事务 scope。要完成全系统 RLS，必须连同非 superuser/非 owner 运行角色、请求事务上下文、后台任务身份及所有读写路径一起改造。当前仓库只给独立 `worker_enrollment` 角色启用了 `agents` 和 `agent_sessions` RLS；这不覆盖 Control Plane。
+
+**实现跟进（2026-11-05）：** 固定容量 Compose 为 Control Plane 增加独立 `agentteams_runtime` 登录角色；数据库初始化服务先行创建该角色并授予现有及后续迁移对象所需权限，Flyway 继续使用 `agentteams`。由于 Enrollment 启用 `agents` 和 `agent_sessions` 的 RLS，策略文件为 Control Plane 运行角色增加兼容性的全表策略，保留旧版应用层授权行为。该运行角色没有 `BYPASSRLS`，但这些表的访问并未按 Tenant scope 限制，不能视作租户隔离已完成。目标分支已通过 PostgreSQL 16 临时实例验证初始化脚本、非超级用户身份、现有表读写和后续建表权限；Enrollment 的 13 项 PostgreSQL/OIDC/Gateway 集成门禁定向执行时 13/13 通过；13 项 Compose/容量/OIDC 契约测试、Compose 配置解析、shell 语法和 `git diff --check` 通过。完整 Enrollment `verify` 的 28 项测试中 27 项通过，固定 amd64 Gateway 在 arm64 Colima 上启动超时；该 Gateway 握手原有 PR CI 证据为通过，本次待新 PR CI 复验。
 
 ## 数据模型与 scope 归属
 

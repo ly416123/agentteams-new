@@ -63,6 +63,7 @@ class JdbcWorkerSessionRepositoryPostgresTest {
                 """);
         jdbc.execute("CREATE TABLE platform_identities (id UUID PRIMARY KEY, subject TEXT NOT NULL)");
         jdbc.execute("CREATE ROLE worker_enrollment LOGIN PASSWORD 'enrollment-test-password' NOSUPERUSER NOBYPASSRLS");
+        jdbc.execute("CREATE ROLE agentteams_runtime NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS");
         jdbc.execute("GRANT CONNECT ON DATABASE enrollment_test TO worker_enrollment");
         jdbc.execute("GRANT USAGE ON SCHEMA public TO worker_enrollment");
         jdbc.execute("CREATE ROLE worker_enrollment_scope_owner LOGIN BYPASSRLS");
@@ -358,6 +359,14 @@ class JdbcWorkerSessionRepositoryPostgresTest {
             jdbc.execute("DROP POLICY IF EXISTS agent_writer_read ON agents");
             jdbc.execute("DROP OWNED BY agent_writer");
             jdbc.execute("DROP ROLE agent_writer");
+        }
+        Boolean runtimeExists = jdbc.queryForObject(
+                "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'agentteams_runtime')", Boolean.class);
+        if (Boolean.TRUE.equals(runtimeExists)) {
+            jdbc.execute("DROP POLICY IF EXISTS control_plane_runtime_agents ON agents");
+            jdbc.execute("DROP POLICY IF EXISTS control_plane_runtime_sessions ON agent_sessions");
+            jdbc.execute("DROP OWNED BY agentteams_runtime");
+            jdbc.execute("DROP ROLE agentteams_runtime");
         }
         Boolean exists = jdbc.queryForObject(
                 "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'worker_enrollment')", Boolean.class);

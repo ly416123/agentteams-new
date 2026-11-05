@@ -43,6 +43,7 @@ class ComposeFixedWorkerCapacityTest(unittest.TestCase):
                 "OIDC_JWK_SET_URI": "https://id.example.test/keys",
                 "OIDC_AUDIENCE": "agentteams-test",
                 "POSTGRES_PASSWORD": "test-postgres-password-with-32-chars",
+                "CONTROL_PLANE_DB_PASSWORD": "test-control-plane-password-with-32-chars",
                 "WORKER_ENROLLMENT_DB_PASSWORD": "test-enrollment-password-with-32-chars",
                 "CREDENTIAL_PROXY_DB_PASSWORD": "test-credential-proxy-password-with-32-chars",
                 "CREDENTIAL_PROXY_UID": str(os.getuid()),
