@@ -125,7 +125,10 @@ jobs:
 
       - name: Validate Compose and shell scripts
         run: |
-          docker pull postgres:16-alpine nats:2.10-alpine natsio/nats-box:0.14.0 alpine:3.21
+          docker pull postgres:16-alpine
+          docker pull nats:2.10-alpine
+          docker pull natsio/nats-box:0.14.0
+          docker pull alpine:3.21
           docker compose --env-file deploy/compose/.env.example -f deploy/compose/compose.yaml config --quiet
           bash -n deploy/compose/*.sh
           python3 -m unittest \
