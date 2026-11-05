@@ -91,17 +91,9 @@ for key in CONTROL_PLANE_IMAGE GATEWAY_IMAGE WORKER_IMAGE; do
 done
 
 if [ "$replicas" -gt 0 ]; then
-  token_file=$(value MODEL_TOKEN_FILE)
-  case "$token_file" in
-    /*) ;;
-    *) token_file="$(CDPATH= cd -- "$(dirname -- "$env_file")" && pwd)/$token_file" ;;
-  esac
-  if [ ! -r "$token_file" ] || [ ! -s "$token_file" ] || [ "${token_file##*/}" = "model-token.example" ]; then
-    echo "Set MODEL_TOKEN_FILE to a readable, non-empty model token file before starting Workers" >&2
-    exit 2
-  fi
   slot=1
   seen_ids=" "
+  seen_model_tokens=" "
   while [ "$slot" -le "$replicas" ]; do
     id=$(value "WORKER_${slot}_AGENT_ID")
     if ! printf '%s\n' "$id" | awk '/^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$/ { ok=1 } END { exit !ok }'; then
@@ -113,6 +105,25 @@ if [ "$replicas" -gt 0 ]; then
       *" $normalized_id "*) echo "Worker Agent UUIDs must be unique" >&2; exit 2 ;;
     esac
     seen_ids="$seen_ids$normalized_id "
+    model_token_file=$(value "WORKER_${slot}_MODEL_TOKEN_FILE")
+    case "$model_token_file" in
+      /*) ;;
+      *) model_token_file="$(CDPATH= cd -- "$(dirname -- "$env_file")" && pwd)/$model_token_file" ;;
+    esac
+    if [ ! -r "$model_token_file" ] || [ ! -s "$model_token_file" ] || [ "${model_token_file##*/}" = "model-token.example" ]; then
+      echo "WORKER_${slot}_MODEL_TOKEN_FILE must point to a readable, non-empty model token file" >&2
+      exit 2
+    fi
+    if model_token_mode=$(stat -f '%Lp' "$model_token_file" 2>/dev/null); then :; else model_token_mode=$(stat -c '%a' "$model_token_file"); fi
+    if [ "$((0$model_token_mode & 077))" -ne 0 ]; then
+      echo "Worker model credential file must not be readable by group or other users: $model_token_file" >&2
+      exit 2
+    fi
+    if model_token_identity=$(stat -f '%d:%i' "$model_token_file" 2>/dev/null); then :; else model_token_identity=$(stat -c '%d:%i' "$model_token_file"); fi
+    case "$seen_model_tokens" in
+      *" $model_token_identity "*) echo "Each active Worker must use a distinct model credential file" >&2; exit 2 ;;
+    esac
+    seen_model_tokens="$seen_model_tokens$model_token_identity "
     credential_file=$(value "WORKER_${slot}_CREDENTIALS_FILE")
     case "$credential_file" in
       /*) ;;

@@ -10,14 +10,14 @@
 - Docker daemon 可访问 Docker Hub 与 GHCR。终端里的 `HTTP_PROXY` 不一定会传给 daemon；需要代理时，也要在 Docker Desktop/Engine 侧配置 registry 出站代理。
 - 当前固定的 `agentteams-java v0.1.5` 应用镜像仅提供 `linux/amd64`；ARM64 开发机需启用 amd64 仿真，生产主机按 amd64 部署。
 - 已发布的 Control Plane、Gateway、Worker GHCR 镜像 digest。`.env.example` 当前固定到 `agentteams-java v0.1.5`（source commit `0156f2c1fecdc868cb4a0f4f13fb068bb4162834`）。不要使用 `latest` 或可变 tag。
-- Worker 模型调用所需的 token 文件。token 只以只读 Compose secret 文件挂入 Worker，不写进 `.env`。
+- 每个活动 Worker 槽位各自的模型 token 文件。token 只以只读 Compose secret 文件挂入对应 Worker，不写进 `.env`；不同槽位不能配置到同一个文件。
 
 ```sh
 cd deploy/compose
 cp .env.example .env
 ```
 
-编辑 `.env`：填入强随机 `POSTGRES_PASSWORD`。镜像已固定到同一发布 tag 和 source commit，升级时从签名的 release manifest 获取新 digest 后一起更新。`POST /api/v1/agents` 只创建 Worker 记录并返回 UUID，不会签发 Gateway 会话 Token。设置 `MODEL_TOKEN_FILE` 为本机模型 token 文件路径；相对路径相对于本目录。使用 ChatGPT Plan Worker 时，该文件应为现有 Worker 运行时支持的 access-token 格式。
+编辑 `.env`：填入强随机 `POSTGRES_PASSWORD`。镜像已固定到同一发布 tag 和 source commit，升级时从签名的 release manifest 获取新 digest 后一起更新。`POST /api/v1/agents` 只创建 Worker 记录并返回 UUID，不会签发 Gateway 会话 Token。分别设置 `WORKER_1_MODEL_TOKEN_FILE` 至 `WORKER_8_MODEL_TOKEN_FILE`，指向每个槽位独立的本机模型 token 文件；相对路径相对于本目录。使用 ChatGPT Plan Worker 时，文件应为现有 Worker 运行时支持的 access-token 格式，权限设为 `0600`。只需为活动槽位创建文件。
 
 要启用 Artifact 对象存储，将 `AGENTTEAMS_STORAGE_ENABLED=true`，并设置 `OBJECT_STORE_ACCESS_KEY` 与至少 24 字符的 `OBJECT_STORE_SECRET_KEY`。启动脚本会先启动 `storage` profile 中的 SeaweedFS S3，并等待 S3 服务就绪后再启动 Control Plane；`agentteams` bucket 在 SeaweedFS 启动时创建，参数采用 [SeaweedFS `weed mini` S3 配置](https://github-wiki-see.page/m/seaweedfs/seaweedfs/wiki/Quick-Start-with-weed-mini)。S3 和管理端口都不发布到宿主机。当前 POC 使用单节点 SeaweedFS，并把全局 S3 凭证提供给 Control Plane；生产环境应改用具备 bucket 范围授权、备份和恢复能力的对象存储身份/服务。
 
@@ -82,7 +82,7 @@ Agent scope 必须在 `metadata.scope` 中包含 enrollment 配置所使用的 `
 ./revoke-worker-session.sh http://127.0.0.1:8090 <agent-uuid> <old-session-uuid> /secure/path/oidc-access-token
 ```
 
-撤销只阻止后续 Gateway 握手；v0.1.5 不会主动断开已建立的连接。Worker 还会通过模型 token 文件调用模型服务，这与 Gateway session 是两类凭据。
+撤销只阻止后续 Gateway 握手；v0.1.5 不会主动断开已建立的连接。Worker 还会通过各自的模型 token 文件调用模型服务，这与 Gateway session 是两类凭据。每个活动槽位必须使用不同文件；配置校验会拒绝指向同一个底层文件的槽位。当前模型 Token 仍可被对应 Worker 进程读取，因此这项隔离不能替代后续凭证代理，也不提供 Attempt 级授权。
 
 ## 状态与运维
 

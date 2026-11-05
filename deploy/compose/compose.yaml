@@ -203,8 +203,8 @@ services:
       AGENTTEAMS_MODEL_PROVIDER: chatgpt-plan
       AGENTTEAMS_MODEL: chatgpt-plan:gpt-5.6-luna
       AGENTTEAMS_MAX_CONCURRENT_TASKS: "1"
-      AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE: /run/secrets/model_token
-    secrets: [model_token]
+      AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE: /run/secrets/model_token_worker_1
+    secrets: [model_token_worker_1]
     depends_on:
       gateway:
         condition: service_started
@@ -223,7 +223,8 @@ services:
     environment:
       <<: *worker-env
       AGENTTEAMS_AGENT_ID: ${WORKER_2_AGENT_ID:?set a registered Worker UUID}
-    secrets: [model_token]
+      AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE: /run/secrets/model_token_worker_2
+    secrets: [model_token_worker_2]
     depends_on:
       gateway:
         condition: service_started
@@ -242,7 +243,8 @@ services:
     environment:
       <<: *worker-env
       AGENTTEAMS_AGENT_ID: ${WORKER_3_AGENT_ID:?set a registered Worker UUID}
-    secrets: [model_token]
+      AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE: /run/secrets/model_token_worker_3
+    secrets: [model_token_worker_3]
     depends_on:
       gateway:
         condition: service_started
@@ -261,7 +263,8 @@ services:
     environment:
       <<: *worker-env
       AGENTTEAMS_AGENT_ID: ${WORKER_4_AGENT_ID:?set a registered Worker UUID}
-    secrets: [model_token]
+      AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE: /run/secrets/model_token_worker_4
+    secrets: [model_token_worker_4]
     depends_on:
       gateway:
         condition: service_started
@@ -280,7 +283,8 @@ services:
     environment:
       <<: *worker-env
       AGENTTEAMS_AGENT_ID: ${WORKER_5_AGENT_ID:?set a registered Worker UUID}
-    secrets: [model_token]
+      AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE: /run/secrets/model_token_worker_5
+    secrets: [model_token_worker_5]
     depends_on:
       gateway:
         condition: service_started
@@ -299,7 +303,8 @@ services:
     environment:
       <<: *worker-env
       AGENTTEAMS_AGENT_ID: ${WORKER_6_AGENT_ID:?set a registered Worker UUID}
-    secrets: [model_token]
+      AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE: /run/secrets/model_token_worker_6
+    secrets: [model_token_worker_6]
     depends_on:
       gateway:
         condition: service_started
@@ -318,7 +323,8 @@ services:
     environment:
       <<: *worker-env
       AGENTTEAMS_AGENT_ID: ${WORKER_7_AGENT_ID:?set a registered Worker UUID}
-    secrets: [model_token]
+      AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE: /run/secrets/model_token_worker_7
+    secrets: [model_token_worker_7]
     depends_on:
       gateway:
         condition: service_started
@@ -337,7 +343,8 @@ services:
     environment:
       <<: *worker-env
       AGENTTEAMS_AGENT_ID: ${WORKER_8_AGENT_ID:?set a registered Worker UUID}
-    secrets: [model_token]
+      AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE: /run/secrets/model_token_worker_8
+    secrets: [model_token_worker_8]
     depends_on:
       gateway:
         condition: service_started
@@ -366,8 +373,22 @@ services:
     restart: unless-stopped
 
 secrets:
-  model_token:
-    file: ${MODEL_TOKEN_FILE:?set MODEL_TOKEN_FILE to a readable model token file}
+  model_token_worker_1:
+    file: ${WORKER_1_MODEL_TOKEN_FILE:?set WORKER_1_MODEL_TOKEN_FILE to a readable model token file}
+  model_token_worker_2:
+    file: ${WORKER_2_MODEL_TOKEN_FILE:?set WORKER_2_MODEL_TOKEN_FILE to a readable model token file}
+  model_token_worker_3:
+    file: ${WORKER_3_MODEL_TOKEN_FILE:?set WORKER_3_MODEL_TOKEN_FILE to a readable model token file}
+  model_token_worker_4:
+    file: ${WORKER_4_MODEL_TOKEN_FILE:?set WORKER_4_MODEL_TOKEN_FILE to a readable model token file}
+  model_token_worker_5:
+    file: ${WORKER_5_MODEL_TOKEN_FILE:?set WORKER_5_MODEL_TOKEN_FILE to a readable model token file}
+  model_token_worker_6:
+    file: ${WORKER_6_MODEL_TOKEN_FILE:?set WORKER_6_MODEL_TOKEN_FILE to a readable model token file}
+  model_token_worker_7:
+    file: ${WORKER_7_MODEL_TOKEN_FILE:?set WORKER_7_MODEL_TOKEN_FILE to a readable model token file}
+  model_token_worker_8:
+    file: ${WORKER_8_MODEL_TOKEN_FILE:?set WORKER_8_MODEL_TOKEN_FILE to a readable model token file}
 
 volumes:
   postgres-data:

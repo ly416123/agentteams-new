@@ -12,7 +12,14 @@ EXAMPLE_ENV = ROOT / "deploy/compose/.env.example"
 
 
 class ComposeFixedWorkerCapacityTest(unittest.TestCase):
-    def invoke_startup(self, replicas: int) -> list[str]:
+    def invoke_startup(
+        self,
+        replicas: int,
+        *,
+        shared_model_tokens: bool = False,
+        model_token_mode: int = 0o600,
+        expected_error: str | None = None,
+    ) -> list[str]:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
             values = {}
@@ -23,6 +30,7 @@ class ComposeFixedWorkerCapacityTest(unittest.TestCase):
 
             model_token = temp / "model-token"
             model_token.write_text("test-only-model-token\n")
+            model_token.chmod(model_token_mode)
             values.update({
                 "API_AUTH_ENABLED": "true",
                 "OIDC_ISSUER_URI": "https://id.example.test/issuer",
@@ -31,10 +39,13 @@ class ComposeFixedWorkerCapacityTest(unittest.TestCase):
                 "POSTGRES_PASSWORD": "test-postgres-password-with-32-chars",
                 "WORKER_ENROLLMENT_DB_PASSWORD": "test-enrollment-password-with-32-chars",
                 "WORKER_REPLICAS": str(replicas),
-                "MODEL_TOKEN_FILE": str(model_token),
             })
 
             for slot in range(1, replicas + 1):
+                slot_model_token = temp / f"worker-{slot}.model-token"
+                slot_model_token.write_text(f"test-only-model-token-{slot}\n")
+                slot_model_token.chmod(model_token_mode)
+                values[f"WORKER_{slot}_MODEL_TOKEN_FILE"] = str(model_token if shared_model_tokens else slot_model_token)
                 credential_file = temp / f"worker-{slot}.runtime.env"
                 credential_file.write_text(f"AGENTTEAMS_GATEWAY_AUTH_TOKEN=ats_{'A' * 48}\n")
                 credential_file.chmod(0o600)
@@ -60,6 +71,10 @@ class ComposeFixedWorkerCapacityTest(unittest.TestCase):
                 env=environment,
                 check=False,
             )
+            if expected_error is not None:
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(expected_error, result.stderr)
+                return []
             self.assertEqual(result.returncode, 0, result.stderr)
             calls = call_log.read_text().splitlines()
             self.assertEqual(len(calls), 1, calls)
@@ -87,6 +102,31 @@ class ComposeFixedWorkerCapacityTest(unittest.TestCase):
             ["postgres", "nats", "nats-bootstrap", "control-plane", "gateway", "worker-1", "worker-2", "worker-enrollment"],
         )
         self.assertNotIn("--scale", args)
+
+    def test_rejects_model_credential_file_shared_between_worker_slots(self) -> None:
+        self.invoke_startup(
+            2,
+            shared_model_tokens=True,
+            expected_error="Each active Worker must use a distinct model credential file",
+        )
+
+    def test_rejects_model_credential_file_readable_by_other_users(self) -> None:
+        self.invoke_startup(
+            1,
+            model_token_mode=0o644,
+            expected_error="Worker model credential file must not be readable by group or other users",
+        )
+
+    def test_each_worker_has_a_distinct_model_secret(self) -> None:
+        compose = (ROOT / "deploy/compose/compose.yaml").read_text()
+        for slot in range(1, 9):
+            secret_name = f"model_token_worker_{slot}"
+            self.assertIn(f"AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE: /run/secrets/{secret_name}", compose)
+            self.assertIn(f"secrets: [{secret_name}]", compose)
+            self.assertRegex(
+                compose,
+                rf"{secret_name}:\n\s+file: \$\{{WORKER_{slot}_MODEL_TOKEN_FILE:\?set WORKER_{slot}_MODEL_TOKEN_FILE",
+            )
 
 
 if __name__ == "__main__":
