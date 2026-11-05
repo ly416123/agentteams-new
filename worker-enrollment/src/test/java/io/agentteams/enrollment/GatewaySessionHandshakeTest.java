@@ -154,7 +154,12 @@ class GatewaySessionHandshakeTest {
         try {
             Status terminal = handshake.status().poll(10, TimeUnit.SECONDS);
             if (terminal == null) {
-                throw new AssertionError("Gateway did not terminate a rejected session. Gateway logs:\n"
+                boolean readyReceived = !handshake.responses().isEmpty();
+                Integer persistedState = jdbc.queryForObject(
+                        "SELECT count(*) FROM gateway_agent_state WHERE agent_id = ?", Integer.class,
+                        helloAgent.toString());
+                throw new AssertionError("Gateway did not terminate a rejected session; readyReceived="
+                        + readyReceived + ", persistedState=" + persistedState + ". Gateway logs:\n"
                         + gateway.getLogs());
             }
             assertThat(terminal.getCode()).withFailMessage("Gateway rejected the handshake: %s", terminal)
