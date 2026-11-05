@@ -118,6 +118,8 @@ GRANT UPDATE (revoked_at) ON TABLE agent_sessions TO worker_enrollment;
 GRANT INSERT (id, session_id, agent_id, tenant_id, project_id, team_id, token_sha256,
               model_credential_ref, expires_at, created_at)
     ON TABLE worker_model_proxy_credentials TO worker_enrollment;
+GRANT SELECT (agent_id, session_id, revoked_at)
+    ON TABLE worker_model_proxy_credentials TO worker_enrollment;
 GRANT UPDATE (revoked_at) ON TABLE worker_model_proxy_credentials TO worker_enrollment;
 
 DROP POLICY IF EXISTS worker_enrollment_agent_scopes_scope ON worker_enrollment_agent_scopes;
@@ -171,6 +173,16 @@ CREATE POLICY worker_enrollment_model_proxy_credentials_insert_scope
                AND session.revoked_at IS NULL
                AND session.expires_at > statement_timestamp()
         )
+    );
+
+DROP POLICY IF EXISTS worker_enrollment_model_proxy_credentials_select_scope
+    ON worker_model_proxy_credentials;
+CREATE POLICY worker_enrollment_model_proxy_credentials_select_scope
+    ON worker_model_proxy_credentials FOR SELECT TO worker_enrollment
+    USING (
+        tenant_id = NULLIF(current_setting('agentteams.tenant_id', true), '')
+        AND project_id = NULLIF(current_setting('agentteams.project_id', true), '')
+        AND team_id = NULLIF(current_setting('agentteams.team_id', true), '')
     );
 
 DROP POLICY IF EXISTS worker_enrollment_model_proxy_credentials_update_scope

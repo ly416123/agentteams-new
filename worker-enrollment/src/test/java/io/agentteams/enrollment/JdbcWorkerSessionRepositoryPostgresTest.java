@@ -144,7 +144,15 @@ class JdbcWorkerSessionRepositoryPostgresTest {
                     new WorkerScope("tenant-a", "project-a", "team-a"),
                     "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
                     "vault://tenant-a/project-a/chatgpt", Instant.now().plusSeconds(3600), Instant.now()));
+            assertThat(restrictedJdbc.queryForObject("""
+                    SELECT revoked_at IS NULL FROM worker_model_proxy_credentials
+                     WHERE agent_id = ? AND session_id = ?
+                    """, Boolean.class, AGENT_ID, SESSION_ID)).isTrue();
             assertThat(restrictedRepository.revoke(AGENT_ID, SESSION_ID, Instant.now())).isTrue();
+            assertThat(restrictedJdbc.queryForObject("""
+                    SELECT revoked_at IS NOT NULL FROM worker_model_proxy_credentials
+                     WHERE agent_id = ? AND session_id = ?
+                    """, Boolean.class, AGENT_ID, SESSION_ID)).isTrue();
         });
         assertThat(jdbc.queryForObject("SELECT token_sha256 FROM worker_model_proxy_credentials WHERE session_id = ?",
                 String.class, SESSION_ID)).isEqualTo(
@@ -159,6 +167,9 @@ class JdbcWorkerSessionRepositoryPostgresTest {
                 .isInstanceOf(org.springframework.dao.DataAccessException.class);
         assertThatThrownBy(() -> restrictedJdbc.queryForObject(
                 "SELECT token_sha256 FROM worker_model_proxy_credentials", String.class))
+                .isInstanceOf(org.springframework.dao.DataAccessException.class);
+        assertThatThrownBy(() -> restrictedJdbc.queryForObject(
+                "SELECT model_credential_ref FROM worker_model_proxy_credentials", String.class))
                 .isInstanceOf(org.springframework.dao.DataAccessException.class);
         assertThatThrownBy(
                 () -> restrictedJdbc.update("UPDATE agents SET phase = 'TERMINATED' WHERE id = ?", AGENT_ID))
@@ -354,6 +365,8 @@ class JdbcWorkerSessionRepositoryPostgresTest {
             jdbc.execute("DROP POLICY IF EXISTS worker_enrollment_agents_scope ON agents");
             jdbc.execute("DROP POLICY IF EXISTS worker_enrollment_sessions_scope ON agent_sessions");
             jdbc.execute("DROP POLICY IF EXISTS worker_enrollment_model_proxy_credentials_insert_scope "
+                    + "ON worker_model_proxy_credentials");
+            jdbc.execute("DROP POLICY IF EXISTS worker_enrollment_model_proxy_credentials_select_scope "
                     + "ON worker_model_proxy_credentials");
             jdbc.execute("DROP POLICY IF EXISTS worker_enrollment_model_proxy_credentials_update_scope "
                     + "ON worker_model_proxy_credentials");
