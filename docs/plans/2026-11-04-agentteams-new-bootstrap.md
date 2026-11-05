@@ -80,6 +80,8 @@
 
 **Credential Proxy 镜像与门禁 CI 验收（2026-11-05）：** 首次镜像 CI 暴露 Dockerfile 只复制代理模块、未复制根 Maven reactor 的 `worker-enrollment` 子模块；补齐模块后又发现构建容器必须读取 GitHub Maven Packages 共享依赖。最终 Dockerfile 通过 BuildKit secret mount 临时读取 Maven settings，CI 显式授予 `packages: read`，不会把凭据写入镜像层。GitHub Actions [run 42013328422](https://github.com/ly416123/agentteams-new/actions/runs/42013328422) 全绿：Maven `verify`、18 项 Enrollment/PostgreSQL/OIDC/Gateway 集成门禁、5 项代理数据库边界测试、9 项 Attempt resolver、7 项凭据文件源、10 项模型代理 HTTP/SSE 与 Compose 校验均满足零跳过要求，Credential Proxy OCI 镜像构建成功。本机已通过代理模块的 Maven verify、8 项 Compose 契约测试、脚本语法和 Compose 配置解析；本机 Testcontainers 未发现可用 socket，5 项 PostgreSQL 容器测试由 CI 实际执行。实现已推送 PR #1，当前未合并。
 
+**批次 2A 固定 Control Plane API/scope 首轮清单（2026-11-05）：** 从 GitHub tag `v0.1.5` 对应固定源码 commit `0156f2c1fecdc868cb4a0f4f13fb068bb4162834` 只读列出主要 API Controller 路由族、资源表、Outbox/NATS 与后台作业类别，见 [v0.1.5 API 与 scope 闭环盘点](../audits/2026-11-05-v015-api-scope-closure-inventory.md)。首轮发现 HTTP 入口覆盖 Task lifecycle/execution/Event、Artifact/File/Result、Subtask、Scheduled Task、Team、Conversation/Memory、MCP、Evaluation/Quality/Webhook、Organization/Management、Sandbox 和内部服务接口；异步边界包括 Outbox Relay、NATS execution consumer、recovery/checkpoint、scheduled/deployment/quality 等作业。源码可见部分 Controller 直接调用 Principal scope guard，其他路由可能在 Service/Repository/过滤器或内部身份层授权；未追完调用链和负向测试，因此不将“Controller 无直接调用”判成漏洞或已通过。该审计只完成 2A 的第一轮范围列举，不构成运行时隔离证明。旧仓库当前本机 checkout 与该 tag 不同且含用户未提交改动；本轮未写入或切换旧仓库。
+
 ## 批次 1：无 Kubernetes 固定容量 Compose POC
 
 1. 先从旧仓库构建并发布 Control Plane、Gateway、Worker 的固定版本 OCI 镜像；记录镜像 digest 和源 commit。
@@ -94,7 +96,7 @@
 
 ## 批次 2：租户与会话隔离
 
-1. 以[多租户与会话隔离验收矩阵](../specs/2026-11-05-tenant-session-isolation-matrix.md)为资源基线，定义不可变 `ExecutionContext` 的 protobuf 字段、签发方、验证方、版本及过期规则；scope 不由 Worker/客户端自行选择。
+1. 以[多租户与会话隔离验收矩阵](../specs/2026-11-05-tenant-session-isolation-matrix.md)和[v0.1.5 API 与 scope 闭环盘点](../audits/2026-11-05-v015-api-scope-closure-inventory.md)为资源基线，逐资源族补全真实 Controller → Service → Repository → 表/事件消费者调用链；再定义新路径不可变 `ExecutionContext` 的 protobuf 字段、签发方、验证方、版本及过期规则。首轮路由列举已完成，授权链与负向验收仍未完成；scope 不由 Worker/客户端自行选择。
 2. 先建立按 Task、Attempt、Conversation、Memory、Artifact、MCP binding、workspace 和后台 Job 划分的 scope 矩阵，统一 scope-aware 数据访问入口；跨租户 ID 猜测、伪造上下文、无 scope 的后台操作默认拒绝。
 3. 实现 Attempt 独立会话状态、目录、缓存键和 MCP 客户端生命周期；完成/取消/失败/租约过期均执行清理。
 4. [部分完成] `worker_enrollment` 的 `agents`、`agent_sessions` 已采用独立非绕过 RLS 角色和事务局部 scope；应用层 scope 校验保持强制。其余 Task、Attempt、Conversation/Memory、Artifact/File、Tool/MCP、Outbox/Audit 表需先完成真实 schema/调用链盘点，再逐表加入策略和负向验收。
