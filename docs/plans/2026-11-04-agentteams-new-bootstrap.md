@@ -76,7 +76,7 @@
 
 **模型代理 Token 鉴权查询（2026-11-05）：** `credential-proxy` 新增 `JdbcModelProxyCredentialAuthenticator`，仅接受固定格式 `atp_` token，在应用侧计算 SHA-256 后调用独立 PostgreSQL `SECURITY DEFINER` 函数；函数同时验证 Token 与 Gateway session 的撤销/过期状态，以及 Agent 当前 Tenant/Project/Team scope，且只返回代理所需身份和非敏感凭据引用。运行角色只能执行函数，不能读取 Token 哈希表。GitHub Actions [run 42006970309](https://github.com/ly416123/agentteams-new/actions/runs/42006970309) 全绿，5 项 PostgreSQL Credential Proxy 边界测试、9 项 Resolver 测试及全部 Enrollment/OIDC/Compose 门禁均执行通过、零跳过。本机 Maven 编译和 9 项 Resolver 测试通过；本机无 Docker，5 项数据库测试本地跳过，由 CI 实际执行。此阶段只完成认证与身份解析，尚未接入 HTTP 模型代理、Provider Secret Source、上游请求转发和流式处理。
 
-**凭据文件源（2026-11-05）：** `credential-proxy` 增加 `CredentialSource` 接口和只接受 `file:<相对路径>` 的容器文件实现。路径限制在挂载根目录内，拒绝绝对路径、穿越、逃逸 symlink、缺失/空文件及超过 64 KiB 的文件；读取时清零中间字节与字符缓冲，异常不回显引用或路径。5 项安全测试覆盖正常读取和拒绝边界，CI 增加零跳过门禁。挂载根目录必须由运维只读挂载，HTTP 代理尚未接入该 source，因此当前还不能用于模型调用。
+**凭据文件源（2026-11-05）：** `credential-proxy` 增加 `CredentialSource` 接口和只接受 `file:<相对路径>` 的容器文件实现。路径限制在挂载根目录内，拒绝绝对路径、穿越、逃逸 symlink、缺失/空文件及超过 64 KiB 的文件；读取时清零中间字节与字符缓冲，异常不回显引用或路径。5 项安全测试覆盖正常读取和拒绝边界。GitHub Actions [run 42007958762](https://github.com/ly416123/agentteams-new/actions/runs/42007958762) 全绿，Credential Source 5 项测试零跳过，PostgreSQL、Resolver 和 Compose 门禁也均通过。挂载根目录必须由运维只读挂载，HTTP 代理尚未接入该 source，因此当前还不能用于模型调用。
 
 ## 批次 1：无 Kubernetes 固定容量 Compose POC
 
