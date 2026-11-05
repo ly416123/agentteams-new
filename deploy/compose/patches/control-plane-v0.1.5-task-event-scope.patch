@@ -2,36 +2,68 @@ diff --git a/control-plane/src/main/java/io/agentteams/controlplane/ControlPlane
 index 3e59349..693a19f 100644
 --- a/control-plane/src/main/java/io/agentteams/controlplane/ControlPlaneConfiguration.java
 +++ b/control-plane/src/main/java/io/agentteams/controlplane/ControlPlaneConfiguration.java
-@@ -7,0 +8 @@ import io.agentteams.controlplane.application.ControlPlaneExecutionEventAdapter;
+@@ -5,6 +5,7 @@ import io.agentteams.application.api.ConfigEventPort;
+ import io.agentteams.application.api.TaskExecutionObservationPort;
+ import io.agentteams.application.api.TaskCommandPort;
+ import io.agentteams.controlplane.application.ControlPlaneExecutionEventAdapter;
 +import io.agentteams.controlplane.application.TaskEventScopeGuard;
-@@ -723 +724,2 @@ public class ControlPlaneConfiguration {
+ import io.agentteams.controlplane.application.ControlPlaneTaskCommandAdapter;
+ import io.agentteams.controlplane.application.ControlPlaneConfigEventAdapter;
+ import io.agentteams.controlplane.outbox.EventPublisher;
+@@ -720,9 +721,10 @@ public class ControlPlaneConfiguration {
+     @Bean
+     @org.springframework.boot.autoconfigure.condition.ConditionalOnBean(ExecutionEventService.class)
+     ExecutionEventPort executionEventPort(ExecutionEventService executionEvents, DataSource dataSource,
 -            TaskExecutionObservationPort observations) {
 +            TaskExecutionObservationPort observations, TaskEventScopeGuard taskEventScopeGuard) {
 +        org.springframework.jdbc.core.JdbcTemplate jdbc = new org.springframework.jdbc.core.JdbcTemplate(dataSource);
-@@ -725 +727 @@ public class ControlPlaneConfiguration {
+         return new ControlPlaneExecutionEventAdapter(executionEvents,
 -                new JdbcModelCallAuditRecorder(new org.springframework.jdbc.core.JdbcTemplate(dataSource)), observations);
 +                new JdbcModelCallAuditRecorder(jdbc), observations, taskEventScopeGuard);
+     }
+
+     @Bean
 diff --git a/control-plane/src/main/java/io/agentteams/controlplane/application/ControlPlaneExecutionEventAdapter.java b/control-plane/src/main/java/io/agentteams/controlplane/application/ControlPlaneExecutionEventAdapter.java
 index dcc48ef..4568d23 100644
 --- a/control-plane/src/main/java/io/agentteams/controlplane/application/ControlPlaneExecutionEventAdapter.java
 +++ b/control-plane/src/main/java/io/agentteams/controlplane/application/ControlPlaneExecutionEventAdapter.java
-@@ -25,0 +26 @@ public final class ControlPlaneExecutionEventAdapter implements ExecutionEventPo
+@@ -23,6 +23,7 @@ public final class ControlPlaneExecutionEventAdapter implements ExecutionEventPo
+     private final ExecutionEventService executionEvents;
+     private final ModelCallAuditRecorder modelCallAudits;
+     private final TaskExecutionObservationPort observations;
 +    private final TaskEventScopeGuard taskEventScopeGuard;
-@@ -37,0 +39,6 @@ public final class ControlPlaneExecutionEventAdapter implements ExecutionEventPo
+
+     public ControlPlaneExecutionEventAdapter(ExecutionEventService executionEvents) {
+         this(executionEvents, ModelCallAuditRecorder.noop(), TaskExecutionObservationPort.noop());
+@@ -35,9 +36,16 @@ public final class ControlPlaneExecutionEventAdapter implements ExecutionEventPo
+
+     public ControlPlaneExecutionEventAdapter(ExecutionEventService executionEvents,
+             ModelCallAuditRecorder modelCallAudits, TaskExecutionObservationPort observations) {
 +        this(executionEvents, modelCallAudits, observations, TaskEventScopeGuard.rejectAll());
 +    }
 +
 +    public ControlPlaneExecutionEventAdapter(ExecutionEventService executionEvents,
 +            ModelCallAuditRecorder modelCallAudits, TaskExecutionObservationPort observations,
 +            TaskEventScopeGuard taskEventScopeGuard) {
-@@ -40,0 +48 @@ public final class ControlPlaneExecutionEventAdapter implements ExecutionEventPo
+         this.executionEvents = Objects.requireNonNull(executionEvents, "executionEvents");
+         this.modelCallAudits = Objects.requireNonNull(modelCallAudits, "modelCallAudits");
+         this.observations = Objects.requireNonNull(observations, "observations");
 +        this.taskEventScopeGuard = Objects.requireNonNull(taskEventScopeGuard, "taskEventScopeGuard");
-@@ -99,2 +107,3 @@ public final class ControlPlaneExecutionEventAdapter implements ExecutionEventPo
+     }
+
+     @Override
+@@ -96,8 +104,9 @@ public final class ControlPlaneExecutionEventAdapter implements ExecutionEventPo
+         Objects.requireNonNull(command, "command");
+         // runId 与既有 observe(...) 相同：run == attempt。白名单与范围校验
+         // 由观测适配器二次校验（不信任上游）。
 -        observations.observed(taskId, command.attemptId(), command.eventId(), command.occurredAt(),
 -                command.correlationId(), command.eventType(), command.payloadJson());
 +        taskEventScopeGuard.runIfActive(taskId, command, () -> observations.observed(taskId,
 +                command.attemptId(), command.eventId(), command.occurredAt(), command.correlationId(),
 +                command.eventType(), command.payloadJson()));
+     }
+
+     private static ArtifactRecord toRecord(UUID taskId, UUID attemptId, UUID eventId, Instant at,
 diff --git a/control-plane/src/main/java/io/agentteams/controlplane/application/JdbcTaskEventScopeGuard.java b/control-plane/src/main/java/io/agentteams/controlplane/application/JdbcTaskEventScopeGuard.java
 new file mode 100644
 index 0000000..fafe4d9
@@ -129,20 +161,46 @@ diff --git a/control-plane/src/main/java/io/agentteams/controlplane/skill/SkillC
 index 13de114..83fc603 100644
 --- a/control-plane/src/main/java/io/agentteams/controlplane/skill/SkillController.java
 +++ b/control-plane/src/main/java/io/agentteams/controlplane/skill/SkillController.java
-@@ -89,0 +90 @@ public final class SkillController {
+@@ -87,6 +87,7 @@ public final class SkillController {
+     @PostMapping("/{skillId}/versions/{versionId}/package/upload")
+     public PackageUploadResponse preparePackageUpload(@PathVariable UUID skillId, @PathVariable UUID versionId,
+             @RequestBody PackageUploadRequest request) {
 +        service.getSkill(skillId);
-@@ -100,0 +102 @@ public final class SkillController {
+         requirePackageStorage();
+         requireRequest(request);
+         SkillPackageStorageService.SkillPackageUpload upload = packageStorage.prepareUpload(skillId, versionId,
+@@ -98,12 +99,14 @@ public final class SkillController {
+
+     @PostMapping("/{skillId}/versions/{versionId}/package/complete")
+     public SkillVersionResponse completePackageUpload(@PathVariable UUID skillId, @PathVariable UUID versionId) {
 +        service.getSkill(skillId);
-@@ -106,0 +109 @@ public final class SkillController {
+         requirePackageStorage();
+         return SkillVersionResponse.from(packageStorage.completeUpload(skillId, versionId), objectMapper);
+     }
+
+     @GetMapping("/{skillId}/versions/{versionId}/package/download")
+     public PackageDownloadResponse downloadPackage(@PathVariable UUID skillId, @PathVariable UUID versionId) {
 +        service.getSkill(skillId);
+         requirePackageStorage();
+         return new PackageDownloadResponse(packageStorage.prepareDownload(skillId, versionId, Duration.ofMinutes(15)));
+     }
 diff --git a/control-plane/src/test/java/io/agentteams/controlplane/application/ControlPlaneExecutionEventAdapterTest.java b/control-plane/src/test/java/io/agentteams/controlplane/application/ControlPlaneExecutionEventAdapterTest.java
 index b576d6e..22dd0b4 100644
 --- a/control-plane/src/test/java/io/agentteams/controlplane/application/ControlPlaneExecutionEventAdapterTest.java
 +++ b/control-plane/src/test/java/io/agentteams/controlplane/application/ControlPlaneExecutionEventAdapterTest.java
-@@ -6,0 +7,2 @@ import static org.mockito.Mockito.verify;
+@@ -4,6 +4,8 @@ import static org.mockito.ArgumentMatchers.any;
+ import static org.mockito.ArgumentMatchers.eq;
+ import static org.mockito.Mockito.mock;
+ import static org.mockito.Mockito.verify;
 +import static org.mockito.Mockito.never;
 +import static org.mockito.Mockito.when;
-@@ -17,0 +20,38 @@ class ControlPlaneExecutionEventAdapterTest {
+
+ import io.agentteams.application.api.ExecutionEventPort;
+ import io.agentteams.application.api.TaskExecutionObservationPort;
+@@ -15,6 +17,44 @@ import java.util.UUID;
+ import org.junit.jupiter.api.Test;
+
+ class ControlPlaneExecutionEventAdapterTest {
 +    @Test
 +    void dropsTaskEventWhenActiveExecutionScopeDoesNotMatch() {
 +        UUID taskId = UUID.randomUUID();
@@ -181,13 +239,20 @@ index b576d6e..22dd0b4 100644
 +                eq(command.payloadJson()));
 +    }
 +
-@@ -41,0 +82,6 @@ class ControlPlaneExecutionEventAdapterTest {
+     @Test
+     void publishesTerminalSuccessToTheTaskExecutionObservationProjection() {
+         UUID taskId = UUID.randomUUID();
+@@ -39,4 +79,10 @@ class ControlPlaneExecutionEventAdapterTest {
+         verify(observations).completed(eq(taskId), eq(attemptId), eq(eventId), eq(occurredAt), eq("corr-1"),
+                 eq(""), eq(List.of(artifact)));
+     }
 +
 +    private static ExecutionEventPort.TaskEventReportCommand taskEventCommand() {
 +        return new ExecutionEventPort.TaskEventReportCommand(UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID(),
 +                Instant.parse("2026-09-07T00:00:00Z"), UUID.randomUUID().toString(), "tool.started", "{}", 1,
 +                "corr-1");
 +    }
+ }
 diff --git a/control-plane/src/test/java/io/agentteams/controlplane/application/JdbcTaskEventScopeGuardPostgresTest.java b/control-plane/src/test/java/io/agentteams/controlplane/application/JdbcTaskEventScopeGuardPostgresTest.java
 new file mode 100644
 index 0000000..da9d31b
@@ -329,17 +394,77 @@ index 0000000..da9d31b
 +        return dataSource;
 +    }
 +}
+diff --git a/control-plane/src/test/java/io/agentteams/controlplane/config/ConfigDeploymentServiceTest.java b/control-plane/src/test/java/io/agentteams/controlplane/config/ConfigDeploymentServiceTest.java
+index e27b905..de37996 100644
+--- a/control-plane/src/test/java/io/agentteams/controlplane/config/ConfigDeploymentServiceTest.java
++++ b/control-plane/src/test/java/io/agentteams/controlplane/config/ConfigDeploymentServiceTest.java
+@@ -241,6 +241,40 @@ class ConfigDeploymentServiceTest {
+                         && result.resourceId().equals("skill-a") && result.status().equals("APPLIED")));
+     }
+
++    @Test
++    void rejectsConfigAppliedAckWhenAuthenticatedAgentDoesNotOwnTheBinding() {
++        FoundationPersistenceService persistence = mock(FoundationPersistenceService.class);
++        FoundationTransaction tx = mock(FoundationTransaction.class);
++        ConfigLifecycleRepository lifecycle = mock(ConfigLifecycleRepository.class);
++        ConfigSnapshotRepository snapshots = mock(ConfigSnapshotRepository.class);
++        UUID bindingId = UUID.randomUUID();
++        UUID ownerAgentId = UUID.randomUUID();
++        UUID otherAgentId = UUID.randomUUID();
++        UUID snapshotId = UUID.randomUUID();
++        ConfigSnapshot snapshot = new ConfigSnapshot(snapshotId, "worker", 7, "{}", "sha", "test", NOW);
++        ConfigBindingRecord binding = new ConfigBindingRecord(bindingId, "worker", ownerAgentId, snapshotId, NOW);
++        var command = new io.agentteams.application.api.ConfigEventPort.ConfigAppliedCommand(
++                UUID.randomUUID(), bindingId, snapshotId, otherAgentId, 7, true, "", NOW, "gateway", "corr-7",
++                List.of());
++        when(tx.configLifecycle()).thenReturn(lifecycle);
++        when(lifecycle.findBinding(bindingId)).thenReturn(Optional.of(binding));
++        when(snapshots.findById(snapshotId)).thenReturn(Optional.of(snapshot));
++        when(persistence.inTransaction(any())).thenAnswer(invocation -> {
++            Function<FoundationTransaction, ?> work = invocation.getArgument(0);
++            return work.apply(tx);
++        });
++
++        org.assertj.core.api.Assertions.assertThatThrownBy(() ->
++                new ConfigDeploymentService(persistence, snapshots, Clock.fixed(NOW, ZoneOffset.UTC), MAPPER)
++                        .recordApplied(command))
++                .isInstanceOf(IllegalArgumentException.class)
++                .hasMessage("config acknowledgement does not match binding");
++
++        org.mockito.Mockito.verify(lifecycle, org.mockito.Mockito.never()).findApply(any(), any());
++        org.mockito.Mockito.verify(lifecycle, org.mockito.Mockito.never()).recordApply(any());
++        org.mockito.Mockito.verify(lifecycle, org.mockito.Mockito.never()).recordResourceApply(any());
++    }
++
+     private static String retryHash(UUID bindingId, ConfigSnapshot snapshot) {
+         try {
+             return java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256")
 diff --git a/control-plane/src/test/java/io/agentteams/controlplane/skill/SkillControllerTest.java b/control-plane/src/test/java/io/agentteams/controlplane/skill/SkillControllerTest.java
 index f33c0c2..bea83c1 100644
 --- a/control-plane/src/test/java/io/agentteams/controlplane/skill/SkillControllerTest.java
 +++ b/control-plane/src/test/java/io/agentteams/controlplane/skill/SkillControllerTest.java
-@@ -4,0 +5,3 @@ import static org.mockito.ArgumentMatchers.eq;
+@@ -2,6 +2,9 @@ package io.agentteams.controlplane.skill;
+
+ import static org.mockito.ArgumentMatchers.any;
+ import static org.mockito.ArgumentMatchers.eq;
 +import static org.mockito.Mockito.doThrow;
 +import static org.mockito.Mockito.verify;
 +import static org.mockito.Mockito.verifyNoInteractions;
-@@ -12,0 +16 @@ import io.agentteams.controlplane.api.ApiErrorHandler;
+ import static org.mockito.Mockito.when;
+ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+@@ -10,6 +13,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
+
+ import com.fasterxml.jackson.databind.ObjectMapper;
+ import io.agentteams.controlplane.api.ApiErrorHandler;
 +import io.agentteams.controlplane.security.AuthorizationException;
-@@ -164,0 +169,25 @@ class SkillControllerTest {
+ import java.time.Instant;
+ import java.net.URL;
+ import java.util.List;
+@@ -162,4 +166,29 @@ class SkillControllerTest {
+                 .andExpect(status().isOk())
+                 .andExpect(jsonPath("$.id").value(versionId.toString()));
+     }
 +
 +    @Test
 +    void rejectsCrossScopePackageUploadCompletionAndDownloadBeforeIssuingStorageUrls() throws Exception {
@@ -365,23 +490,43 @@ index f33c0c2..bea83c1 100644
 +        verify(service, org.mockito.Mockito.times(3)).getSkill(skillId);
 +        verifyNoInteractions(packageStorage);
 +    }
+ }
 diff --git a/deploy/docker/control-plane.Dockerfile b/deploy/docker/control-plane.Dockerfile
 index 66e64ff..4981640 100644
 --- a/deploy/docker/control-plane.Dockerfile
 +++ b/deploy/docker/control-plane.Dockerfile
-@@ -3 +3 @@
+@@ -1,13 +1,13 @@
+ # Java bytecode is platform independent; compile on BUILDPLATFORM and keep
+ # only the runtime image on TARGETPLATFORM.
 -FROM --platform=$BUILDPLATFORM maven:3.9.16-eclipse-temurin-21 AS build
 +FROM --platform=$BUILDPLATFORM dockerproxy.net/library/maven@sha256:99e61abcff91a9b1333463bd8451fb18495d6eba9250ac66a338b518f8278320 AS build
-@@ -10 +10 @@ RUN mvn -q -pl control-plane -DskipTests package spring-boot:repackage
+ WORKDIR /workspace
+ COPY deploy/docker/maven-settings.xml /root/.m2/settings.xml
+ COPY . .
+ RUN mvn -q -pl control-plane -am -DskipTests install
+ RUN mvn -q -pl control-plane -DskipTests package spring-boot:repackage
+
 -FROM eclipse-temurin:21-jre
 +FROM dockerproxy.net/library/eclipse-temurin@sha256:0b99b3376fbb50dbf9c0af8535fdd5b8eb0d3fdfc8b1e4967f383b6919f6901a
+ WORKDIR /app
+ COPY --from=build /workspace/control-plane/target/agentteams-control-plane-0.1.0-SNAPSHOT.jar /app/app.jar
+ USER 10001
 diff --git a/integration-tests/src/test/java/io/agentteams/it/FakeAgent.java b/integration-tests/src/test/java/io/agentteams/it/FakeAgent.java
 index 60c40b6..23e1a46 100644
 --- a/integration-tests/src/test/java/io/agentteams/it/FakeAgent.java
 +++ b/integration-tests/src/test/java/io/agentteams/it/FakeAgent.java
-@@ -19,0 +20 @@ import io.agentteams.contracts.v1.TaskProgress;
+@@ -17,6 +17,7 @@ import io.agentteams.contracts.v1.TaskAssigned;
+ import io.agentteams.contracts.v1.TaskCompleted;
+ import io.agentteams.contracts.v1.TaskHeartbeat;
+ import io.agentteams.contracts.v1.TaskProgress;
 +import io.agentteams.contracts.v1.TaskEventReport;
-@@ -156,0 +158,13 @@ final class FakeAgent implements AutoCloseable {
+ import io.agentteams.gateway.SequencedCommand;
+ import io.grpc.ManagedChannel;
+ import io.grpc.ManagedChannelBuilder;
+@@ -154,6 +155,19 @@ final class FakeAgent implements AutoCloseable {
+                 .build()).build());
+     }
+
 +    void reportTaskEventForTask(TaskAssigned assignment, String targetTaskId, String eventId) {
 +        EventMetadata metadata = taskMetadata(assignment, eventId, 6).toBuilder()
 +                .setTaskId(targetTaskId)
@@ -395,6 +540,9 @@ index 60c40b6..23e1a46 100644
 +                .build()).build());
 +    }
 +
+     void complete(TaskAssigned assignment, String name, String storageKey, String sha256, long sizeBytes) {
+         requests.onNext(AgentMessage.newBuilder().setTaskCompleted(TaskCompleted.newBuilder()
+                 .setMetadata(taskMetadata(assignment, UUID.randomUUID().toString(), 5))
 diff --git a/integration-tests/src/test/java/io/agentteams/it/TaskEventScopeEndToEndIT.java b/integration-tests/src/test/java/io/agentteams/it/TaskEventScopeEndToEndIT.java
 new file mode 100644
 index 0000000..d0b1985
