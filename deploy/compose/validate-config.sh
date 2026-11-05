@@ -43,8 +43,9 @@ if [ "$api_auth_enabled" = "true" ]; then
   for key in OIDC_ISSUER_URI OIDC_JWK_SET_URI; do
     oidc_value=$(value "$key")
     case "$oidc_value" in
-      https://*|http://*) ;;
-      *) echo "$key must be an absolute HTTP(S) URL when API_AUTH_ENABLED=true" >&2; exit 2 ;;
+      https://*) ;;
+      http://*) echo "$key must use HTTPS when API_AUTH_ENABLED=true" >&2; exit 2 ;;
+      *) echo "$key must be an absolute HTTPS URL when API_AUTH_ENABLED=true" >&2; exit 2 ;;
     esac
   done
   audience=$(value OIDC_AUDIENCE)

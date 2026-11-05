@@ -21,9 +21,11 @@
 
 ## 仓库边界
 
-当前 `agentteams-java` 是完整源码仓库。为避免本仓库通过本机相对路径引用兄弟目录，或复制一份控制面和 Worker 后独立演进，6 个共享模块与根 parent 已以 `0.1.5` 发布到 GitHub Packages，并通过本仓库独立 Maven consumer 完成远端解析验证。
+`agentteams-new` 是无 Kubernetes 目标架构的主线和最终部署入口。多租户授权、Worker enrollment、固定容量调度、会话/Attempt 隔离、凭证代理、部署配置及后续新能力均在本仓库实现和验收；不能因为旧仓库已有实现，就默认把新功能继续加到 `agentteams-java`。
 
-批次 0 已在 `agentteams-java` 发布并验证 contracts、domain、application-contracts、runtime、observability、storage 六个共享模块的版本化 Maven 制品。后续如发现模块边界不适合独立发布，则以受控迁移和兼容 API/事件契约替代；决策及影响记录在 [共享核心复用 ADR](docs/decisions/0001-shared-core-reuse.md)。
+`agentteams-java` 当前作为有版本约束的上游兼容来源：新项目可复用稳定的领域/API 核心制品；当前 POC 暂时复用 v0.1.5 Control Plane、Gateway 和 Worker OCI 镜像，以验证任务协议、状态机和部署链路。整套旧应用镜像只是迁移过渡，不是新架构的终态依赖。只有阻断新项目的上游安全/兼容问题才回旧仓库做最小、独立、可审计的修复；后续应在新仓库建立所需的替代实现或边界清晰的应用制品。
+
+六个共享模块与根 parent 已以固定版本发布到 GitHub Packages，并通过独立 Maven consumer 完成远端解析验证。共享核心复用策略及应用镜像迁移门槛见[共享核心复用 ADR](docs/decisions/0001-shared-core-reuse.md)。
 
 ## 架构与计划
 
