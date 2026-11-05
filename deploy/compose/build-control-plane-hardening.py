@@ -61,6 +61,7 @@ def require_tests(source: Path) -> None:
     expected = {
         "io.agentteams.controlplane.application.ControlPlaneExecutionEventAdapterTest": 3,
         "io.agentteams.controlplane.application.JdbcTaskEventScopeGuardPostgresTest": 4,
+        "io.agentteams.controlplane.skill.SkillControllerTest": 6,
     }
     for class_name, expected_count in expected.items():
         report = reports / f"TEST-{class_name}.xml"
@@ -107,7 +108,7 @@ def main() -> int:
         run(["patch", "--batch", "--forward", "-p1", "-i", str(patch_file)], cwd=source)
         run([
             "mvn", "--batch-mode", "--no-transfer-progress", "-pl", "control-plane", "-am",
-            "-Dtest=ControlPlaneExecutionEventAdapterTest,JdbcTaskEventScopeGuardPostgresTest",
+            "-Dtest=ControlPlaneExecutionEventAdapterTest,JdbcTaskEventScopeGuardPostgresTest,SkillControllerTest",
             "-Dsurefire.failIfNoSpecifiedTests=false", "test",
         ], cwd=source)
         run([

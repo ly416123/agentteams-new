@@ -125,6 +125,16 @@ index 0000000..b563fdc
 +        return (taskId, command, projection) -> false;
 +    }
 +}
+diff --git a/control-plane/src/main/java/io/agentteams/controlplane/skill/SkillController.java b/control-plane/src/main/java/io/agentteams/controlplane/skill/SkillController.java
+index 13de114..83fc603 100644
+--- a/control-plane/src/main/java/io/agentteams/controlplane/skill/SkillController.java
++++ b/control-plane/src/main/java/io/agentteams/controlplane/skill/SkillController.java
+@@ -89,0 +90 @@ public final class SkillController {
++        service.getSkill(skillId);
+@@ -100,0 +102 @@ public final class SkillController {
++        service.getSkill(skillId);
+@@ -106,0 +109 @@ public final class SkillController {
++        service.getSkill(skillId);
 diff --git a/control-plane/src/test/java/io/agentteams/controlplane/application/ControlPlaneExecutionEventAdapterTest.java b/control-plane/src/test/java/io/agentteams/controlplane/application/ControlPlaneExecutionEventAdapterTest.java
 index b576d6e..22dd0b4 100644
 --- a/control-plane/src/test/java/io/agentteams/controlplane/application/ControlPlaneExecutionEventAdapterTest.java
@@ -319,6 +329,42 @@ index 0000000..da9d31b
 +        return dataSource;
 +    }
 +}
+diff --git a/control-plane/src/test/java/io/agentteams/controlplane/skill/SkillControllerTest.java b/control-plane/src/test/java/io/agentteams/controlplane/skill/SkillControllerTest.java
+index f33c0c2..bea83c1 100644
+--- a/control-plane/src/test/java/io/agentteams/controlplane/skill/SkillControllerTest.java
++++ b/control-plane/src/test/java/io/agentteams/controlplane/skill/SkillControllerTest.java
+@@ -4,0 +5,3 @@ import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.Mockito.doThrow;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.verifyNoInteractions;
+@@ -12,0 +16 @@ import io.agentteams.controlplane.api.ApiErrorHandler;
++import io.agentteams.controlplane.security.AuthorizationException;
+@@ -164,0 +169,25 @@ class SkillControllerTest {
++
++    @Test
++    void rejectsCrossScopePackageUploadCompletionAndDownloadBeforeIssuingStorageUrls() throws Exception {
++        UUID skillId = UUID.randomUUID();
++        UUID versionId = UUID.randomUUID();
++        doThrow(new AuthorizationException("resource is outside caller project")).when(service).getSkill(skillId);
++        MockMvc packageMockMvc = MockMvcBuilders
++                .standaloneSetup(new SkillController(service, new ObjectMapper(), packageStorage))
++                .setControllerAdvice(new ApiErrorHandler()).build();
++
++        packageMockMvc.perform(post("/api/v1/skills/{skillId}/versions/{versionId}/package/upload", skillId,
++                        versionId)
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content("{\"sizeBytes\":4,\"sha256\":\"" + "a".repeat(64) + "\"}"))
++                .andExpect(status().isForbidden());
++        packageMockMvc.perform(post("/api/v1/skills/{skillId}/versions/{versionId}/package/complete", skillId,
++                        versionId))
++                .andExpect(status().isForbidden());
++        packageMockMvc.perform(get("/api/v1/skills/{skillId}/versions/{versionId}/package/download", skillId,
++                        versionId))
++                .andExpect(status().isForbidden());
++
++        verify(service, org.mockito.Mockito.times(3)).getSkill(skillId);
++        verifyNoInteractions(packageStorage);
++    }
 diff --git a/deploy/docker/control-plane.Dockerfile b/deploy/docker/control-plane.Dockerfile
 index 66e64ff..4981640 100644
 --- a/deploy/docker/control-plane.Dockerfile
