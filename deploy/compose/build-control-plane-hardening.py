@@ -62,6 +62,7 @@ def require_tests(source: Path) -> None:
         "io.agentteams.controlplane.application.ControlPlaneExecutionEventAdapterTest": 3,
         "io.agentteams.controlplane.application.JdbcTaskEventScopeGuardPostgresTest": 4,
         "io.agentteams.controlplane.config.ConfigDeploymentServiceTest": 7,
+        "io.agentteams.controlplane.team.TeamDeploymentRepositoryTest": 4,
         "io.agentteams.controlplane.skill.SkillControllerTest": 6,
     }
     for class_name, expected_count in expected.items():
@@ -110,7 +111,7 @@ def main() -> int:
         run([
             "mvn", "--batch-mode", "--no-transfer-progress", "-P", "!colima-testcontainers",
             "-pl", "control-plane", "-am",
-            "-Dtest=ControlPlaneExecutionEventAdapterTest,JdbcTaskEventScopeGuardPostgresTest,ConfigDeploymentServiceTest,SkillControllerTest",
+            "-Dtest=ControlPlaneExecutionEventAdapterTest,JdbcTaskEventScopeGuardPostgresTest,ConfigDeploymentServiceTest,TeamDeploymentRepositoryTest,SkillControllerTest",
             "-Dsurefire.failIfNoSpecifiedTests=false", "test",
         ], cwd=source)
         run([

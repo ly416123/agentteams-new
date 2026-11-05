@@ -491,6 +491,32 @@ index f33c0c2..bea83c1 100644
 +        verifyNoInteractions(packageStorage);
 +    }
  }
+diff --git a/control-plane/src/test/java/io/agentteams/controlplane/team/TeamDeploymentRepositoryTest.java b/control-plane/src/test/java/io/agentteams/controlplane/team/TeamDeploymentRepositoryTest.java
+index 97a0dbc..729b5d3 100644
+--- a/control-plane/src/test/java/io/agentteams/controlplane/team/TeamDeploymentRepositoryTest.java
++++ b/control-plane/src/test/java/io/agentteams/controlplane/team/TeamDeploymentRepositoryTest.java
+@@ -81,6 +81,21 @@ class TeamDeploymentRepositoryTest {
+         assertThat(repository.find(second).orElseThrow().status()).isEqualTo("SUCCEEDED");
+     }
+
++    @Test
++    void doesNotAdvanceDeploymentWhenAcknowledgementAgentDoesNotOwnTheBinding() {
++        UUID deploymentId = deploy("deployment-forged-agent-ack");
++        UUID otherAgentId = UUID.randomUUID();
++        ConfigAppliedCommand forged = new ConfigAppliedCommand(applyEventId, bindingId, snapshotId, otherAgentId,
++                CONFIG_VERSION, true, null, NOW, "test", "forged-agent-ack", List.of());
++
++        repository.recordConfigAppliedAck(forged);
++
++        TeamDeployment unchanged = repository.find(deploymentId).orElseThrow();
++        assertThat(unchanged.status()).isEqualTo("PENDING");
++        assertThat(unchanged.members()).singleElement()
++                .extracting(TeamDeployment.Member::status).isEqualTo("PENDING");
++    }
++
+     @Test
+     void convergesMemberWhenApplyCompletedBeforeBindingWasRecorded() {
+         UUID deploymentId = UUID.randomUUID();
 diff --git a/deploy/docker/control-plane.Dockerfile b/deploy/docker/control-plane.Dockerfile
 index 66e64ff..4981640 100644
 --- a/deploy/docker/control-plane.Dockerfile
