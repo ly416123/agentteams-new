@@ -95,6 +95,7 @@ class OidcJwtIntegrationTest {
         properties.add("agentteams.enrollment.oidc.issuer-uri", () -> ISSUER);
         properties.add("agentteams.enrollment.oidc.jwk-set-uri",
                 () -> "http://127.0.0.1:" + jwksServer.getAddress().getPort() + "/jwks");
+        properties.add("agentteams.enrollment.oidc.allow-insecure-loopback", () -> true);
         properties.add("agentteams.enrollment.oidc.audience", () -> AUDIENCE);
         properties.add("spring.datasource.url", POSTGRES::getJdbcUrl);
         properties.add("spring.datasource.username", POSTGRES::getUsername);

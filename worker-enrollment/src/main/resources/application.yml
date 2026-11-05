@@ -27,6 +27,7 @@ agentteams:
       project-claim: ${OIDC_PROJECT_CLAIM:project}
       team-claim: ${OIDC_TEAM_CLAIM:team}
       permissions-claim: ${OIDC_PERMISSIONS_CLAIM:permissions}
+      allow-insecure-loopback: ${AGENTTEAMS_ENROLLMENT_OIDC_ALLOW_INSECURE_LOOPBACK:false}
 
 management:
   endpoints:

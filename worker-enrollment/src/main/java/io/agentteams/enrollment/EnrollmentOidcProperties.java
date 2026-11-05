@@ -12,10 +12,11 @@ public class EnrollmentOidcProperties {
     private String projectClaim = "project";
     private String teamClaim = "team";
     private String permissionsClaim = "permissions";
+    private boolean allowInsecureLoopback;
 
     public void validate() {
-        requireAbsoluteUri(issuerUri, "issuer-uri");
-        requireAbsoluteUri(jwkSetUri, "jwk-set-uri");
+        requireAbsoluteUri(issuerUri, "issuer-uri", allowInsecureLoopback);
+        requireAbsoluteUri(jwkSetUri, "jwk-set-uri", allowInsecureLoopback);
         requireText(audience, "audience");
         requireText(tenantClaim, "tenant-claim");
         requireText(projectClaim, "project-claim");
@@ -23,7 +24,7 @@ public class EnrollmentOidcProperties {
         requireText(permissionsClaim, "permissions-claim");
     }
 
-    private static void requireAbsoluteUri(String value, String field) {
+    private static void requireAbsoluteUri(String value, String field, boolean allowInsecureLoopback) {
         requireText(value, field);
         try {
             URI uri = URI.create(value);
@@ -35,7 +36,7 @@ public class EnrollmentOidcProperties {
         }
         URI uri = URI.create(value);
         if ("https".equalsIgnoreCase(uri.getScheme())) return;
-        if ("http".equalsIgnoreCase(uri.getScheme()) && isLoopbackHost(uri.getHost())) return;
+        if (allowInsecureLoopback && "http".equalsIgnoreCase(uri.getScheme()) && isLoopbackHost(uri.getHost())) return;
         throw new IllegalStateException("agentteams.enrollment.oidc." + field
                 + " must use HTTPS; HTTP is allowed only for loopback test or development endpoints");
     }
@@ -67,4 +68,8 @@ public class EnrollmentOidcProperties {
     public void setTeamClaim(String teamClaim) { this.teamClaim = teamClaim; }
     public String permissionsClaim() { return permissionsClaim; }
     public void setPermissionsClaim(String permissionsClaim) { this.permissionsClaim = permissionsClaim; }
+    public boolean isAllowInsecureLoopback() { return allowInsecureLoopback; }
+    public void setAllowInsecureLoopback(boolean allowInsecureLoopback) {
+        this.allowInsecureLoopback = allowInsecureLoopback;
+    }
 }

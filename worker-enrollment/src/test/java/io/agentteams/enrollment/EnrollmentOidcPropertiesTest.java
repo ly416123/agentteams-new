@@ -56,12 +56,17 @@ class EnrollmentOidcPropertiesTest {
     }
 
     @Test
-    void permitsLoopbackHttpJwksForLocalIntegrationTests() {
+    void permitsLoopbackHttpJwksOnlyAfterAnExplicitDevelopmentOptIn() {
         EnrollmentOidcProperties properties = new EnrollmentOidcProperties();
         properties.setIssuerUri("https://identity.example.test/issuer");
         properties.setJwkSetUri("http://127.0.0.1:18080/keys");
         properties.setAudience("agentteams-api");
 
+        assertThatThrownBy(properties::validate)
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("jwk-set-uri must use HTTPS");
+
+        properties.setAllowInsecureLoopback(true);
         assertThatCode(properties::validate).doesNotThrowAnyException();
     }
 }
