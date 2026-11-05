@@ -28,7 +28,7 @@ Controller 源码中能直接看到 `PrincipalContext`、`ProjectApiAuthorizatio
 | Evaluation、Artifact Quality 与 Webhook | `/api/v1/evaluations/**`、`/api/v1/artifact-quality/**`、`/api/v1/webhooks/**` | Controller 未见直接调用 | 待确认数据归属、导出可见范围、投递/查询过滤及租户配置授权 |
 | Organization / Tenant 管理 | `/api/v1/management/organizations/**`、`tenants/**`、`memberships/**`、`integrations/**`、`users/**`、`authorizations/**` | 管理授权另有入口 | 待分别验证 Platform Admin、Organization Admin、Tenant Admin 与普通 Project member 的边界 |
 | 配置与 Matrix Room binding | `/api/v1/config/**`、Matrix binding 回调 | Controller 直接 scope 调用不完整 | 待判明 public/runtime 配置与租户配置，验证 Matrix room 与 Tenant/Project 映射不可伪造 |
-| Sandbox 与内部服务接口 | `/api/v1/sandboxes/**`、`/internal/v1/artifacts/**`、`/internal/v1/token-ledger/**`、`/internal/v1/task-state-consistency/**` | Sandbox 有直接调用；其余为内部入口 | 待验证网络/服务身份、内部路由是否可从宿主公开入口访问、后台任务的显式 scope 与最小权限 |
+| Sandbox 与内部服务接口 | `/api/v1/sandboxes/**`、`/internal/v1/artifacts/**`、`/internal/v1/token-ledger/**`、`/internal/v1/task-state-consistency/**` | Sandbox 有直接调用；其余为内部入口 | Compose 已验证 Worker 网络不可达；内部 token 为空时 fail-closed。其他部署入口、后台任务 scope 与最小权限仍需验收 |
 | Skills、审计、用量与配额 | `/api/v1/skills/**`、`/api/v1/audit-events`、`/api/v1/usage/**`、`/api/v1/projects/**/quota` | Skill 通过可见性 scope；Project/Quota 有项目授权服务；Audit/Usage 需在服务层按 principal 过滤 | 待逐读写、导出和汇总查询确认 scope 聚合与最小权限 |
 
 入口名称来自固定 tag 中的 `control-plane/.../api`、`artifact`、`memory`、`mcp`、`organization`、`sandbox`、`token`、`quality` 与 `task` 源码目录。上表是路由族清单，不代替逐方法的调用图与负向测试。
@@ -49,6 +49,13 @@ Controller 源码中能直接看到 `PrincipalContext`、`ProjectApiAuthorizatio
 对 v0.1.5 固定 tag 的迁移目录做只读扫描，没有发现业务迁移启用 `ENABLE ROW LEVEL SECURITY`、`FORCE ROW LEVEL SECURITY` 或 `CREATE POLICY`。因此当前业务表的租户边界是应用层 SQL/Service scope 检查，不是数据库全表 RLS。数据模型也混合三种模式：Conversation、Scheduled Task、MCP Connection、Token Ledger 等直接存 organization/tenant/project；Task、Agent、Team 等通过 `resource_scopes` 建立 scope；Task File、Artifact 等子对象依赖父 Task/Attempt 关联。`resource_scopes` 本身无指向各业务表的外键，跨资源一致性由写入服务维护。全表 RLS 的前置工作应先完成非 owner/非 superuser Control Plane 运行角色、可信事务 scope 注入、关键父子复合约束/触发器与逐表越权测试；只给现有 owner 角色加 policy 不形成有效隔离。
 
 异步路径包括 Outbox Relay、NATS execution event consumer、Task recovery/checkpoint、Scheduled Task、Team deployment timeout、Agent presence consistency、Artifact quality delivery 和内部一致性检查。它们不能复用“HTTP Principal 缺省即系统全权”的隐式规则；每种作业需有明确的系统身份和父资源 scope 验证。
+
+## 内部 HTTP 路由与 Compose 网络复核（2026-11-06）
+
+- 固定 v0.1.5 的 Internal Quota、Worker Operation、Artifact Upload、Task State Consistency 路由使用 `agentteams.quota.internal-token`；Token Ledger 使用独立的 `agentteams.token-ledger.internal-token`。相关控制器在 token 未配置或请求头缺失时拒绝请求。Compose 未向 Control Plane 注入这两项 token，因此当前 POC 对这些内部路由按默认配置应 fail-closed。
+- Compose 声明并运行态回读均确认 Control Plane 只映射宿主机 `127.0.0.1:18080`；Worker 加入 `worker-egress`，不加入 `host-ingress` 或 `data`。Gateway、PostgreSQL、NATS 没有宿主机端口映射。先前同 Worker 网络的无凭据探针也确认无法直连 Control Plane 的 data-network IP，而 Gateway gRPC 可达。故当前 POC 中 Worker 无法通过 Compose 网络访问上述 Control Plane 内部 HTTP 路由。
+- 这项结论只覆盖仓库 Compose 与本机验证环境。宿主机本地进程可以访问 loopback 映射；生产反向代理、云负载均衡、sidecar/管理网络和其他部署清单尚未核验。若部署方配置内部 token，仍需保持高熵、分服务隔离和轮换，并限制 `/internal/**` 的网络入口。内部 token 是服务身份，不代表 Tenant scope；内部操作仍要从数据库父资源校验 Task、Attempt、Agent 与租户关系。
+- Task State Consistency 的 Issues 查询返回跨租户运维记录，属于全局内部诊断能力；其安全边界是内部 token 与网络入口，而不是调用方 Tenant 过滤。部署时只能授予受信任运维主体，不能将该 token 放入 Worker 或租户可见配置。
 
 ## 已追踪的 Task API 调用链
 
