@@ -60,11 +60,11 @@
 
 **真实 Control Plane schema 验收（2026-11-05）：** 在专用 Colima profile 与隔离 Compose project 中启动固定 v0.1.5 Control Plane/PostgreSQL，实际执行 Enrollment RLS 安装 SQL。确认 v121 schema 含 scope 索引和 Agents/Agent Sessions RLS；Enrollment 角色可读 `agents.id` 和 scope 索引列，但不能读 `agents.metadata` 或直接写 scope 索引；scope owner 为 `NOLOGIN`、非 superuser、无 `BYPASSRLS`；Control Plane readiness 为 UP。验收后删除隔离容器/卷/网络和临时凭据，并停止专用 profile。PR #1 提交 `6b31984` 的 CI run [41989421452](https://github.com/ly416123/agentteams-new/actions/runs/41989421452) 全绿。
 
-**Worker 模型凭证槽位隔离（2026-11-05）：** Compose 从所有 Worker 共用一个模型 Secret 改为最多 8 个独立槽位 Secret；每个 Worker 只挂载其槽位文件，启动校验拒绝多个活动槽位指向同一个底层文件。合约测试覆盖八个 Secret 映射及共享文件拒绝。该改动降低槽位间凭证复用，但上游 Token 仍可被对应 Worker 读取，不能替代 Attempt 级凭证代理；验收见提交后的 CI。
+**Worker 模型凭证槽位隔离（2026-11-05）：** Compose 从所有 Worker 共用一个模型 Secret 改为最多 8 个独立槽位 Secret；每个 Worker 只挂载其槽位文件，启动校验拒绝多个活动槽位指向同一个底层文件并要求文件仅所有者可读（`0600`）。合约测试覆盖八个 Secret 映射、共享文件和宽权限文件拒绝；8 项本机 Compose/OIDC 合约测试、Compose config 与 shell 语法通过。PR #1 提交 `5a53931` 的 CI run [41990267166](https://github.com/ly416123/agentteams-new/actions/runs/41990267166) 全绿。该改动降低槽位间凭证复用，但上游 Token 仍可被对应 Worker 读取，不能替代 Attempt 级凭证代理。
 
 **复用 Control Plane 的 RLS 边界审计（2026-11-05）：** 对固定 v0.1.5 的迁移 SQL、scope Repository、Task 查询与 Compose 数据库身份做只读检查，记录见[共享 Control Plane scope 与 RLS 就绪度审计](../audits/2026-11-05-shared-control-plane-scope-and-rls-readiness.md)。Task/Attempt/Assignment/Lease 等需沿 `resource_scopes` 与父子关系判定 scope；Conversation 有自身 scope。当前 Compose 使用 `POSTGRES_USER=agentteams` 初始化超级用户作为 Control Plane 连接，源码查询未设置事务级 GUC，因此单独从新仓库启用业务表 RLS无法保护 Control Plane。全系统 RLS 前置是拆分非 superuser/非 owner 运行角色、实现所有 API 和后台作业的事务 scope，并验证跨 Tenant 的业务 API；当前不宣称强隔离。
 
-**凭证代理接入边界（2026-11-05）：** Worker 可配置 ChatGPT Responses API endpoint 并逐请求读取模型 Token 文件，便于新项目把上游调用改道到代理；但当前模型 Token Source 不接收 Task/Attempt/Lease 上下文。Compose 已切换到每个固定 Worker 槽位独立的模型 Secret，仍不能证明 Attempt 级消费令牌。若不扩展 Worker 的可信执行上下文，新代理最多证明 Agent/槽位级访问控制，不能达到计划要求的 Attempt 级授权。该约束已记录在 RLS 审计文档；代理设计须先确定如何让新路径安全获得并验证 Attempt 身份。
+**凭证代理接入边界（2026-11-05）：** Worker 可配置 ChatGPT Responses API endpoint 并逐请求读取模型 Token 文件，便于新项目把上游调用改道到代理；但当前模型 Token Source 不接收 Task/Attempt/Lease 上下文。Compose 已切换到每个固定 Worker 槽位独立的模型 Secret，仍不能证明 Attempt 级消费令牌。不能通过客户端自报的 HTTP header/request body 补身份；新项目需要由可信 Gateway/执行适配器建立 Agent 到当前 Assignment/Attempt/Lease 的绑定，再让模型代理校验不可伪造且可撤销的短时授权。该边界已记录在 RLS 审计文档，Attempt 级代理实施依赖新路径的可信执行上下文。
 
 ## 批次 1：无 Kubernetes 固定容量 Compose POC
 
