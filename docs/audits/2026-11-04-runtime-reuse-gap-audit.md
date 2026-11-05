@@ -8,16 +8,16 @@
 
 `agentteams-java` 已有可复用的 Java 任务状态机、数据库租约与恢复、Gateway 持久状态、应用层授权、Matrix 身份/房间绑定和 S3 兼容制品流程。它能作为新项目的兼容运行时与业务行为基线。
 
-但 v0.1.4 还不能证明满足 `agentteams-new` 的多租户隔离目标：授权主要依靠 API 与 Service 层，迁移中未发现 PostgreSQL Row-Level Security（RLS）策略；Worker 的 MCP 凭证可从环境变量解析，模型 Token 可由 Worker 进程读取文件；对象存储 key 与短时 URL 本身不是授权机制；Matrix 与租户绑定仍依赖应用层身份和房间映射。Gateway 在存在 PostgreSQL 时会使用 `agent_sessions` 短时会话 Token 校验，但源码没有该记录的签发/撤销服务或 API；当前 Compose 也没有为 Worker 提供 Gateway 会话 Token。另一个重要边界是 v0.1.4 的 API OIDC 安全默认关闭，Compose 只将 HTTP 端口绑定到本机回环地址。Compose 冒烟已验证基础服务、TaskFile API 和对象持久性；Enrollment 另有真实 HTTP/JWT/PostgreSQL 集成测试。固定 digest 的 v0.1.4 Gateway gRPC 握手集成测试已加入 CI，覆盖有效、未知、过期、撤销和 Agent 绑定不匹配的会话；最新 run 尚未获得 runner，结果待验收。仍未运行真实 Worker Attempt，也未完成 A/B 租户负向验收。
+但 v0.1.4 还不能证明满足 `agentteams-new` 的多租户隔离目标：授权主要依靠 API 与 Service 层，迁移中未发现 PostgreSQL Row-Level Security（RLS）策略；Worker 的 MCP 凭证可从环境变量解析，模型 Token 可由 Worker 进程读取文件；对象存储 key 与短时 URL 本身不是授权机制；Matrix 与租户绑定仍依赖应用层身份和房间映射。更严重的是，2026-11-05 的固定 digest gRPC 握手测试发现 v0.1.4 Gateway 对未知、过期、已撤销和 Agent 不匹配的会话均返回 `READY` 并写入在线状态，详见 [CI 41953617348](https://github.com/ly416123/agentteams-new/actions/runs/41953617348)。源代码中允许所有连接的默认 `AuthenticationPort` Bean 先于 JDBC `AgentSessionStore` 声明，条件 Bean 装配顺序可能导致会话校验失效；需在 `agentteams-java` 补充配置级回归测试并修复后发布新镜像。当前 Compose 也没有为 Worker 提供 Gateway 会话 Token。v0.1.4 的 API OIDC 安全默认关闭，Compose 只将 HTTP 端口绑定到本机回环地址。Compose 冒烟已验证基础服务、TaskFile API 和对象持久性；Enrollment 另有真实 HTTP/JWT/PostgreSQL 集成测试。仍未运行真实 Worker Attempt，也未完成 A/B 租户负向验收。
 
-因此批次 1 继续作为无 Kubernetes 的部署底座。新仓库现已增加独立 Worker Enrollment 服务和 Compose 每槽位凭证投放：OIDC issuer/JWKS/audience 验证、`worker:session:manage` 权限、Agent scope 精确比对、明文只回传一次、DB 仅存 SHA-256、过期与撤销 API。固定容量不需要动态创建或扩缩 Worker，但仍须支持注册、健康状态、排空、租约失效和重启恢复。Gateway 握手测试已接入固定 v0.1.4 镜像 digest 的 CI 流程，等待 runner 分配后验收；真实 IdP 下的 claims 映射、真实 Worker task attempt、完整多租户隔离及上游凭证代理仍未验收。
+因此批次 1 继续作为无 Kubernetes 的部署底座。新仓库现已增加独立 Worker Enrollment 服务和 Compose 每槽位凭证投放：OIDC issuer/JWKS/audience 验证、`worker:session:manage` 权限、Agent scope 精确比对、明文只回传一次、DB 仅存 SHA-256、过期与撤销 API。固定容量不需要动态创建或扩缩 Worker，但仍须支持注册、健康状态、排空、租约失效和重启恢复。CI 握手测试确认当前 v0.1.4 镜像会接受无效会话，构成启用 Worker 的安全阻断；需先修复旧 Gateway 并发布新 digest。真实 IdP 下的 claims 映射、真实 Worker task attempt、完整多租户隔离及上游凭证代理仍未验收。
 
 ## 依赖审计
 
 | 领域 | v0.1.4 已有机制 | 关键依赖/缺口 | 新项目决策 |
 |---|---|---|---|
 | 任务派发 | `TaskAssignmentService` 在事务中锁定任务，生成 Assignment、Attempt、Lease 并写入 Outbox；租约到期可回收。调度器有数据库调度租约。 | 调度面对的是数据库中的 Agent/Worker 注册状态；Compose 只固定进程数量，不会自动保证实例身份唯一、排空或容量正确。 | 复用派发与状态机。Compose 槽位用稳定 Worker ID；容量不足排队/限流。补齐 drain、重启和过期 Lease 验收，不引入 K8s Controller。 |
-| Worker 生命周期 | Gateway 处理 Hello、会话 Token 校验、协议协商、注册、心跳/在线投影、重连及命令重放；`JdbcAgentStateStore` 持久化连接状态。 | v0.1.4 `agent_sessions` 没有签发/撤销入口；撤销只会影响未来握手，不会主动断开现有连接。新项目 CI 已加入真实固定 digest Gateway 和 PostgreSQL 握手及凭据拒绝测试，但最新 run 尚未获得 runner，不能视为通过；没有运行真实 Worker runtime 或真实任务。 | 新项目增加受控 enrollment 服务：OIDC 权限和 tenant/project/team scope 校验、短时 Worker Token、数据库 Hash、轮换/撤销及每槽位文件投放。生产部署仍需验证真实 IdP、真实 Worker 重连和撤销操作。 |
+| Worker 生命周期 | Gateway 设计包含 Hello、会话 Token 校验、协议协商、注册、心跳/在线投影、重连及命令重放；`JdbcAgentStateStore` 持久化连接状态。 | v0.1.4 固定镜像的集成测试证实四类无效会话都被接受并持久化为在线。默认放行 Bean 与 JDBC Session Store 的条件装配顺序是当前根因假设；在旧仓库修复并通过新镜像验证前，不得启用 Worker。无效会话撤销测试不能视为通过。 | 先修复并发布 Gateway 鉴权，再使用新 digest 重跑有效/无效握手测试；之后才验收受控 enrollment、真实 Worker 重连和撤销。 |
 | 状态持久化 | PostgreSQL 保存任务、Attempt、Lease、Assignment、Outbox 等；Gateway 命令/ACK 状态可走 JDBC 持久化；NATS JetStream 承载持久事件。 | 必须确认新部署使用持久卷、备份恢复和迁移流程；不能把 Gateway 内存连接状态当成事实源。 | 保留 PostgreSQL + Outbox + JetStream 的职责划分。Compose POC 已验证迁移到 v121 与 NATS stream 创建；还需故障恢复和真实任务端到端验收。 |
 | API 与租户授权 | `ExecutionContext` 包含 organization/tenant/project/team/subject；目录解析校验成员关系；任务 Service 校验任务 spec scope；项目资源授权与资源 scope 映射已存在。API 默认拒绝没有显式授权边界的路由。 | 隔离依赖应用层查询和调用路径正确。审计的 Flyway SQL 未发现 RLS policy；运维 SQL、后台 Job、内部服务若绕过授权 Service，数据库不会自动按租户拒绝。 | 先集中 scope-aware Repository/Service 并让缺 scope 失败关闭。对高风险共享表增加 PostgreSQL RLS 和连接事务 scope 设置，测试连接池复用时上下文不会串租户。 |
 | 会话与 Attempt | Assignment payload 有 Attempt/Lease ID；AgentScope MCP 请求可附 Task/Attempt/Lease/Call ID；Task Memory 可由控制面组装。 | 这些标识不等同于 Worker 执行隔离。需要确认对话记忆、工具客户端、临时目录、缓存和 MCP 会话是否按 Attempt 创建/清理。此次 Compose POC 未运行真实 Attempt，无法证明。 | 每个 Attempt 使用隔离会话键、workspace、缓存命名空间和工具客户端生命周期；终态/取消/租约超时统一清理。共享池先设 `maxConcurrency=1`，验收后再开放并发。 |
@@ -63,7 +63,7 @@
 
 ## 验收边界与风险
 
-- 当前 Compose 证据限于 PostgreSQL 迁移、NATS stream、Control Plane/Gateway 启动、TaskFile 上传下载和 SeaweedFS 重启后对象仍在；Enrollment 模块既有 22 项单元/HTTP/PostgreSQL 集成测试、Maven verify、Compose config 与 shell 语法校验已通过。临时 RSA/JWKS 发行者通过真实 HTTP 解码器测试签名、issuer、audience；HTTP→服务→PostgreSQL 集成验证签发哈希、撤销写入和 tenant/project/team scope 全维拒绝；仓库测试覆盖专用 DB role 最小表权限。CI 强制 10/10 PostgreSQL 集成测试执行且不跳过。新增的固定 digest Gateway 握手测试尚未成功跑完；仍需真实 OIDC Provider 配置和真实 Worker 任务运行时验收，启用 Worker 前必须设置 `API_AUTH_ENABLED=true` 并配置真实 IdP。
+- 当前 Compose 证据限于 PostgreSQL 迁移、NATS stream、Control Plane/Gateway 启动、TaskFile 上传下载和 SeaweedFS 重启后对象仍在；Enrollment 模块既有 22 项单元/HTTP/PostgreSQL 集成测试、Maven verify、Compose config 与 shell 语法校验已通过。临时 RSA/JWKS 发行者通过真实 HTTP 解码器测试签名、issuer、audience；HTTP→服务→PostgreSQL 集成验证签发哈希、撤销写入和 tenant/project/team scope 全维拒绝；仓库测试覆盖专用 DB role 最小表权限。CI 强制 10/10 PostgreSQL 集成测试执行且不跳过。固定 digest Gateway 测试在 CI `41953617348` 执行 5 项，1 项有效会话通过，4 项无效会话收到 READY 并被持久化为在线；Worker 不能接入当前 Gateway 镜像。仍需修复上游鉴权配置、以新镜像重新验收，并配置真实 OIDC Provider 和真实 Worker 任务运行时；启用 Worker 前必须设置 `API_AUTH_ENABLED=true` 并配置真实 IdP。
 - `agentteams-java` 的测试目录已有 ExecutionContext、ScopeIsolation、TaskService、Artifact、Matrix 和调度单元测试；这些测试支持应用机制存在，但不是新部署组合的端到端安全证据。
 - 本文档只审计指定 commit，不保证上游后续版本行为相同。升级共享制品前需按同一矩阵重新审计。
 - 在批次 2/3 通过前，部署说明必须称为「单租户/受信 Worker 试验档」或明确限制租户间共池；不得宣称多租户强隔离、零信任凭证或生产就绪。

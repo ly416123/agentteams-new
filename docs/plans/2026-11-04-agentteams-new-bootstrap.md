@@ -40,7 +40,9 @@
 
 **运行时复用边界审计：** 对 `agentteams-java` v0.1.4 源码 commit `02d5ad3017f56b2a3cbb6c60112077d32f3299f4` 完成只读检查，记录见 [旧运行时复用边界审计](../audits/2026-11-04-runtime-reuse-gap-audit.md)。旧版可复用任务状态机、DB Lease/恢复、Gateway 持久状态、应用层租户授权、Matrix 绑定和 Artifact API；但未发现 PostgreSQL RLS policy，MCP 凭证可从 Worker 环境读取、模型 Token 可由 Worker 读取文件，Compose 也尚未跑真实 Worker Attempt。上述机制不构成新项目的多租户强隔离或凭证不落 Worker 证明。后续先完成真实固定 Worker 生命周期，再依次落地 scope 闭环、Attempt 隔离、RLS 纵深防御与凭证代理。
 
-**Worker 启动阻断项：** 继续核对固定槽位真实连接条件时发现，v0.1.4 Gateway 在共享 PostgreSQL 可用时自动启用 `agent_sessions` Hash 校验，但旧源码只有查询端，没有 Token 签发/撤销服务；Compose 也未注入 `AGENTTEAMS_GATEWAY_AUTH_TOKEN`。同时 Control Plane 的 API OIDC 默认为关闭。故当前 Compose 能启动 Worker 容器配置，但没有可受支持的注册凭证生命周期，真实 Worker Attempt 尚不能验收。批次 1 收尾前，必须在 `agentteams-new` 增加受控 Worker enrollment（Token 只展示一次、DB 仅存 Hash、支持撤销/轮换、每槽位独立投放）和明确的 OIDC API 配置；不得通过手工插入长期 Token 或公开 API 临时绕过认证来宣布通过。
+**Worker 启动阻断项：** 继续核对固定槽位真实连接条件时发现，v0.1.4 Gateway 在共享 PostgreSQL 可用时预期使用 `agent_sessions` Hash 校验，但旧源码只有查询端，没有 Token 签发/撤销服务；Compose 也未注入 `AGENTTEAMS_GATEWAY_AUTH_TOKEN`。同时 Control Plane 的 API OIDC 默认为关闭。故当前 Compose 能启动 Worker 容器配置，但没有可受支持的注册凭证生命周期，真实 Worker Attempt 尚不能验收。批次 1 收尾前，必须在 `agentteams-new` 增加受控 Worker enrollment（Token 只展示一次、DB 仅存 Hash、支持撤销/轮换、每槽位独立投放）和明确的 OIDC API 配置；不得通过手工插入长期 Token 或公开 API 临时绕过认证来宣布通过。
+
+**Gateway 安全阻断（2026-11-05）：** 固定 digest 的 Gateway 集成测试运行后发现，未知、过期、已撤销及 Agent 不匹配的 4 类会话都收到了 `READY`，并写入 `gateway_agent_state`。失败运行见 [CI 41953617348](https://github.com/ly416123/agentteams-new/actions/runs/41953617348)。对 v0.1.4 源码检查发现，允许所有连接的默认 `AuthenticationPort` Bean 在 JDBC `AgentSessionStore` Bean 之前声明；目前高度怀疑条件 Bean 装配顺序让默认放行实现覆盖了数据库会话校验。确认并修复前，禁止将 v0.1.4 Gateway 用于受控 Worker 注册或多租户部署。Worker Enrollment 计划原定不修改 `agentteams-java`，因此跨仓库修复需先获得授权；不得在新仓库伪造一个“通过”的握手测试。
 
 ## 批次 1：无 Kubernetes 固定容量 Compose POC
 
