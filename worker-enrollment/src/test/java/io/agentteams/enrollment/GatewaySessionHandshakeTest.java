@@ -153,7 +153,10 @@ class GatewaySessionHandshakeTest {
         Handshake handshake = connect(helloAgent, token);
         try {
             Status terminal = handshake.status().poll(10, TimeUnit.SECONDS);
-            assertThat(terminal).isNotNull();
+            if (terminal == null) {
+                throw new AssertionError("Gateway did not terminate a rejected session. Gateway logs:\n"
+                        + gateway.getLogs());
+            }
             assertThat(terminal.getCode()).withFailMessage("Gateway rejected the handshake: %s", terminal)
                     .isEqualTo(Status.Code.UNAUTHENTICATED);
         } finally {
