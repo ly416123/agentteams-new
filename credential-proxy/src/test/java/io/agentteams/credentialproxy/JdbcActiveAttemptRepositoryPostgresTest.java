@@ -2,16 +2,38 @@ package io.agentteams.credentialproxy;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.asyncDispatch;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.request;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import com.sun.net.httpserver.HttpServer;
+import java.net.InetSocketAddress;
+import java.net.URI;
+import java.net.http.HttpClient;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.security.MessageDigest;
+import java.time.Clock;
 import java.util.HexFormat;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.core.io.ClassPathResource;
+import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
+import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.MvcResult;
+import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -34,6 +56,26 @@ class JdbcActiveAttemptRepositoryPostgresTest {
 
     private JdbcTemplate jdbc;
     private JdbcActiveAttemptRepository repository;
+    private HttpServer modelProvider;
+    private java.util.concurrent.ScheduledExecutorService streamMonitor;
+    private Path providerCredentialRoot;
+
+    @AfterEach
+    void stopIntegrationResources() throws Exception {
+        if (modelProvider != null) modelProvider.stop(0);
+        if (streamMonitor != null) streamMonitor.shutdownNow();
+        if (providerCredentialRoot != null) {
+            try (var paths = Files.walk(providerCredentialRoot)) {
+                paths.sorted(java.util.Comparator.reverseOrder()).forEach(path -> {
+                    try {
+                        Files.deleteIfExists(path);
+                    } catch (java.io.IOException error) {
+                        throw new java.io.UncheckedIOException(error);
+                    }
+                });
+            }
+        }
+    }
 
     @BeforeEach
     void createSchemaAndInstallNarrowFunction() throws Exception {
@@ -234,6 +276,92 @@ class JdbcActiveAttemptRepositoryPostgresTest {
         assertThat(authenticator.authenticate(PROXY_TOKEN)).isEmpty();
         assertThat(authenticator.revalidate(authenticated)).isEmpty();
     }
+
+    @Test
+    void httpRequestUsesDatabaseAttemptScopeAndForwardsOnlyTheResolvedProviderCredential() throws Exception {
+        insertScope("WORKER", AGENT, "tenant-a", "project-a", "team-a");
+        insertScope("TASK", TASK, "tenant-a", "project-a", "team-a");
+        insertProxyCredential();
+        insertActive(AGENT, TASK, ATTEMPT, LEASE);
+        Path providerToken = createProviderCredential("tenant-a", "project-a", "team-a", "provider-token-a");
+        HttpProxyFixture fixture = startHttpProxy(providerToken);
+
+        MvcResult result = fixture.mvc().perform(post("/v1/responses")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .header("Authorization", "Bearer " + PROXY_TOKEN)
+                        .content("{\"model\":\"gpt-5.6-luna\",\"input\":[]}"))
+                .andExpect(request().asyncStarted())
+                .andReturn();
+
+        fixture.mvc().perform(asyncDispatch(result))
+                .andExpect(status().isOk())
+                .andExpect(content().string("data: forwarded\n\n"));
+        assertThat(fixture.upstreamCalls().get()).isEqualTo(1);
+        assertThat(fixture.upstreamAuthorization().get()).isEqualTo("Bearer provider-token-a");
+    }
+
+    @Test
+    void httpRequestCannotUseAttemptFromAnotherTenantAndNeverCallsProvider() throws Exception {
+        insertScope("WORKER", AGENT, "tenant-a", "project-a", "team-a");
+        insertScope("TASK", TASK, "tenant-b", "project-a", "team-a");
+        insertProxyCredential();
+        insertActive(AGENT, TASK, ATTEMPT, LEASE);
+        Path providerToken = createProviderCredential("tenant-a", "project-a", "team-a", "provider-token-a");
+        HttpProxyFixture fixture = startHttpProxy(providerToken);
+
+        fixture.mvc().perform(post("/v1/responses")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .header("Authorization", "Bearer " + PROXY_TOKEN)
+                        .content("{\"model\":\"gpt-5.6-luna\",\"input\":[]}"))
+                .andExpect(status().isForbidden())
+                .andExpect(content().json("{\"error\":\"model_proxy_request_denied\"}"));
+
+        assertThat(fixture.upstreamCalls().get()).isZero();
+    }
+
+    private Path createProviderCredential(String tenant, String project, String team, String value) throws Exception {
+        providerCredentialRoot = Files.createTempDirectory("credential-proxy-provider-");
+        Path token = providerCredentialRoot.resolve(tenant).resolve(project).resolve(team).resolve("provider-token");
+        Files.createDirectories(token.getParent());
+        Files.writeString(token, value, StandardCharsets.UTF_8);
+        jdbc.update("UPDATE worker_model_proxy_credentials SET model_credential_ref = ? WHERE id = ?",
+                "file:" + tenant + "/" + project + "/" + team + "/provider-token", PROXY_CREDENTIAL_ID);
+        return token;
+    }
+
+    private HttpProxyFixture startHttpProxy(Path providerToken) throws Exception {
+        AtomicInteger calls = new AtomicInteger();
+        AtomicReference<String> authorization = new AtomicReference<>();
+        modelProvider = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        modelProvider.createContext("/v1/responses", exchange -> {
+            calls.incrementAndGet();
+            authorization.set(exchange.getRequestHeaders().getFirst("Authorization"));
+            exchange.getRequestBody().readAllBytes();
+            byte[] body = "data: forwarded\n\n".getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().set("Content-Type", "text/event-stream; charset=utf-8");
+            exchange.sendResponseHeaders(200, 0);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        modelProvider.start();
+        streamMonitor = Executors.newSingleThreadScheduledExecutor();
+        jdbc.execute("CREATE ROLE credential_proxy_test LOGIN PASSWORD 'proxy-test-password'");
+        jdbc.execute("GRANT credential_proxy_query TO credential_proxy_test");
+        JdbcTemplate proxyRuntime = new JdbcTemplate(new DriverManagerDataSource(
+                POSTGRES.getJdbcUrl(), "credential_proxy_test", "proxy-test-password"));
+        ModelProxyService service = new ModelProxyService(
+                new JdbcModelProxyCredentialAuthenticator(proxyRuntime),
+                new AttemptExecutionContextResolver(new JdbcActiveAttemptRepository(proxyRuntime), Clock.systemUTC()),
+                new FileCredentialSource(providerToken.getParent().getParent().getParent().getParent()),
+                URI.create("http://127.0.0.1:" + modelProvider.getAddress().getPort() + "/v1/responses"),
+                Set.of("gpt-5.6-luna"), HttpClient.newHttpClient(), Clock.systemUTC(), streamMonitor,
+                new Semaphore(4));
+        MockMvc mvc = MockMvcBuilders.standaloneSetup(new ModelProxyController(service)).build();
+        return new HttpProxyFixture(mvc, calls, authorization);
+    }
+
+    private record HttpProxyFixture(MockMvc mvc, AtomicInteger upstreamCalls,
+            AtomicReference<String> upstreamAuthorization) { }
 
     private void insertScope(String type, UUID id, String tenant, String project, String team) {
         jdbc.update("INSERT INTO resource_scopes(resource_type, resource_id, tenant_id, project_id, team) VALUES (?, ?, ?, ?, ?)",

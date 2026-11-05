@@ -3,7 +3,9 @@
 **核验日期：** 2026-11-05  
 **核验方式：** 使用本机 `readonly-pod-logs` Kubernetes Context 做只读检查，并读取公开 OIDC Discovery/JWKS 元数据。未读取 Kubernetes Secret 正文、Token、私钥或 JWKS 公钥材料。
 
-**权限复核（2026-11-06）：** 再次检查本机 context 与 RBAC。当前 context 仍是本地 `kind-agentteams`；显式指定 `readonly-pod-logs` 后，`can-i` 显示可读取/列出 `agentteams` Pod，但不能读取 Secret，也不能列出 ConfigMap 或 Deployment；尝试列出 namespace 亦被拒绝。允许列出的 Job/CronJob 不是 OIDC、Worker 部署或凭据文件的充分证据。因此本次不能从 L5 实时确认是否已新增 HTTPS IdP 入口、专供 `agentteams-new` 的 Worker 资源，或运行主机上的 Provider 凭据文件。未尝试读取任何 Secret 内容或本机凭据内容。
+**权限复核（2026-11-06）：** 再次检查本机 context 与 RBAC。当前 context 仍是本地 `kind-agentteams`；显式指定 `readonly-pod-logs` 后，`can-i` 确认可在 `agentteams` namespace 列出/读取 Pod 及读取 Pod 日志；对 Namespace、Deployment、Service、Ingress、ConfigMap、ServiceAccount 的 list 均返回 `no`，Secret 的 list 也返回 `no`。对 Deployment、Service、Ingress、ConfigMap 的实际 list 请求均返回 `Forbidden`。允许列出的 Job/CronJob 不是 OIDC、Worker 部署或凭据文件的充分证据。因此本次不能从 L5 实时确认是否已新增 HTTPS IdP 入口、专供 `agentteams-new` 的 Worker 资源，或运行主机上的 Provider 凭据文件。未尝试读取任何 Secret 内容或本机凭据内容。
+
+**Pod 与公开 Discovery 复核（2026-11-06）：** 只读 Pod 列表显示 L5 当前有 `keycloak` Pod，以及 `agentteams-java` 的 Control Plane、Gateway、Manager、Operator 和 12 个 Ready 的旧 Worker Pod；PostgreSQL、NATS、MinIO 也在运行。这能确认旧版集成环境仍在，不能证明有 `agentteams-new` 专属部署。公开 OIDC Discovery 当前仍返回 `http://192.168.122.55:30082/realms/agentteams`，JWKS URI 也仍为 HTTP；这与 secure Compose 所需的 HTTPS Issuer 不兼容。由于无法列出 Ingress/Service/ConfigMap，不能判断集群是否另有 HTTPS 入口或新项目配置。旧 Worker 的 OAuth token 引用不作为新 Credential Proxy 的通用 Provider 凭据；L5 是否另有专用凭据文件仍未知。
 
 ## 结论
 
