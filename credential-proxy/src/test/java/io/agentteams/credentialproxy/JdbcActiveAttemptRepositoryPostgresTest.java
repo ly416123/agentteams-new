@@ -113,7 +113,8 @@ class JdbcActiveAttemptRepositoryPostgresTest {
     }
 
     private void insertActive(UUID agent, UUID task, UUID attempt, UUID lease) {
-        jdbc.update("INSERT INTO agent_leases VALUES (?, ?, ?, now(), NULL, 'ACTIVE')", lease, agent, attempt);
+        jdbc.update("INSERT INTO agent_leases VALUES (?, ?, ?, now() + interval '10 minutes', NULL, 'ACTIVE')",
+                lease, agent, attempt);
         jdbc.update("INSERT INTO task_attempts VALUES (?, ?, ?, 'RUNNING', now() + interval '10 minutes')",
                 attempt, task, lease);
         jdbc.update("INSERT INTO task_assignments VALUES (?, ?, ?, ?, 'RUNNING', NULL)",
