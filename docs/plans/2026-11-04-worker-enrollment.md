@@ -51,7 +51,9 @@
 - [x] 使用 Testcontainers/PostgreSQL 验证 scope 查询、Token Hash 落库、撤销幂等和专用 DB role 仅能访问授权表；CI 明确要求 10 项 PostgreSQL 集成断言全部执行。
 - [x] 使用进程内临时 RSA/JWKS 发行者通过真实 HTTP JWT 解码器与 PostgreSQL 验证签名、issuer、audience、Token Hash、撤销和 tenant/project/team scope 拒绝。
 - [x] 在本机使用固定 digest 的 v0.1.5 Gateway 与 PostgreSQL，以最小 protobuf/gRPC 客户端验证有效握手、Gateway/Agent 状态投影，以及未知、过期、撤销和 Agent 绑定不匹配的拒绝；本机共 5 项且未跳过。旧镜像失败见 CI `41953617348`；新镜像 digest `sha256:40c919d31b0fe7bdf876237c36fff405a16c2208420ad42374f6dd67491e055f` 的本机验收 5/5 通过。发布来源为 `agentteams-java v0.1.5` / commit `0156f2c1fecdc868cb4a0f4f13fb068bb4162834`。
+- [x] 只读盘点 L5：Keycloak OIDC discovery/JWKS 可达，部署配置使用 `agentteams-api` audience 和 `tenant`/`project`/`team`/`permissions` claims；现有 Worker Pod 引用模型 Token Secret，未读取或输出 Secret 内容。
 - [ ] 在部署环境使用真实 OIDC Provider 验证 claims 映射，并使用真实 Worker runtime 完成任务 attempt、续租/重连及撤销后的新连接拒绝；测试发行者不替代真实 IdP，当前没有有效 Worker 模型凭据。
+- [ ] L5 当前 OIDC issuer/JWKS 使用 HTTP，不符合 `agentteams-new` Worker 启动校验要求的 HTTPS；本机 kube context 仅有 Pod 读取权限，不能读取 Secret/ConfigMap。需要安全可用的 HTTPS issuer/JWKS 入口，并由用户通过受信路径提供 access token 文件和模型凭据文件路径；不可复制 L5 Secret 内容或放宽 HTTPS 门禁。
 - [x] 检查没有测试密钥或 Token 文件入库；更新审计、PR 描述并提交。
 
 ## 不变量

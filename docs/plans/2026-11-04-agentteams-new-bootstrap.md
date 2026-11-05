@@ -48,6 +48,8 @@
 
 **v0.1.5 上游制品及新项目握手验收（2026-11-05）：** `agentteams-java` PR #2 合并后，release run `41968831366` 成功发布 Maven parent + 6 个共享模块和签名 OCI 镜像。Release manifest source commit `0156f2c1fecdc868cb4a0f4f13fb068bb4162834`；Control Plane digest `sha256:403c3da94d436c19ce09e2d347f9e4182fb972a41adc5995c57694922fb94173`、Gateway `sha256:40c919d31b0fe7bdf876237c36fff405a16c2208420ad42374f6dd67491e055f`、Worker `sha256:0aec65e942a9ecfa726032e560066d91266905dc878fd4a610d533db0118b86d` 已更新到 Compose 示例，三者在本机 Docker 均按 amd64 平台拉取并与 manifest digest 一致。`agentteams-new` Maven parent 固定消费 `0.1.5`；独立 consumer 用已认证 GitHub Packages、本机代理和现有第三方依赖缓存解析 6 个核心模块及传递依赖，`BUILD SUCCESS`。新 Gateway gRPC 握手测试通过 5/5、0 skipped；Enrollment 全套 27/27 测试通过，Compose config、shell syntax 与 `git diff --check` 均通过。本机 ARM64 Colima 通过 amd64 仿真运行：固定容量基础 Compose 中 CP/Gateway/PostgreSQL/NATS 启动成功，数据库 schema 到 v121、4 个 NATS streams 已创建；重启 CP/Gateway 后 schema 与 streams 均保留，CP readiness 返回 `UP`。CP 冷启动约 83 秒，反映 ARM64 仿真耗时，正式运行建议使用 amd64。此阶段只完成上游安全依赖修复、握手门禁和基础服务重启恢复；真实 OIDC Provider/Worker Attempt、租户/会话隔离、凭证代理、容量恢复仍在计划中。
 
+**固定容量启动契约与 L5 资源盘点（2026-11-05）：** 新增无容器副作用的 `start-workers.sh` 契约测试，检查 `WORKER_REPLICAS=0` 只启动共享服务、配置为 2 时只点名 `worker-1` 和 `worker-2`，并禁止使用 `--scale`；OIDC URL 契约测试同时要求 API Auth 启用时 issuer/JWKS 使用 HTTPS。L5 只读确认现有 Keycloak discovery/JWKS、API audience/claim 配置及 Worker Pod 对模型 Token Secret 的引用；未读取 Secret 内容。L5 现有 issuer/JWKS 为 HTTP，且当前 kube context 无权读取 Secret/ConfigMap，不能直接作为新 Compose 的安全凭据来源；真实 IdP/Worker Attempt 验收需先提供 HTTPS OIDC 入口与受信凭据文件路径。现有 L5 工作负载未改动。
+
 ## 批次 1：无 Kubernetes 固定容量 Compose POC
 
 1. 先从旧仓库构建并发布 Control Plane、Gateway、Worker 的固定版本 OCI 镜像；记录镜像 digest 和源 commit。

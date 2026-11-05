@@ -61,4 +61,6 @@ jobs:
         run: |
           docker compose --env-file deploy/compose/.env.example -f deploy/compose/compose.yaml config --quiet
           bash -n deploy/compose/*.sh
-          python3 -m unittest verification.test_compose_oidc_url_contract -v
+          python3 -m unittest \
+            verification.test_compose_fixed_worker_capacity \
+            verification.test_compose_oidc_url_contract -v
