@@ -6,7 +6,8 @@ COPY worker-enrollment/pom.xml ./worker-enrollment/pom.xml
 COPY worker-enrollment/src ./worker-enrollment/src
 COPY credential-proxy/pom.xml ./credential-proxy/pom.xml
 COPY credential-proxy/src ./credential-proxy/src
-RUN mvn --batch-mode --no-transfer-progress -f pom.xml -pl credential-proxy -am package -DskipTests
+RUN --mount=type=secret,id=maven_settings,target=/root/.m2/settings.xml \
+    mvn --batch-mode --no-transfer-progress -f pom.xml -pl credential-proxy -am package -DskipTests
 
 FROM eclipse-temurin:21-jre-jammy
 WORKDIR /app

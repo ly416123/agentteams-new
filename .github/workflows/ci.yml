@@ -12,6 +12,7 @@ concurrency:
 
 permissions:
   contents: read
+  packages: read
 
 jobs:
   worker-enrollment:
@@ -130,4 +131,4 @@ jobs:
             verification.test_compose_oidc_url_contract -v
 
       - name: Build Credential Proxy container
-        run: docker build --tag agentteams-credential-proxy:ci --file credential-proxy/Dockerfile .
+        run: docker build --secret id=maven_settings,src="$HOME/.m2/settings.xml" --tag agentteams-credential-proxy:ci --file credential-proxy/Dockerfile .
