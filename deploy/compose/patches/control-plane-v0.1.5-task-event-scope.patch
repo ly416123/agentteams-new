@@ -881,10 +881,9 @@ index 0000000..5e15346
 +}
 diff --git a/control-plane/src/test/java/io/agentteams/controlplane/worker/WorkerDrainLifecycleTest.java b/control-plane/src/test/java/io/agentteams/controlplane/worker/WorkerDrainLifecycleTest.java
 new file mode 100644
-index 0000000..b022df1
 --- /dev/null
 +++ b/control-plane/src/test/java/io/agentteams/controlplane/worker/WorkerDrainLifecycleTest.java
-@@ -0,0 +1,186 @@
+@@ -0,0 +1,281 @@
 +package io.agentteams.controlplane.worker;
 +
 +import static org.assertj.core.api.Assertions.assertThat;
@@ -896,12 +895,22 @@ index 0000000..b022df1
 +import io.agentteams.controlplane.persistence.TaskAttemptRecord;
 +import io.agentteams.controlplane.persistence.TaskRecord;
 +import io.agentteams.controlplane.service.WorkerLifecycleConflictException;
++import io.agentteams.controlplane.service.TaskAssignmentService;
++import io.agentteams.controlplane.security.AuthorizationException;
++import io.agentteams.controlplane.security.AuthorizationService;
++import io.agentteams.controlplane.security.Principal;
++import io.agentteams.controlplane.security.PrincipalContext;
++import io.agentteams.controlplane.security.ResourceScopeRepository;
 +import io.agentteams.domain.agent.AgentPhase;
 +import io.agentteams.domain.task.TaskPhase;
 +import java.lang.reflect.InvocationTargetException;
 +import java.time.Duration;
 +import java.time.Instant;
 +import java.util.UUID;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.TimeUnit;
 +import org.flywaydb.core.Flyway;
 +import org.junit.jupiter.api.BeforeEach;
 +import org.junit.jupiter.api.Test;
@@ -1010,11 +1019,95 @@ index 0000000..b022df1
 +        UUID agentId = readyAgent();
 +        operations.drain(agentId, 0, "drain-not-ready-1");
 +        insertGatewayOnline(agentId);
-+        insertActiveLease(agentId);
-+
 +        assertThatThrownBy(() -> invokeActivate(agentId, 1, "activate-not-drained-1"))
 +                .isInstanceOf(WorkerLifecycleConflictException.class)
-+                .hasMessage("WORKER_HAS_ACTIVE_TASKS");
++                .hasMessage("WORKER_NOT_DRAINED");
++    }
++
++    @Test
++    void drainingWorkerCannotReceiveAnotherTaskAssignment() {
++        UUID agentId = readyAgent();
++        UUID taskId = UUID.randomUUID();
++        operations.drain(agentId, 0, "drain-before-assignment-1");
++        persistence.inTransaction(tx -> {
++            tx.tasks().insert(new TaskRecord(taskId, "queued", "", TaskPhase.QUEUED, 0, "{}", "actor", "test",
++                    null, null, NOW, NOW, 0));
++            return null;
++        });
++
++        assertThatThrownBy(() -> new TaskAssignmentService(persistence, Duration.ofMinutes(2))
++                .queueReadyTask(taskId, NOW))
++                .isInstanceOf(IllegalStateException.class)
++                .hasMessage("no READY agent matches task capabilities");
++        assertThat(persistence.findTask(taskId)).get().extracting(TaskRecord::phase).isEqualTo(TaskPhase.QUEUED);
++    }
++
++    @Test
++    void taskDispatchSkipsWorkerWhileActivationHoldsItsRowLock() throws Exception {
++        UUID agentId = readyAgent();
++        operations.drain(agentId, 0, "drain-before-concurrent-activation-1");
++        recover(NOW);
++        insertGatewayOnline(agentId);
++        UUID taskId = UUID.randomUUID();
++        persistence.inTransaction(tx -> {
++            tx.tasks().insert(new TaskRecord(taskId, "queued", "", TaskPhase.QUEUED, 0, "{}", "actor", "test",
++                    null, null, NOW, NOW, 0));
++            return null;
++        });
++
++        CountDownLatch activationHasLockedWorker = new CountDownLatch(1);
++        CountDownLatch finishActivation = new CountDownLatch(1);
++        ExecutorService executor = Executors.newSingleThreadExecutor();
++        try {
++            var activation = executor.submit(() -> persistence.inTransaction(tx -> {
++                tx.agents().findByIdForUpdate(agentId).orElseThrow();
++                tx.agents().updatePhase(agentId, AgentPhase.READY, 1, NOW);
++                activationHasLockedWorker.countDown();
++                try {
++                    if (!finishActivation.await(5, TimeUnit.SECONDS)) {
++                        throw new IllegalStateException("activation lock test timed out");
++                    }
++                } catch (InterruptedException interrupted) {
++                    Thread.currentThread().interrupt();
++                    throw new IllegalStateException("activation lock test interrupted", interrupted);
++                }
++                return null;
++            }));
++            assertThat(activationHasLockedWorker.await(5, TimeUnit.SECONDS)).isTrue();
++
++            java.util.Optional<AgentRecord> match = persistence.inTransaction(tx -> tx.agents()
++                    .findReadyMatchingInTaskProject("{}", taskId, NOW));
++            assertThat(match).isEmpty();
++
++            finishActivation.countDown();
++            activation.get(5, TimeUnit.SECONDS);
++            new TaskAssignmentService(persistence, Duration.ofMinutes(2)).queueReadyTask(taskId, NOW);
++            assertThat(persistence.findTask(taskId)).get().extracting(TaskRecord::phase)
++                    .isEqualTo(TaskPhase.ASSIGNED);
++        } finally {
++            finishActivation.countDown();
++            executor.shutdownNow();
++        }
++    }
++
++    @Test
++    void refusesActivationWhenCallerCannotSeeTheWorkerTenantScope() {
++        UUID agentId = UUID.randomUUID();
++        ResourceScopeRepository scopes = org.mockito.Mockito.mock(ResourceScopeRepository.class);
++        org.mockito.Mockito.doThrow(new AuthorizationException("resource is outside caller project"))
++                .when(scopes).requireVisible("WORKER", agentId);
++        WorkerOperationService scoped = new WorkerOperationService(persistence,
++                java.time.Clock.fixed(NOW, java.time.ZoneOffset.UTC), Duration.ofMinutes(2), scopes);
++        PrincipalContext.set(new Principal("tenant-b-user",
++                new AuthorizationService.Scope("tenant-b", "project-b", "team-b"), java.util.Set.of()));
++        try {
++            assertThatThrownBy(() -> scoped.activate(agentId, 1, "cross-tenant-activate-1"))
++                    .isInstanceOf(AuthorizationException.class)
++                    .hasMessage("resource is outside caller project");
++            org.mockito.Mockito.verify(scopes).requireVisible("WORKER", agentId);
++        } finally {
++            PrincipalContext.clear();
++        }
 +    }
 +
 +    private UUID readyAgent() {
@@ -1053,7 +1146,8 @@ index 0000000..b022df1
 +                    (agent_id, connection_id, presence, phase, runtime, runtime_version, capabilities,
 +                     connected_at, last_seen_at, disconnected_at, updated_at)
 +                VALUES (?, ?, 'ONLINE', 'READY', 'agentscope', 'v0.1.5', '{}'::jsonb, ?, ?, NULL, ?)
-+                """, agentId.toString(), UUID.randomUUID(), NOW, NOW, NOW);
++                """, agentId.toString(), UUID.randomUUID(), java.sql.Timestamp.from(NOW),
++                java.sql.Timestamp.from(NOW), java.sql.Timestamp.from(NOW));
 +    }
 +
 +    private WorkerOperation invokeActivate(UUID agentId, long expectedVersion, String idempotencyKey) {
@@ -1274,160 +1368,3 @@ index 0000000..62da7a1
 +    OR (type = 'ROLLBACK' AND status IN ('SUCCEEDED', 'FAILED'))
 +    OR (type = 'TERMINATE' AND status IN ('PENDING', 'RUNNING', 'SUCCEEDED', 'FAILED'))
 +);
-diff --git a/control-plane/src/test/java/io/agentteams/controlplane/worker/WorkerDrainLifecycleTest.java b/control-plane/src/test/java/io/agentteams/controlplane/worker/WorkerDrainLifecycleTest.java
-index b022df1..8ae589f 100644
---- a/control-plane/src/test/java/io/agentteams/controlplane/worker/WorkerDrainLifecycleTest.java
-+++ b/control-plane/src/test/java/io/agentteams/controlplane/worker/WorkerDrainLifecycleTest.java
-@@ -123,11 +123,9 @@ class WorkerDrainLifecycleTest {
-         UUID agentId = readyAgent();
-         operations.drain(agentId, 0, "drain-not-ready-1");
-         insertGatewayOnline(agentId);
--        insertActiveLease(agentId);
--
-         assertThatThrownBy(() -> invokeActivate(agentId, 1, "activate-not-drained-1"))
-                 .isInstanceOf(WorkerLifecycleConflictException.class)
--                .hasMessage("WORKER_HAS_ACTIVE_TASKS");
-+                .hasMessage("WORKER_NOT_DRAINED");
-     }
-
-     private UUID readyAgent() {
-@@ -166,7 +164,8 @@ class WorkerDrainLifecycleTest {
-                     (agent_id, connection_id, presence, phase, runtime, runtime_version, capabilities,
-                      connected_at, last_seen_at, disconnected_at, updated_at)
-                 VALUES (?, ?, 'ONLINE', 'READY', 'agentscope', 'v0.1.5', '{}'::jsonb, ?, ?, NULL, ?)
--                """, agentId.toString(), UUID.randomUUID(), NOW, NOW, NOW);
-+                """, agentId.toString(), UUID.randomUUID(), java.sql.Timestamp.from(NOW),
-+                java.sql.Timestamp.from(NOW), java.sql.Timestamp.from(NOW));
-     }
-
-     private WorkerOperation invokeActivate(UUID agentId, long expectedVersion, String idempotencyKey) {
-diff --git a/control-plane/src/test/java/io/agentteams/controlplane/worker/WorkerDrainLifecycleTest.java b/control-plane/src/test/java/io/agentteams/controlplane/worker/WorkerDrainLifecycleTest.java
-index 8ae589f..c046454 100644
---- a/control-plane/src/test/java/io/agentteams/controlplane/worker/WorkerDrainLifecycleTest.java
-+++ b/control-plane/src/test/java/io/agentteams/controlplane/worker/WorkerDrainLifecycleTest.java
-@@ -9,6 +9,12 @@ import io.agentteams.controlplane.persistence.FoundationPersistenceService;
- import io.agentteams.controlplane.persistence.TaskAttemptRecord;
- import io.agentteams.controlplane.persistence.TaskRecord;
- import io.agentteams.controlplane.service.WorkerLifecycleConflictException;
-+import io.agentteams.controlplane.service.TaskAssignmentService;
-+import io.agentteams.controlplane.security.AuthorizationException;
-+import io.agentteams.controlplane.security.AuthorizationService;
-+import io.agentteams.controlplane.security.Principal;
-+import io.agentteams.controlplane.security.PrincipalContext;
-+import io.agentteams.controlplane.security.ResourceScopeRepository;
- import io.agentteams.domain.agent.AgentPhase;
- import io.agentteams.domain.task.TaskPhase;
- import java.lang.reflect.InvocationTargetException;
-@@ -128,6 +134,44 @@ class WorkerDrainLifecycleTest {
-                 .hasMessage("WORKER_NOT_DRAINED");
-     }
-
-+    @Test
-+    void drainingWorkerCannotReceiveAnotherTaskAssignment() {
-+        UUID agentId = readyAgent();
-+        UUID taskId = UUID.randomUUID();
-+        operations.drain(agentId, 0, "drain-before-assignment-1");
-+        persistence.inTransaction(tx -> {
-+            tx.tasks().insert(new TaskRecord(taskId, "queued", "", TaskPhase.QUEUED, 0, "{}", "actor", "test",
-+                    null, null, NOW, NOW, 0));
-+            return null;
-+        });
-+
-+        assertThatThrownBy(() -> new TaskAssignmentService(persistence, Duration.ofMinutes(2))
-+                .queueReadyTask(taskId, NOW))
-+                .isInstanceOf(IllegalStateException.class)
-+                .hasMessage("no READY agent matches task capabilities");
-+        assertThat(persistence.findTask(taskId)).get().extracting(TaskRecord::phase).isEqualTo(TaskPhase.QUEUED);
-+    }
-+
-+    @Test
-+    void refusesActivationWhenCallerCannotSeeTheWorkerTenantScope() {
-+        UUID agentId = UUID.randomUUID();
-+        ResourceScopeRepository scopes = org.mockito.Mockito.mock(ResourceScopeRepository.class);
-+        org.mockito.Mockito.doThrow(new AuthorizationException("resource is outside caller project"))
-+                .when(scopes).requireVisible("WORKER", agentId);
-+        WorkerOperationService scoped = new WorkerOperationService(persistence,
-+                java.time.Clock.fixed(NOW, java.time.ZoneOffset.UTC), Duration.ofMinutes(2), scopes);
-+        PrincipalContext.set(new Principal("tenant-b-user",
-+                new AuthorizationService.Scope("tenant-b", "project-b", "team-b"), java.util.Set.of()));
-+        try {
-+            assertThatThrownBy(() -> scoped.activate(agentId, 1, "cross-tenant-activate-1"))
-+                    .isInstanceOf(AuthorizationException.class)
-+                    .hasMessage("resource is outside caller project");
-+            org.mockito.Mockito.verify(scopes).requireVisible("WORKER", agentId);
-+        } finally {
-+            PrincipalContext.clear();
-+        }
-+    }
-+
-     private UUID readyAgent() {
-         UUID id = UUID.randomUUID();
-         persistence.inTransaction(tx -> {
---- a/control-plane/src/test/java/io/agentteams/controlplane/worker/WorkerDrainLifecycleTest.java
-+++ b/control-plane/src/test/java/io/agentteams/controlplane/worker/WorkerDrainLifecycleTest.java
-@@ -21,6 +21,10 @@
- import java.time.Duration;
- import java.time.Instant;
- import java.util.UUID;
-+import java.util.concurrent.CountDownLatch;
-+import java.util.concurrent.ExecutorService;
-+import java.util.concurrent.Executors;
-+import java.util.concurrent.TimeUnit;
- import org.flywaydb.core.Flyway;
- import org.junit.jupiter.api.BeforeEach;
- import org.junit.jupiter.api.Test;
-@@ -153,5 +157,54 @@
-     }
-+
-     @Test
-+    void taskDispatchSkipsWorkerWhileActivationHoldsItsRowLock() throws Exception {
-+        UUID agentId = readyAgent();
-+        operations.drain(agentId, 0, "drain-before-concurrent-activation-1");
-+        recover(NOW);
-+        insertGatewayOnline(agentId);
-+        UUID taskId = UUID.randomUUID();
-+        persistence.inTransaction(tx -> {
-+            tx.tasks().insert(new TaskRecord(taskId, "queued", "", TaskPhase.QUEUED, 0, "{}", "actor", "test",
-+                    null, null, NOW, NOW, 0));
-+            return null;
-+        });
-+
-+        CountDownLatch activationHasLockedWorker = new CountDownLatch(1);
-+        CountDownLatch finishActivation = new CountDownLatch(1);
-+        ExecutorService executor = Executors.newSingleThreadExecutor();
-+        try {
-+            var activation = executor.submit(() -> persistence.inTransaction(tx -> {
-+                tx.agents().findByIdForUpdate(agentId).orElseThrow();
-+                tx.agents().updatePhase(agentId, AgentPhase.READY, 1, NOW);
-+                activationHasLockedWorker.countDown();
-+                try {
-+                    if (!finishActivation.await(5, TimeUnit.SECONDS)) {
-+                        throw new IllegalStateException("activation lock test timed out");
-+                    }
-+                } catch (InterruptedException interrupted) {
-+                    Thread.currentThread().interrupt();
-+                    throw new IllegalStateException("activation lock test interrupted", interrupted);
-+                }
-+                return null;
-+            }));
-+            assertThat(activationHasLockedWorker.await(5, TimeUnit.SECONDS)).isTrue();
-+
-+            java.util.Optional<AgentRecord> match = persistence.inTransaction(tx -> tx.agents()
-+                    .findReadyMatchingInTaskProject("{}", taskId, NOW));
-+            assertThat(match).isEmpty();
-+
-+            finishActivation.countDown();
-+            activation.get(5, TimeUnit.SECONDS);
-+            new TaskAssignmentService(persistence, Duration.ofMinutes(2)).queueReadyTask(taskId, NOW);
-+            assertThat(persistence.findTask(taskId)).get().extracting(TaskRecord::phase)
-+                    .isEqualTo(TaskPhase.ASSIGNED);
-+        } finally {
-+            finishActivation.countDown();
-+            executor.shutdownNow();
-+        }
-+    }
-+
-+    @Test
-     void refusesActivationWhenCallerCannotSeeTheWorkerTenantScope() {
-         UUID agentId = UUID.randomUUID();
-         ResourceScopeRepository scopes = org.mockito.Mockito.mock(ResourceScopeRepository.class);
