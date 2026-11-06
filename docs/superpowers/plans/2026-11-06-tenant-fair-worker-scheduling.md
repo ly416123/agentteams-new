@@ -48,7 +48,7 @@
 
 **完成证据：** A/B 交替 Attempt 的 PostgreSQL/HTTP/代理集成测试和真实 Worker POC；旧的 scope 相等校验只有在新的 Attempt capability 校验已验证替代后才能移除。
 
-**进度更新（2026-11-06）：** Credential Proxy 已实现 Attempt-bound token 校验，并新增内部签发 API。Worker 以 Gateway session bearer 证明 Agent 身份，只有该 Agent 当前活动的 Task/Attempt/Lease 可签发；Tenant/Project/Team scope 从 Task scope 派生，Provider credential ref 从部署侧可信映射读取，数据库仅存新 token 的 SHA-256。旧 Tenant-bound Enrollment token 保持严格 scope 校验。Credential Proxy 模块全量 54 项测试通过（PostgreSQL Testcontainers 13 项及签发 HTTP 3 项均在本机 Docker 实际运行，零跳过）。当前仍缺 Control Plane 分配事务关联与 Worker 领取/续领和受保护传输；签发 token 到期不晚于当时 Lease，Worker 尚未续领；TaskEvent/Artifact/workspace 尚未验证 capability。因此共享池门槛未完成，不能先移除现有 Worker/Task scope guard。
+**进度更新（2026-11-06）：** Credential Proxy 已实现 Attempt-bound token 校验和内部签发 API。Worker 以 Gateway session bearer 证明 Agent 身份，只有该 Agent 当前活动的 Task/Attempt/Lease 可签发；Tenant/Project/Team scope 从 Task scope 派生，Provider credential ref 从部署侧可信映射读取，数据库仅存新 token 的 SHA-256。旧 Tenant-bound Enrollment token 保持严格 scope 校验。Worker 补丁现通过按模型请求获取不缓存的 Attempt token 接入该 API；精确 Worker 测试 31 项、Credential Proxy 全量 54 项（PostgreSQL Testcontainers 13 项及签发 HTTP 3 项）通过，零失败/跳过。L5 固定 Tenant A 槽位已用该 Worker 镜像启动并进入 `READY`，Credential Proxy healthy；没有静态模型密钥配置。L5 验证曾发现槽位 Session 到期，现通过独立测试 Keycloak 重新 Enrollment 为 7 天并确认撤销/过期状态；凭据到期后的自动 Session 轮换尚未实现。PR commit `3894f1c` 的 CI run `42193166952` 全部通过。仍缺 Control Plane 领取事务向 Worker 交付 Attempt capability、任务事件/Artifact/workspace 统一校验 capability、Lease 延期后的真实模型请求及 A/B 连续执行验收；当前 L5 只有 Worker ready，没有真实任务闭环。因此共享池门槛未完成，不能移除现有 Worker/Task scope guard。
 
 ### 任务 2：定义并测试租户公平调度器
 
