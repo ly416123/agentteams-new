@@ -33,6 +33,17 @@
 
 调度算法实现前的先行容量修复：已按 TDD 在 pinned-source 隔离副本中先运行回归测试并复现失败（活动 Lease 时仍选中 READY Worker），然后在 Project scope Agent 选择 SQL 加入有效活动 Lease 检查；同一 Testcontainers PostgreSQL 测试确认活动 Lease 返回空，标记 RELEASED 后重新选中该 Worker。Team 路径已有活动 Lease 检查与 Agent 行锁。干净上游副本应用全部 Compose patch 的 `patch --dry-run` 已通过；本地 PostgreSQL 集成测试分别实跑 1/1 通过：活动 Lease/释放可重用，以及两个并发任务只产生一个活动 Lease。实现和两项 PostgreSQL 测试已纳入 Compose Control Plane hardening patch；新增纯 `TenantFairQueue` weighted deficit 轮询组件，测试锁定 A:B 权重 2:1 长期分配比例、活动上限、空队列/配额阻塞及非法配置。第一次算法测试暴露轮转游标导致的 1:1 退化，修正后 4/4 通过。纯组件和所有测试已纳入 Compose Control Plane hardening patch；构建门禁分别要求 PostgreSQL 两项、调度单测四项零失败/错误/跳过。调度算法尚未接入数据库 Candidate 加载/TaskAssignmentScheduler，也未实现持久化 Tenant 权重/并发/队列配额，不能称为端到端公平派发已完成。
 
+### 任务 1A：实现 Tenant-neutral Worker 与 Attempt capability（公平调度前置门槛）
+
+- [ ] Enrollment 为固定共享槽位签发 Tenant-neutral Workload 身份；不复用某个 Tenant 管理员长期 Session 作为共享池身份。
+- [ ] Task/Attempt/Lease 原子领取时生成随机 Attempt capability，仅存哈希，明文只交给已认证的目标 Worker；租约释放、取消、超时/恢复时撤销。
+- [ ] Control Plane TaskEvent、文件/Artifact/workspace API 从 capability 派生 Attempt 和 Task scope，拒绝 Worker 请求自报 Tenant；覆盖缺失、过期、伪造、跨 Attempt、跨 Tenant 测试。
+- [ ] Credential Proxy 以 capability 解析活跃 Attempt 与 TASK scope，并按 Tenant/Project 选择 Provider 凭据；长期 Worker Session 不承载 Tenant modelCredentialRef。
+- [ ] 同一固定槽位连续执行 Tenant A/B Attempt，验证 workspace、凭据引用、事件和 Artifact 不能串用；完成清理后才允许再领取。
+- [ ] 固定上游补丁、Enrollment、Credential Proxy 各自 CI 硬门禁验证上述合同，零跳过。
+
+**完成证据：** A/B 交替 Attempt 的 PostgreSQL/HTTP/代理集成测试和真实 Worker POC；旧的 scope 相等校验只有在新的 Attempt capability 校验已验证替代后才能移除。
+
 ### 任务 2：定义并测试租户公平调度器
 
 - [x] 为公平轮转和 Tenant 活动上限写纯单元测试：权重高的 Tenant 长期获得相应更多机会，但任何 Tenant 都不能绕过并发上限。
