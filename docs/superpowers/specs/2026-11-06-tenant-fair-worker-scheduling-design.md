@@ -36,7 +36,11 @@ Credential Proxy 已增加第二种身份模式的本地实现：原 Enrollment 
 
 ## 并发运行模型
 
-Java 虚拟线程不作为调度公平或租户隔离机制。先保留当前 Worker 执行器，并用代表性负载测出 I/O 等待、CPU 占用、线程数和上下文传播；若执行线程主要阻塞在网络/磁盘 I/O，再以有界并发评估虚拟线程。CPU 密集任务继续使用有界执行器及 CPU 限额；不可信工具/代码需由子进程或明确的沙箱 Provider 隔离。
+Java 虚拟线程不作为调度公平或租户隔离机制。上游 Runtime 已有 `maxConcurrency` 上限；AgentScope Runtime 以 task-id 索引独立 Execution，并订阅每个任务的事件流，因此执行层具备有界并行的形态。但本项目当前 Control Plane 对每个逻辑 Worker/Agent 强制最多一个活动 Lease，调度侧不会向同一 Agent 并发派发；这是当前容量模型的硬约束，不能因 Runtime 支持并发就认为同一 Pod 已支持多租户并跑。
+
+第一阶段按一个逻辑 Worker slot 同时执行一个 Attempt，使用持久队列、Tenant 公平派发及每租户并发上限；任务占用 slot 期间不抢占。若要在同一 Pod 开多个执行 lane，需先把“每 Agent 唯一活动 Lease”改为固定数量 lane 的原子占用，例如 `(agent_id, lane_id)` 唯一活动 Lease，并让 Control Plane 与 Runtime 共用同一个 lane 容量；同时补齐每 Attempt workspace、配置/模型/工具调用身份、取消、完成清理和资源隔离验收。长任务阻塞所有 lane 时仍只能等待、检查点让出或终止，公平队列不能抢占运行中任务。
+
+当前 AgentScope 调用已采用事件流/异步订阅；因此不先引入协程框架或把所有执行改成虚拟线程。先采样长任务中模型/工具 I/O 等待、CPU、堆外/工作区内存、OS 线程和连接池使用。如果 I/O 等待期间确实占用大量平台线程，再仅对阻塞适配层评估 Java 21 虚拟线程；必须由 Semaphore、连接池、租户配额和 CPU/内存限制给并发设上限。CPU 密集任务继续使用有界执行器及 CPU 限额；不可信工具/代码需由子进程或明确的沙箱 Provider 隔离。
 
 ## 验收标准
 

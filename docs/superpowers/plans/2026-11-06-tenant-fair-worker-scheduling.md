@@ -85,6 +85,8 @@
 
 ### 任务 5：长任务资源与运行模型基准
 
+**源码盘点：** Runtime 已存在 `maxConcurrency`，`AgentScopeRuntime` 用 task-id 映射独立 Execution 并订阅异步事件流；但本批 Control Plane 安全补丁把每个逻辑 Worker/Agent 限为一个活动 Lease。故当前已支持的是“有界 Runtime 并发接口”，不是“同一 Agent/Pod 多 Attempt 调度”。引入同 Pod 多执行 lane 前，必须同步实现固定 lane 原子租用、租户额度、每 Attempt workspace/凭据/会话边界和终态清理；仅调大 `maxConcurrency` 不会生效且可能绕过数据库容量约束。
+
 - [ ] 为 CPU、内存、Attempt wall-clock、心跳和取消设置硬上限及明确失败状态。
 - [ ] 选择代表性 I/O 密集、CPU 密集和长工具等待任务，测量现有执行器的 CPU、RSS、线程数、租户排队时间和任务吞吐。
 - [ ] 单独比较 Java 虚拟线程与当前执行器；验证 ThreadLocal/安全 Principal、租户上下文、取消传播和连接池背压。
