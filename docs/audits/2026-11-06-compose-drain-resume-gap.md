@@ -33,4 +33,4 @@ v0.1.5 有持久化 `DRAIN` 与 `TERMINATE` 操作，但它们不是可逆的 Co
 
 在固定 v0.1.5 派生 Control Plane 补丁中增加 Drain 生命周期状态恢复和 `POST /api/v1/agents/{id}/operations/activate`：恢复调度器按 Agent 行锁顺序检查活动 Lease，零 Lease 时把 DRAIN 标记为 DRAINED 并写入事件；DRAIN 不再因 2 分钟 operation lease 到期而失败。Activate 要求当前版本匹配、Agent 仍为 DRAINING、无活动 Lease、最新 Drain 已 DRAINED 且 Gateway 近 30 秒在线，成功后同一 Agent 回到 READY，并持久化幂等 ACTIVATE 操作及审计事件。TERMINATE 语义仍是永久终止。
 
-新增 6 项 PostgreSQL Testcontainers 生命周期用例，覆盖无 Lease 自动完成、活动 Lease 等待、在线恢复与幂等、Gateway 离线拒绝、活动 Lease 拒绝和未 Drain 完成拒绝。上次 CI 的红灯先暴露测试夹具向 PostgreSQL 传 Instant 的类型推断错误，已改用 Timestamp；本机 Maven 编译成功，但缺少 Docker，6 项数据库测试全部被跳过，不能记为通过。修改后的统一 pinned-source patch 已能应用到基线源码。尚需提交后由 CI 实际运行 6 项测试及全量加固测试，确认成功后再接 Compose 操作脚本和生命周期端到端演练；并发派发/激活竞态、跨租户授权仍需补充专门验收。
+新增 6 项 PostgreSQL Testcontainers 生命周期用例，覆盖无 Lease 自动完成、活动 Lease 等待、在线恢复与幂等、Gateway 离线拒绝、活动 Lease 拒绝和未 Drain 完成拒绝。第一轮 CI 已在数据库用例中发现 Gateway 状态表 `agent_id` 实际为 TEXT，修正为 TEXT 比较并锁定查询到的 `connection_id` 行；测试夹具向 PostgreSQL 传 Instant 的类型问题也已改用 Timestamp。本机缺少 Docker，6 项数据库测试在本地被跳过，不能记为通过；统一 pinned-source patch 能应用到基线。修正后 CI 待重跑。确认测试通过后再接 Compose 操作脚本和生命周期端到端演练；并发派发/激活竞态、跨租户授权仍需专门验收。
