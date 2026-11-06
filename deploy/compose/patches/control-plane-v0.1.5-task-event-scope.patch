@@ -1363,3 +1363,71 @@ index 8ae589f..c046454 100644
      private UUID readyAgent() {
          UUID id = UUID.randomUUID();
          persistence.inTransaction(tx -> {
+--- a/control-plane/src/test/java/io/agentteams/controlplane/worker/WorkerDrainLifecycleTest.java
++++ b/control-plane/src/test/java/io/agentteams/controlplane/worker/WorkerDrainLifecycleTest.java
+@@ -21,6 +21,10 @@
+ import java.time.Duration;
+ import java.time.Instant;
+ import java.util.UUID;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.TimeUnit;
+ import org.flywaydb.core.Flyway;
+ import org.junit.jupiter.api.BeforeEach;
+ import org.junit.jupiter.api.Test;
+@@ -153,5 +157,54 @@
+     }
++
+     @Test
++    void taskDispatchSkipsWorkerWhileActivationHoldsItsRowLock() throws Exception {
++        UUID agentId = readyAgent();
++        operations.drain(agentId, 0, "drain-before-concurrent-activation-1");
++        recover(NOW);
++        insertGatewayOnline(agentId);
++        UUID taskId = UUID.randomUUID();
++        persistence.inTransaction(tx -> {
++            tx.tasks().insert(new TaskRecord(taskId, "queued", "", TaskPhase.QUEUED, 0, "{}", "actor", "test",
++                    null, null, NOW, NOW, 0));
++            return null;
++        });
++
++        CountDownLatch activationHasLockedWorker = new CountDownLatch(1);
++        CountDownLatch finishActivation = new CountDownLatch(1);
++        ExecutorService executor = Executors.newSingleThreadExecutor();
++        try {
++            var activation = executor.submit(() -> persistence.inTransaction(tx -> {
++                tx.agents().findByIdForUpdate(agentId).orElseThrow();
++                tx.agents().updatePhase(agentId, AgentPhase.READY, 1, NOW);
++                activationHasLockedWorker.countDown();
++                try {
++                    if (!finishActivation.await(5, TimeUnit.SECONDS)) {
++                        throw new IllegalStateException("activation lock test timed out");
++                    }
++                } catch (InterruptedException interrupted) {
++                    Thread.currentThread().interrupt();
++                    throw new IllegalStateException("activation lock test interrupted", interrupted);
++                }
++                return null;
++            }));
++            assertThat(activationHasLockedWorker.await(5, TimeUnit.SECONDS)).isTrue();
++
++            java.util.Optional<AgentRecord> match = persistence.inTransaction(tx -> tx.agents()
++                    .findReadyMatchingInTaskProject("{}", taskId, NOW));
++            assertThat(match).isEmpty();
++
++            finishActivation.countDown();
++            activation.get(5, TimeUnit.SECONDS);
++            new TaskAssignmentService(persistence, Duration.ofMinutes(2)).queueReadyTask(taskId, NOW);
++            assertThat(persistence.findTask(taskId)).get().extracting(TaskRecord::phase)
++                    .isEqualTo(TaskPhase.ASSIGNED);
++        } finally {
++            finishActivation.countDown();
++            executor.shutdownNow();
++        }
++    }
++
++    @Test
+     void refusesActivationWhenCallerCannotSeeTheWorkerTenantScope() {
+         UUID agentId = UUID.randomUUID();
+         ResourceScopeRepository scopes = org.mockito.Mockito.mock(ResourceScopeRepository.class);
