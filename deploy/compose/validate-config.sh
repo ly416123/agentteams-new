@@ -40,16 +40,23 @@ if [ "$deployment_mode" != "local-dev" ] && [ "$api_auth_enabled" != "true" ]; t
   echo "API_AUTH_ENABLED=true is required outside local-dev" >&2
   exit 2
 fi
-if [ "$deployment_mode" = "self-hosted-small" ]; then
+if [ "$deployment_mode" = "self-hosted-small" ] || [ "$replicas" -gt 0 ]; then
   control_plane_source_build=$(value CONTROL_PLANE_BUILD_FROM_SOURCE)
   control_plane_image=$(value CONTROL_PLANE_IMAGE)
   if [ "$control_plane_source_build" != "true" ] \
       || [ "$control_plane_image" != "agentteams-new/control-plane:v0.1.5-task-event-scope-guard-0156f2c" ]; then
-    echo "self-hosted-small requires the pinned TASK_EVENT-hardened Control Plane source build" >&2
+    echo "self-hosted-small or Workers require the pinned TASK_EVENT-hardened Control Plane source build" >&2
     exit 2
   fi
 fi
 if [ "$replicas" -gt 0 ]; then
+  worker_source_build=$(value WORKER_BUILD_FROM_SOURCE)
+  worker_image=$(value WORKER_IMAGE)
+  if [ "$worker_source_build" != "true" ] \
+      || [ "$worker_image" != "ghcr.io/ly416123/agentteams-agent-worker@sha256:0aec65e942a9ecfa726032e560066d91266905dc878fd4a610d533db0118b86d" ]; then
+    echo "Workers require WORKER_BUILD_FROM_SOURCE=true and the pinned base Worker digest; startup builds the Attempt-isolated derivative" >&2
+    exit 2
+  fi
   enrollment_port=$(value ENROLLMENT_PORT)
   enrollment_port=${enrollment_port:-8090}
   case "$enrollment_port" in *[!0-9]*|'') echo "ENROLLMENT_PORT must be a TCP port number" >&2; exit 2 ;; esac
@@ -114,7 +121,7 @@ fi
 for key in CONTROL_PLANE_IMAGE GATEWAY_IMAGE WORKER_IMAGE; do
   image=$(value "$key")
   if [ "$key" = "CONTROL_PLANE_IMAGE" ] \
-      && [ "$deployment_mode" = "self-hosted-small" ] \
+      && { [ "$deployment_mode" = "self-hosted-small" ] || [ "$replicas" -gt 0 ]; } \
       && [ "$(value CONTROL_PLANE_BUILD_FROM_SOURCE)" = "true" ] \
       && [ "$image" = "agentteams-new/control-plane:v0.1.5-task-event-scope-guard-0156f2c" ]; then
     continue

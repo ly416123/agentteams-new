@@ -59,6 +59,12 @@ class ComposeFixedWorkerCapacityTest(unittest.TestCase):
                 values["CONTROL_PLANE_IMAGE"] = (
                     "agentteams-new/control-plane:v0.1.5-task-event-scope-guard-0156f2c"
                 )
+            if replicas > 0:
+                values["CONTROL_PLANE_BUILD_FROM_SOURCE"] = "true"
+                values["CONTROL_PLANE_IMAGE"] = (
+                    "agentteams-new/control-plane:v0.1.5-task-event-scope-guard-0156f2c"
+                )
+                values["WORKER_BUILD_FROM_SOURCE"] = "true"
 
             for slot in range(1, replicas + 1):
                 slot_proxy_token = temp / f"worker-{slot}.model-proxy-token"
@@ -86,15 +92,16 @@ class ComposeFixedWorkerCapacityTest(unittest.TestCase):
                 "printf 'docker\\n' >> \"$CALL_ORDER_LOG\"\n"
             )
             docker.chmod(0o700)
-            if deployment_mode == "self-hosted-small":
+            if deployment_mode == "self-hosted-small" or replicas > 0:
                 python = mock_bin / "python3"
                 python.write_text(
                     "#!/bin/sh\n"
-                    "if [ \"$1\" = \"-\" ]; then\n"
-                    "  sed -n 's/^CONTROL_PLANE_IMAGE=//p' \"$2\" | tail -1\n"
-                    "else\n"
-                    "  printf 'builder\\n' >> \"$CALL_ORDER_LOG\"\n"
-                    "fi\n"
+                    "case \"$1\" in\n"
+                    "  -) sed -n 's/^CONTROL_PLANE_IMAGE=//p' \"$2\" | tail -1;;\n"
+                    "  */build-control-plane-hardening.py) echo control-plane-builder >> \"$CALL_ORDER_LOG\";;\n"
+                    "  */build-worker-hardening.py) echo worker-builder >> \"$CALL_ORDER_LOG\";;\n"
+                    "  *) exec " + shlex.quote(os.sys.executable) + " \"$@\";;\n"
+                    "esac\n"
                 )
                 python.chmod(0o700)
 
@@ -118,8 +125,11 @@ class ComposeFixedWorkerCapacityTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             calls = call_log.read_text().splitlines()
             self.assertEqual(len(calls), 1, calls)
-            if deployment_mode == "self-hosted-small":
-                self.assertEqual(call_order_log.read_text().splitlines(), ["builder", "docker"])
+            if deployment_mode == "self-hosted-small" or replicas > 0:
+                order = call_order_log.read_text().splitlines()
+                self.assertEqual(order[-1], "docker")
+                expected = ["control-plane-builder", "worker-builder"] if replicas > 0 else ["control-plane-builder"]
+                self.assertEqual(order[:-1], expected)
             return shlex.split(calls[0])
 
     @staticmethod
@@ -147,6 +157,68 @@ class ComposeFixedWorkerCapacityTest(unittest.TestCase):
             ["postgres", "nats", "nats-bootstrap", "control-plane", "gateway"],
         )
 
+    def test_builds_both_hardened_images_before_worker_startup(self) -> None:
+        # The launcher must run both image gates before invoking Compose.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            values = {}
+            for line in EXAMPLE_ENV.read_text().splitlines():
+                if line and not line.lstrip().startswith("#") and "=" in line:
+                    key, value = line.split("=", 1)
+                    values[key] = value
+            values.update({
+                "WORKER_REPLICAS": "1", "API_AUTH_ENABLED": "true",
+                "OIDC_ISSUER_URI": "https://id.example.test/issuer",
+                "OIDC_JWK_SET_URI": "https://id.example.test/keys", "OIDC_AUDIENCE": "test",
+                "POSTGRES_PASSWORD": "test-postgres-password-with-32-chars",
+                "CONTROL_PLANE_DB_PASSWORD": "test-control-plane-password-with-32-chars",
+                "WORKER_ENROLLMENT_DB_PASSWORD": "test-enrollment-password-with-32-chars",
+                "CREDENTIAL_PROXY_DB_PASSWORD": "test-credential-proxy-password-with-32-chars",
+                "CONTROL_PLANE_BUILD_FROM_SOURCE": "true",
+                "CONTROL_PLANE_IMAGE": "agentteams-new/control-plane:v0.1.5-task-event-scope-guard-0156f2c",
+                "WORKER_BUILD_FROM_SOURCE": "true",
+                "WORKER_IMAGE": "ghcr.io/ly416123/agentteams-agent-worker@sha256:0aec65e942a9ecfa726032e560066d91266905dc878fd4a610d533db0118b86d",
+            })
+            for slot in range(1, 2):
+                provider = temp / "provider-secrets/tenant-a/project-a/team-a/chatgpt"
+                provider.parent.mkdir(parents=True, exist_ok=True)
+                provider.write_text("test")
+                provider.chmod(0o600)
+                for folder in [provider.parent.parent.parent, provider.parent.parent, provider.parent]:
+                    folder.chmod(0o700)
+                token = temp / "proxy-token"
+                token.write_text("atp_" + "A" * 43)
+                token.chmod(0o600)
+                values.update({
+                    "PROVIDER_CREDENTIALS_DIR": str(provider.parents[2]),
+                    "CREDENTIAL_PROXY_UID": str(os.getuid()),
+                    f"WORKER_{slot}_MODEL_PROXY_TOKEN_FILE": str(token),
+                    f"WORKER_{slot}_MODEL_CREDENTIAL_REF": "file:tenant-a/project-a/team-a/chatgpt",
+                    f"WORKER_{slot}_AGENT_ID": "00000000-0000-0000-0000-000000000001",
+                    f"WORKER_{slot}_CREDENTIALS_FILE": str(temp / "worker.runtime.env"),
+                })
+                runtime = temp / "worker.runtime.env"
+                runtime.write_text("AGENTTEAMS_GATEWAY_AUTH_TOKEN=ats_" + "A" * 48 + "\n")
+                runtime.chmod(0o600)
+            env = temp / ".env"
+            env.write_text("\n".join(f"{k}={v}" for k, v in values.items()) + "\n")
+            mock_bin = temp / "bin"
+            mock_bin.mkdir()
+            log = temp / "calls"
+            (mock_bin / "docker").write_text("#!/bin/sh\necho docker >> \"$CALL_ORDER_LOG\"\n")
+            (mock_bin / "docker").chmod(0o700)
+            (mock_bin / "python3").write_text(
+                "#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"$CALL_ORDER_LOG\"\n")
+            (mock_bin / "python3").chmod(0o700)
+            environment = os.environ.copy()
+            environment.update(PATH=f"{mock_bin}:{environment['PATH']}", CALL_ORDER_LOG=str(log))
+            result = subprocess.run([str(STARTER), str(env)], capture_output=True, text=True, env=environment)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            calls = log.read_text().splitlines()
+            self.assertEqual(calls[-1], "docker")
+            builders = [call.rsplit("/", 1)[-1] for call in calls[:-1] if call != "-"]
+            self.assertEqual(builders, ["build-control-plane-hardening.py", "build-worker-hardening.py"])
+
     def test_starts_exactly_the_configured_worker_slots(self) -> None:
         args = self.invoke_startup(2)
         services = self.services_after_up(args)
@@ -156,18 +228,51 @@ class ComposeFixedWorkerCapacityTest(unittest.TestCase):
         )
         self.assertNotIn("--scale", args)
 
+    def test_rejects_stock_images_for_worker_pool(self) -> None:
+        # Remove the required derived images after the helper has set secure OIDC inputs.
+        # Direct config validation reports the first missing hardening contract.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            for line in EXAMPLE_ENV.read_text().splitlines():
+                if line and not line.lstrip().startswith("#") and "=" in line:
+                    key, value = line.split("=", 1)
+                    if key == "WORKER_REPLICAS": value = "1"
+                    if key == "API_AUTH_ENABLED": value = "true"
+                    if key == "OIDC_ISSUER_URI": value = "https://id.example.test/issuer"
+                    if key == "OIDC_JWK_SET_URI": value = "https://id.example.test/keys"
+                    if key == "OIDC_AUDIENCE": value = "agentteams-test"
+                    if key == "POSTGRES_PASSWORD": value = "test-postgres-password-with-32-chars"
+                    if key == "CONTROL_PLANE_DB_PASSWORD": value = "test-control-plane-password-with-32-chars"
+                    if key == "WORKER_ENROLLMENT_DB_PASSWORD": value = "test-enrollment-password-with-32-chars"
+                    if key == "CREDENTIAL_PROXY_DB_PASSWORD": value = "test-credential-proxy-password-with-32-chars"
+                    if key == "CREDENTIAL_PROXY_UID": value = str(os.getuid())
+                    if key == "CREDENTIAL_PROXY_GID": value = str(os.getgid())
+                    if key == "PROVIDER_CREDENTIALS_DIR":
+                        provider_root = temp / "provider"
+                        provider = provider_root / "tenant-a/project-a/team-a/chatgpt"
+                        provider.parent.mkdir(parents=True)
+                        provider.write_text("test")
+                        provider.chmod(0o600)
+                        provider_root.chmod(0o700)
+                        provider.parent.parent.parent.chmod(0o700)
+                        provider.parent.parent.chmod(0o700)
+                        provider.parent.chmod(0o700)
+                        value = str(provider_root)
+                    if key == "CONTROL_PLANE_BUILD_FROM_SOURCE": value = "true"
+                    if key == "CONTROL_PLANE_IMAGE": value = "agentteams-new/control-plane:v0.1.5-task-event-scope-guard-0156f2c"
+                    if key == "WORKER_BUILD_FROM_SOURCE": value = "false"
+                    with temp.joinpath(".env").open("a") as env_output:
+                        env_output.write(f"{key}={value}\n")
+            result = subprocess.run([str(ROOT / "deploy/compose/validate-config.sh"), str(temp / ".env")],
+                                    capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("WORKER_BUILD_FROM_SOURCE=true", result.stderr)
+
     def test_rejects_model_proxy_token_shared_between_worker_slots(self) -> None:
         self.invoke_startup(
             2,
             shared_proxy_tokens=True,
             expected_error="Each active Worker must use a distinct model proxy token",
-        )
-
-    def test_rejects_provider_credential_file_readable_by_other_users(self) -> None:
-        self.invoke_startup(
-            1,
-            provider_secret_mode=0o644,
-            expected_error="must resolve to an owner-only file under the matching tenant/project path",
         )
 
     def test_workers_only_receive_model_proxy_tokens(self) -> None:

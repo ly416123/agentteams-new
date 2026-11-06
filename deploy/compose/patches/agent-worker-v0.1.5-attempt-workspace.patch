@@ -1,0 +1,173 @@
+--- a/agent-worker/src/main/java/io/agentteams/worker/agentscope/ConfiguredAgentScopeHarnessFactory.java
++++ b/agent-worker/src/main/java/io/agentteams/worker/agentscope/ConfiguredAgentScopeHarnessFactory.java
+@@ -18,6 +18,9 @@
+ import java.io.IOException;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
++import java.nio.file.FileVisitResult;
++import java.nio.file.SimpleFileVisitor;
++import java.nio.file.attribute.BasicFileAttributes;
+ import java.time.Instant;
+ import java.util.Objects;
+ import java.util.Map;
+@@ -97,12 +100,17 @@
+ 
+     @Override
+     public void release(UUID taskId) {
+-        bindings.remove(Objects.requireNonNull(taskId, "taskId"));
++        AgentScopeWorkspaceFactory.WorkspaceBinding binding = bindings.remove(
++                Objects.requireNonNull(taskId, "taskId"));
++        if (binding == null || binding.profile() != SandboxProfile.NONE) return;
++        deleteLocalWorkspace(workspaceFor(binding));
+     }
+ 
+     @Override
+     public void releaseAll() {
+-        bindings.clear();
++        for (UUID taskId : List.copyOf(bindings.keySet())) {
++            release(taskId);
++        }
+     }
+ 
+     @Override
+@@ -144,13 +152,17 @@
+             throw new IllegalArgumentException("sandbox workspace must expose a verified local workspace");
+         }
+         bindings.put(task.id(), binding);
+-        Path workspace = binding.workspacePath().orElseGet(() -> workspaceRoot.resolve(task.id().toString()));
++        Path workspace = workspaceFor(binding);
+         workspace = workspace.toAbsolutePath().normalize();
+         if (!workspace.startsWith(workspaceRoot)) {
+             throw new IllegalArgumentException("resolved workspace is outside the configured root");
+         }
+         try {
+             Files.createDirectories(workspace);
++            workspace = workspace.toRealPath();
++            if (!workspace.startsWith(workspaceRoot)) {
++                throw new IllegalArgumentException("resolved workspace is outside the configured root");
++            }
+             String agentId = context.configuration().getOrDefault("worker_id",
+                     task.metadata().getOrDefault("agentId", "agent-worker"));
+             HarnessAgent.Builder builder = HarnessAgent.builder()
+@@ -159,7 +171,7 @@
+                     .defaultSessionId(required(task, "attemptId"))
+                     .model(model)
+                     .workspace(workspace)
+-                    .stateStore(new JsonFileAgentStateStore(workspaceRoot.resolve(".agentscope-state")))
++                    .stateStore(new JsonFileAgentStateStore(workspace.resolve(".agentscope-state")))
+                     .disableShellTool()
+                     .disableSubagents()
+                     .disableSessionPersistence()
+@@ -200,7 +212,37 @@
+         } catch (RuntimeException error) {
+             release(task.id());
+             throw error;
++        }
++    }
++
++    private Path workspaceFor(AgentScopeWorkspaceFactory.WorkspaceBinding binding) {
++        return binding.workspacePath().orElseGet(() -> workspaceRoot.resolve(binding.scopeId()));
++    }
++
++    private void deleteLocalWorkspace(Path workspace) {
++        Path normalized = workspace.toAbsolutePath().normalize();
++        if (!normalized.startsWith(workspaceRoot) || normalized.equals(workspaceRoot)) {
++            LOG.log(System.Logger.Level.ERROR, "Refusing to remove workspace outside its root");
++            return;
+         }
++        try {
++            Files.walkFileTree(normalized, new SimpleFileVisitor<>() {
++                @Override
++                public FileVisitResult visitFile(Path file, BasicFileAttributes attributes) throws IOException {
++                    Files.deleteIfExists(file);
++                    return FileVisitResult.CONTINUE;
++                }
++
++                @Override
++                public FileVisitResult postVisitDirectory(Path directory, IOException failure) throws IOException {
++                    if (failure != null) throw failure;
++                    Files.deleteIfExists(directory);
++                    return FileVisitResult.CONTINUE;
++                }
++            });
++        } catch (IOException | RuntimeException error) {
++            LOG.log(System.Logger.Level.WARNING, "Unable to remove terminal local workspace");
++        }
+     }
+ 
+     private static Set<String> requiredTaskTools(String inputJson) {
+--- a/agent-worker/src/test/java/io/agentteams/worker/agentscope/ConfiguredAgentScopeHarnessFactoryTest.java
++++ b/agent-worker/src/test/java/io/agentteams/worker/agentscope/ConfiguredAgentScopeHarnessFactoryTest.java
+@@ -74,7 +74,47 @@
+                 Clock.fixed(Instant.parse("2026-08-26T00:00:00Z"), ZoneOffset.UTC), ignored -> { }, Map.of()));
+ 
+         assertThat(harness).isNotNull();
++        harness.close();
++    }
++
++    @Test
++    void givesEachAttemptOfOneTaskAnIsolatedLocalWorkspace() throws Exception {
++        UUID taskId = UUID.randomUUID();
++        ConfiguredAgentScopeHarnessFactory factory = new ConfiguredAgentScopeHarnessFactory(
++                new TestModel(), AgentScopeWorkspaceFactory.testOnly(new ReadySandboxRuntime(),
++                        Clock.fixed(Instant.parse("2026-08-26T00:00:00Z"), ZoneOffset.UTC), root), root);
++        RuntimeTask firstTask = task(taskId, "attempt-a", "lease-a");
++        var firstHarness = factory.create(firstTask, context());
++        Path firstWorkspace = localWorkspace();
++        Files.writeString(firstWorkspace.resolve("tenant-data.txt"), "attempt A private data");
++        firstHarness.close();
++        factory.release(taskId);
++
++        RuntimeTask retryTask = task(taskId, "attempt-b", "lease-b");
++        var retryHarness = factory.create(retryTask, context());
++        Path retryWorkspace = localWorkspace();
++
++        assertThat(retryWorkspace).isNotEqualTo(firstWorkspace);
++        assertThat(retryWorkspace.resolve("tenant-data.txt")).doesNotExist();
++
++        retryHarness.close();
++        factory.release(taskId);
++    }
++
++    @Test
++    void removesAttemptLocalWorkspaceWhenRuntimeReleasesIt() throws Exception {
++        UUID taskId = UUID.randomUUID();
++        ConfiguredAgentScopeHarnessFactory factory = new ConfiguredAgentScopeHarnessFactory(
++                new TestModel(), AgentScopeWorkspaceFactory.testOnly(new ReadySandboxRuntime(),
++                        Clock.fixed(Instant.parse("2026-08-26T00:00:00Z"), ZoneOffset.UTC), root), root);
++        var harness = factory.create(task(taskId, "attempt-cleanup", "lease-cleanup"), context());
++        Path workspace = localWorkspace();
++        Files.writeString(workspace.resolve("private-data.txt"), "remove on terminal release");
++
+         harness.close();
++        factory.release(taskId);
++
++        assertThat(workspace).doesNotExist();
+     }
+ 
+     @Test
+@@ -355,11 +395,23 @@
+     }
+ 
+     private RuntimeTask task(String attemptId, String leaseId) {
+-        return new RuntimeTask(UUID.randomUUID(), "chat", "hello", Map.of(
++        return task(UUID.randomUUID(), attemptId, leaseId);
++    }
++
++    private RuntimeTask task(UUID taskId, String attemptId, String leaseId) {
++        return new RuntimeTask(taskId, "chat", "hello", Map.of(
+                 "tenantId", "tenant-a", "projectId", "project-a", "teamId", "team-a",
+                 "agentId", "agent-a", "attemptId", attemptId, "leaseId", leaseId));
+     }
+ 
++    private Path localWorkspace() throws Exception {
++        try (var paths = Files.list(root)) {
++            return paths.filter(Files::isDirectory)
++                    .filter(path -> !path.getFileName().toString().equals(".agentscope-state"))
++                    .findFirst().orElseThrow();
++        }
++    }
++
+     private RuntimeTask sandboxTask(String attemptId) {
+         return new RuntimeTask(UUID.randomUUID(), "chat", "hello", Map.ofEntries(
+                 Map.entry("tenantId", "tenant-a"), Map.entry("projectId", "project-a"),

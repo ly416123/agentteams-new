@@ -10,7 +10,8 @@ compose() {
   docker compose -p "$compose_project" --env-file "$env_file" -f "$script_dir/compose.yaml" "$@"
 }
 deployment_mode=$(awk -F= '$1 == "DEPLOYMENT_MODE" { value=$2 } END { gsub(/[[:space:]]/, "", value); print value }' "$env_file")
-if [ "$deployment_mode" = "self-hosted-small" ]; then
+replicas=$(awk -F= '$1 == "WORKER_REPLICAS" { value=$2 } END { gsub(/[[:space:]]/, "", value); print value }' "$env_file")
+if [ "$deployment_mode" = "self-hosted-small" ] || [ "$replicas" -gt 0 ]; then
   control_plane_image=$(python3 - "$env_file" <<'PY'
 from pathlib import Path
 import sys
@@ -26,7 +27,11 @@ PY
   echo "Building the pinned TASK_EVENT-hardened Control Plane from agentteams-new's source patch"
   python3 "$script_dir/build-control-plane-hardening.py" "$control_plane_image"
 fi
-replicas=$(awk -F= '$1 == "WORKER_REPLICAS" { value=$2 } END { gsub(/[[:space:]]/, "", value); print value }' "$env_file")
+if [ "$replicas" -gt 0 ]; then
+  worker_image=agentteams-new/agent-worker:v0.1.5-attempt-workspace-guard-0156f2c
+  echo "Building the pinned Attempt-isolated Worker from agentteams-new's source patch"
+  python3 "$script_dir/build-worker-hardening.py" "$worker_image"
+fi
 storage_enabled=$(awk -F= '$1 == "AGENTTEAMS_STORAGE_ENABLED" { value=$2 } END { gsub(/[[:space:]]/, "", value); print value }' "$env_file")
 
 case "$replicas" in

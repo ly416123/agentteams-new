@@ -143,6 +143,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Build and test the Attempt-isolated Worker
+        run: python3 deploy/compose/build-worker-hardening.py
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Build Credential Proxy container
         run: docker build --secret id=maven_settings,src="$HOME/.m2/settings.xml" --tag agentteams-credential-proxy:ci --file credential-proxy/Dockerfile .
 
