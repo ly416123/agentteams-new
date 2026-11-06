@@ -61,7 +61,7 @@ class LeaseGuardedInputStreamTest {
                 .hasCauseInstanceOf(IOException.class);
         assertThat(checks.get()).isGreaterThanOrEqualTo(2);
         assertThat(guarded.isInvalidated()).isTrue();
-        assertThat(permits.availablePermits()).isEqualTo(1);
+        awaitPermitRelease(permits);
         guarded.close();
         assertThat(permits.availablePermits()).isEqualTo(1);
     }
@@ -98,7 +98,7 @@ class LeaseGuardedInputStreamTest {
         assertThatThrownBy(pendingRead::get).hasCauseInstanceOf(IOException.class);
         assertThat(checks).hasValue(1);
         assertThat(guarded.isInvalidated()).isTrue();
-        assertThat(permits.availablePermits()).isEqualTo(1);
+        awaitPermitRelease(permits);
     }
 
     @Test
@@ -122,7 +122,7 @@ class LeaseGuardedInputStreamTest {
         assertThatThrownBy(pendingRead::get).hasCauseInstanceOf(IOException.class);
         assertThat(checks).hasValue(2);
         assertThat(guarded.isInvalidated()).isTrue();
-        assertThat(permits.availablePermits()).isEqualTo(1);
+        awaitPermitRelease(permits);
     }
 
     @Test
@@ -154,6 +154,13 @@ class LeaseGuardedInputStreamTest {
         Semaphore permits = new Semaphore(1);
         assertThat(permits.tryAcquire()).isTrue();
         return permits;
+    }
+
+    private static void awaitPermitRelease(Semaphore permits) throws InterruptedException {
+        assertThat(permits.tryAcquire(2, TimeUnit.SECONDS)).isTrue();
+        assertThat(permits.availablePermits()).isZero();
+        permits.release();
+        assertThat(permits.availablePermits()).isEqualTo(1);
     }
 
     private static ModelProxyAuthenticator activeAuthenticator() {
