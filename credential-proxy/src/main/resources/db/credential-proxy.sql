@@ -23,6 +23,7 @@ ALTER ROLE credential_proxy_query
 -- one Attempt and Lease. The tenant scope is always joined from the Task.
 CREATE TABLE IF NOT EXISTS public.attempt_model_proxy_credentials (
     id UUID PRIMARY KEY,
+    session_id UUID NOT NULL,
     agent_id UUID NOT NULL,
     task_id UUID NOT NULL,
     attempt_id UUID NOT NULL,
@@ -33,6 +34,11 @@ CREATE TABLE IF NOT EXISTS public.attempt_model_proxy_credentials (
     revoked_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT statement_timestamp()
 );
+-- Legacy POC capabilities cannot be tied to the session that requested them;
+-- revoke them as part of upgrade before enforcing session binding.
+ALTER TABLE public.attempt_model_proxy_credentials ADD COLUMN IF NOT EXISTS session_id UUID;
+DELETE FROM public.attempt_model_proxy_credentials WHERE session_id IS NULL;
+ALTER TABLE public.attempt_model_proxy_credentials ALTER COLUMN session_id SET NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS attempt_model_proxy_credentials_one_live_token
     ON public.attempt_model_proxy_credentials (attempt_id, lease_id)
     WHERE revoked_at IS NULL;
@@ -68,7 +74,7 @@ GRANT SELECT (id, agent_id, token_sha256, expires_at, revoked_at)
     ON TABLE public.agent_sessions TO credential_proxy_query_owner;
 GRANT SELECT (agent_id, tenant_id, project_id, team_id)
     ON TABLE public.worker_enrollment_agent_scopes TO credential_proxy_query_owner;
-GRANT SELECT (id, agent_id, task_id, attempt_id, lease_id, token_sha256,
+GRANT SELECT (id, session_id, agent_id, task_id, attempt_id, lease_id, token_sha256,
               model_credential_ref, expires_at, revoked_at)
     ON TABLE public.attempt_model_proxy_credentials TO credential_proxy_query_owner;
 GRANT SELECT (tenant_id, project_id, team_id, model_credential_ref, enabled)
@@ -222,6 +228,8 @@ AS $$
            TRUE,
            TRUE
       FROM public.attempt_model_proxy_credentials AS credential
+      JOIN public.agent_sessions AS session
+        ON session.id = credential.session_id AND session.agent_id = credential.agent_id
       JOIN public.task_assignments AS assignment
         ON assignment.task_id = credential.task_id
        AND assignment.attempt_id = credential.attempt_id
@@ -240,6 +248,8 @@ AS $$
      WHERE credential.id = p_proxy_credential_id
        AND credential.revoked_at IS NULL
        AND credential.expires_at > statement_timestamp()
+       AND session.revoked_at IS NULL
+       AND session.expires_at > statement_timestamp()
        AND assignment.phase IN ('ASSIGNED', 'ACCEPTED', 'RUNNING')
        AND assignment.released_at IS NULL
        AND attempt.phase IN ('ASSIGNED', 'ACCEPTED', 'RUNNING')
@@ -379,6 +389,8 @@ AS $$
            task_scope.project_id, task_scope.team, credential.model_credential_ref,
            assignment.attempt_id, lease.id
       FROM public.attempt_model_proxy_credentials AS credential
+      JOIN public.agent_sessions AS session
+        ON session.id = credential.session_id AND session.agent_id = credential.agent_id
       JOIN public.task_assignments AS assignment
         ON assignment.task_id = credential.task_id
        AND assignment.attempt_id = credential.attempt_id
@@ -397,6 +409,8 @@ AS $$
      WHERE credential.token_sha256 = p_token_sha256::CHAR(64)
        AND credential.revoked_at IS NULL
        AND credential.expires_at > statement_timestamp()
+       AND session.revoked_at IS NULL
+       AND session.expires_at > statement_timestamp()
        AND assignment.phase IN ('ASSIGNED', 'ACCEPTED', 'RUNNING')
        AND assignment.released_at IS NULL
        AND attempt.phase IN ('ASSIGNED', 'ACCEPTED', 'RUNNING')
@@ -413,8 +427,9 @@ GRANT EXECUTE ON FUNCTION public.credential_proxy_authenticate_v2(TEXT)
     TO credential_proxy_query;
 
 -- A Gateway-authenticated Worker asks for its active Attempt credential only
--- after receiving TaskAssigned. The bearer session is never stored here: only
--- its hash is checked, and only the new Attempt token hash is persisted.
+-- after receiving TaskAssigned. The bearer session is never stored here: its
+-- hash is checked, its session id is linked to the capability, and only the
+-- new Attempt token hash is persisted.
 CREATE OR REPLACE FUNCTION public.credential_proxy_issue_attempt(
     p_worker_session_sha256 TEXT,
     p_task_id UUID,
@@ -439,6 +454,7 @@ SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
+    v_session_id UUID;
     v_agent_id UUID;
     v_tenant_id TEXT;
     v_project_id TEXT;
@@ -460,7 +476,7 @@ BEGIN
     -- or write access on assignment and lease tables to this function owner.
     PERFORM pg_advisory_xact_lock(hashtextextended(p_attempt_id::TEXT || ':' || p_lease_id::TEXT, 0));
 
-    SELECT session.agent_id INTO v_agent_id
+    SELECT session.agent_id, session.id INTO v_agent_id, v_session_id
       FROM public.agent_sessions AS session
      WHERE session.token_sha256 = p_worker_session_sha256::CHAR(64)
        AND session.revoked_at IS NULL
@@ -509,10 +525,10 @@ BEGIN
        AND credential.revoked_at IS NULL;
 
     INSERT INTO public.attempt_model_proxy_credentials (
-        id, agent_id, task_id, attempt_id, lease_id, token_sha256,
+        id, session_id, agent_id, task_id, attempt_id, lease_id, token_sha256,
         model_credential_ref, expires_at
     ) VALUES (
-        p_credential_id, v_agent_id, p_task_id, p_attempt_id, p_lease_id,
+        p_credential_id, v_session_id, v_agent_id, p_task_id, p_attempt_id, p_lease_id,
         p_token_sha256::CHAR(64), v_model_credential_ref, v_expires_at
     );
 
@@ -565,6 +581,8 @@ AS $$
            task_scope.project_id, task_scope.team, credential.model_credential_ref,
            assignment.attempt_id, lease.id
       FROM public.attempt_model_proxy_credentials AS credential
+      JOIN public.agent_sessions AS session
+        ON session.id = credential.session_id AND session.agent_id = credential.agent_id
       JOIN public.task_assignments AS assignment
         ON assignment.task_id = credential.task_id
        AND assignment.attempt_id = credential.attempt_id
@@ -583,6 +601,8 @@ AS $$
      WHERE credential.id = p_proxy_credential_id
        AND credential.revoked_at IS NULL
        AND credential.expires_at > statement_timestamp()
+       AND session.revoked_at IS NULL
+       AND session.expires_at > statement_timestamp()
        AND assignment.phase IN ('ASSIGNED', 'ACCEPTED', 'RUNNING')
        AND assignment.released_at IS NULL
        AND attempt.phase IN ('ASSIGNED', 'ACCEPTED', 'RUNNING')

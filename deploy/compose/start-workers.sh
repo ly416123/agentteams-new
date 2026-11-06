@@ -28,7 +28,7 @@ PY
   python3 "$script_dir/build-control-plane-hardening.py" "$control_plane_image"
 fi
 if [ "$replicas" -gt 0 ]; then
-  worker_image=agentteams-new/agent-worker:v0.1.5-attempt-workspace-guard-0156f2c
+  worker_image=agentteams-new/agent-worker:v0.1.5-attempt-capability-0156f2c
   echo "Building the pinned Attempt-isolated Worker from agentteams-new's source patch"
   python3 "$script_dir/build-worker-hardening.py" "$worker_image"
 fi
@@ -63,4 +63,4 @@ while [ "$slot" -le "$replicas" ]; do
   set -- "$@" "worker-$slot"
   slot=$((slot + 1))
 done
-compose --profile secure-api --profile worker-pool up -d "$@" worker-enrollment credential-proxy
+WORKER_IMAGE="$worker_image" compose --profile secure-api --profile worker-pool up -d "$@" worker-enrollment credential-proxy

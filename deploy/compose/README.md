@@ -10,7 +10,7 @@
 - Docker daemon 可访问 Docker Hub 与 GHCR。终端里的 `HTTP_PROXY` 不一定会传给 daemon；需要代理时，也要在 Docker Desktop/Engine 侧配置 registry 出站代理。
 - 当前固定的 `agentteams-java v0.1.5` 应用镜像仅提供 `linux/amd64`；ARM64 开发机需启用 amd64 仿真，生产主机按 amd64 部署。
 - 已发布的 Control Plane、Gateway、Worker GHCR 镜像 digest。`.env.example` 当前固定到 `agentteams-java v0.1.5`（source commit `0156f2c1fecdc868cb4a0f4f13fb068bb4162834`）。不要使用 `latest` 或可变 tag。
-- 可信 HTTPS OIDC Provider、每个活动 Worker 的代理 Token 文件，以及按 Tenant/Project 组织的上游 Provider 凭据文件。Worker 仅接收独立的 `atp_` 代理 Token；上游凭据目录只读挂入 Credential Proxy。
+- 可信 HTTPS OIDC Provider、每个活动 Worker 的 Gateway session 凭据，以及按 Tenant/Project/Team 组织的上游 Provider 凭据文件。Worker 不挂载模型代理 Token 文件；每次模型请求前以 Gateway session 和当前 Task/Attempt/Lease 向 Credential Proxy 换取短时 `atp_` capability。上游凭据目录只读挂入 Credential Proxy。
 
 ```sh
 cd deploy/compose
@@ -19,9 +19,9 @@ cp .env.example .env
 
 编辑 `.env`：填入随机且互不相同的 `POSTGRES_PASSWORD`、`CONTROL_PLANE_DB_PASSWORD`、`WORKER_ENROLLMENT_DB_PASSWORD` 和 `CREDENTIAL_PROXY_DB_PASSWORD`（各至少 24 字符）。PostgreSQL 初始化用户 `agentteams` 只供 Flyway 迁移和数据库角色初始化使用；Control Plane SQL 使用非超级用户 `agentteams_runtime`。将 `CREDENTIAL_PROXY_UID`、`CREDENTIAL_PROXY_GID` 设为运行部署用户的数字 UID/GID；Compose 中 Worker 和 Credential Proxy 都以此身份运行，以便它们只读各自挂载的 `0600` 文件。镜像已固定到发布 digest，升级时从签名 release manifest 获取新 digest 后一起更新。`POST /api/v1/agents` 只创建 Worker 记录，不会签发会话 Token。
 
-`.env.example` 的 `DEPLOYMENT_MODE=local-dev` 与 `API_AUTH_ENABLED=false` 只适用于零 Worker 的本机开发，Control Plane API 不执行 OIDC 认证。用于多租户、自托管或启用任何 Worker 槽位时，必须启用 `API_AUTH_ENABLED=true`，并提供可信 HTTPS issuer/JWKS 与 audience。self-hosted-small 或任意 Worker 部署都必须设置 `CONTROL_PLANE_BUILD_FROM_SOURCE=true` 与派生 Control Plane 镜像。Worker 部署还需设置 `WORKER_BUILD_FROM_SOURCE=true` 与 `agentteams-new/agent-worker:v0.1.5-attempt-workspace-guard-0156f2c`。启动脚本从固定的 `agentteams-java` v0.1.5 源码 commit 下载代码，在临时目录应用本仓库维护的 Control Plane 与 Worker 补丁并运行强制测试，再构建本机派生镜像；Worker 补丁令 workspace 和 AgentScope state 按完整 Attempt scope 隔离，并在终态释放本地 workspace。修复和镜像构建只由 `agentteams-new` 承载，不修改 `agentteams-java` 工作树。未经加固的 v0.1.5 镜像会被配置校验拒绝。启动需要可读取公开源码的 GitHub CLI（`gh`）和 Docker。部署前运行 `./validate-config.sh .env` 或 `./start-workers.sh .env`；不要绕过校验脚本直接启动共享 API 服务。当前 Compose 只实现 `local-dev` 与 `self-hosted-small`；`enterprise-k8s` 尚未实现。
+`.env.example` 的 `DEPLOYMENT_MODE=local-dev` 与 `API_AUTH_ENABLED=false` 只适用于零 Worker 的本机开发，Control Plane API 不执行 OIDC 认证。用于多租户、自托管或启用任何 Worker 槽位时，必须启用 `API_AUTH_ENABLED=true`，并提供可信 HTTPS issuer/JWKS 与 audience。self-hosted-small 或任意 Worker 部署都必须设置 `CONTROL_PLANE_BUILD_FROM_SOURCE=true` 与派生 Control Plane 镜像。Worker 部署还需设置 `WORKER_BUILD_FROM_SOURCE=true`；启动脚本构建 `agentteams-new/agent-worker:v0.1.5-attempt-capability-0156f2c`。它从固定的 `agentteams-java` v0.1.5 源码 commit 下载代码，在临时目录应用本仓库维护的 Control Plane 与 Worker 补丁并运行强制测试，再构建本机派生镜像；Worker 补丁隔离 Attempt workspace/state，并在每次模型请求时按精确 Task/Attempt/Lease scope 申请短期凭据。修复和镜像构建只由 `agentteams-new` 承载，不修改 `agentteams-java` 工作树。未经加固的 v0.1.5 镜像会被配置校验拒绝。启动需要可读取公开源码的 GitHub CLI（`gh`）和 Docker。部署前运行 `./validate-config.sh .env` 或 `./start-workers.sh .env`；不要绕过校验脚本直接启动共享 API 服务。当前 Compose 只实现 `local-dev` 与 `self-hosted-small`；`enterprise-k8s` 尚未实现。
 
-创建 `PROVIDER_CREDENTIALS_DIR` 指定的目录，并按 `file:<tenant>/<project>/<team>/<credential-name>` 的引用组织凭据。例如 `.env` 中 `WORKER_1_MODEL_CREDENTIAL_REF=file:tenant-a/project-a/team-a/chatgpt` 对应文件 `secrets/provider/tenant-a/project-a/team-a/chatgpt`。引用中的 Tenant、Project、Team 必须与数据库活动 Attempt 的 scope 完全一致。目录和所有子目录权限设为 `0700`，凭据文件设为 `0600`，所有者 UID 与 `CREDENTIAL_PROXY_UID` 一致。Credential Proxy 只读挂载此目录；Worker 网络为 internal 网络，只能访问 Gateway 和 Proxy，Provider 出站只由 Proxy 所在网络提供。每个活动 Worker 还需要各自的 `WORKER_n_MODEL_PROXY_TOKEN_FILE`，由 Enrollment 命令生成；这些 `atp_` 文件也须为 `0600` 且由同一 UID 拥有。只需为活动槽位准备模型代理 Token 和其引用的 Provider 凭据文件。
+创建 `PROVIDER_CREDENTIALS_DIR` 指定的目录，并按 `file:<tenant>/<project>/<team>/<credential-name>` 的引用组织凭据。例如 `AGENTTEAMS_TENANT_CREDENTIAL_REFS_JSON` 中的 Tenant/Project/Team 与 provider ref 映射到 `secrets/provider/tenant-a/project-a/team-a/chatgpt`。配置会在 Enrollment 数据库初始化步骤中同步到 `tenant_model_proxy_credential_refs`；删除的映射会禁用，Worker 不能通过请求体选择 Tenant 或 Provider ref。目录和所有子目录权限设为 `0700`，凭据文件设为 `0600`，所有者 UID 与 `CREDENTIAL_PROXY_UID` 一致。Credential Proxy 只读挂载此目录；Worker 网络为 internal 网络，只能访问 Gateway 和 Proxy，Provider 出站只由 Proxy 所在网络提供。Worker 只保存其 Gateway session 凭据；Attempt 模型 token 在内存中按请求换取，不落盘。
 
 要启用 Artifact 对象存储，将 `AGENTTEAMS_STORAGE_ENABLED=true`，并设置 `OBJECT_STORE_ACCESS_KEY` 与至少 24 字符的 `OBJECT_STORE_SECRET_KEY`。启动脚本会先启动 `storage` profile 中的 SeaweedFS S3，并等待 S3 服务就绪后再启动 Control Plane；`agentteams` bucket 在 SeaweedFS 启动时创建，参数采用 [SeaweedFS `weed mini` S3 配置](https://github-wiki-see.page/m/seaweedfs/seaweedfs/wiki/Quick-Start-with-weed-mini)。S3 和管理端口都不发布到宿主机。当前 POC 使用单节点 SeaweedFS，并把全局 S3 凭证提供给 Control Plane；生产环境应改用具备 bucket 范围授权、备份和恢复能力的对象存储身份/服务。
 
@@ -95,7 +95,7 @@ Enrollment 也会为模型代理创建独立短期凭据。附加 `ttl-seconds`�
   ./secrets/worker-1.runtime.env 604800 file:tenant-a/project-a/team-a/chatgpt ./secrets/worker-1.model-proxy-token
 ```
 
-Gateway Token 和模型代理 Token 互不通用；数据库只存两者的 SHA-256，模型代理凭据绑定 Gateway session、Agent scope 和模型凭据引用，撤销 session 会一并撤销模型代理凭据。输出文件均设置为 `0600`。Worker 将 Responses API 请求发往内部 Credential Proxy；Proxy 逐请求校验唯一活动 Assignment/Attempt/Lease，并要求凭据引用中的 Tenant/Project 与数据库执行上下文一致，再读取 Provider Secret、替换 Authorization 并流式转发。客户端不能通过请求体或 header 选择租户/Attempt；非成功上游错误正文不会回传给 Worker。
+Gateway session 和 Attempt 模型 token 互不通用；数据库只存 Gateway session 与模型 token 的 SHA-256。Worker 每次发起模型调用时，用当前活动 Assignment/Attempt/Lease 向内部签发接口请求一个最多 120 秒且不晚于 Lease 的 token；凭据记录绑定原 Gateway session，撤销 session 后新签发和现有 token 的认证/流式重验证均失败。Worker 不把 `atp_` token 写入文件。Responses API 请求发往内部 Credential Proxy；Proxy 逐请求校验唯一活动 Assignment/Attempt/Lease，并从持久 TASK scope 解析 Tenant/Project/Team，再读取受信 Provider ref 对应的 Secret、替换 Authorization 并流式转发。客户端不能通过请求体或 header 选择租户/Attempt；非成功上游错误正文不会回传给 Worker。
 
 ```sh
 ./start-workers.sh
@@ -112,7 +112,7 @@ Gateway Token 和模型代理 Token 互不通用；数据库只存两者的 SHA-
 ./revoke-worker-session.sh http://127.0.0.1:8090 <agent-uuid> <old-session-uuid> /secure/path/oidc-access-token
 ```
 
-撤销会阻止后续 Gateway 握手，并同步撤销关联的模型代理 Token；v0.1.5 不会主动断开已建立的 Gateway 连接。每个活动槽位必须使用不同的代理 Token 文件；多个同 Tenant/Project 的 Worker 可引用同一个受 scope 保护的 Provider 凭据。
+撤销会阻止后续 Gateway 握手及模型请求，并使已签发的 Attempt token 在下一次认证或流式 Lease 检查时失效；v0.1.5 不会主动断开已建立的 Gateway 连接。多个固定 Worker 槽位可作为租户中立执行容量，Tenant 凭据由活动 Task scope 选择，不再绑定 Worker 槽位。任务派发目前仍需完成 Tenant-neutral Enrollment 与公平队列接线后，才能实现多租户共享运行。
 
 ### 安全重启固定槽位
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -12,8 +13,12 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 SOURCE_COMMIT = "0156f2c1fecdc868cb4a0f4f13fb068bb4162834"
-IMAGE_TAG = "agentteams-new/agent-worker:v0.1.5-attempt-workspace-guard-0156f2c"
-TEST_CLASS = "io.agentteams.worker.agentscope.ConfiguredAgentScopeHarnessFactoryTest"
+IMAGE_TAG = "agentteams-new/agent-worker:v0.1.5-attempt-capability-0156f2c"
+REQUIRED_TESTS = {
+    "io.agentteams.worker.agentscope.ConfiguredAgentScopeHarnessFactoryTest": 19,
+    "io.agentteams.worker.chatgpt.AttemptCredentialTokenSourceTest": 2,
+    "io.agentteams.worker.WorkerRuntimeFactoryTest": 10,
+}
 
 
 def run(command: list[str], *, cwd: Path | None = None) -> None:
@@ -40,11 +45,13 @@ def extract_source(archive: Path, destination: Path) -> None:
 
 
 def require_tests(source: Path) -> None:
-    report = source / "agent-worker/target/surefire-reports" / f"TEST-{TEST_CLASS}.xml"
-    suite = ET.parse(report).getroot()
-    if (suite.attrib["tests"] != "18" or suite.attrib["skipped"] != "0"
-            or suite.attrib["failures"] != "0" or suite.attrib["errors"] != "0"):
-        raise RuntimeError(f"required Attempt workspace tests failed: {suite.attrib}")
+    report_dir = source / "agent-worker/target/surefire-reports"
+    for test_class, expected_tests in REQUIRED_TESTS.items():
+        report = report_dir / f"TEST-{test_class}.xml"
+        suite = ET.parse(report).getroot()
+        if (suite.attrib["tests"] != str(expected_tests) or suite.attrib["skipped"] != "0"
+                or suite.attrib["failures"] != "0" or suite.attrib["errors"] != "0"):
+            raise RuntimeError(f"required Worker Attempt credential tests failed for {test_class}: {suite.attrib}")
 
 
 def main() -> int:
@@ -57,7 +64,7 @@ def main() -> int:
     current = subprocess.run(
         ["docker", "image", "inspect", "--format",
          '{{index .Config.Labels "org.opencontainers.image.revision"}}|'
-         '{{index .Config.Labels "io.agentteams.attempt-workspace-patch.sha256"}}', image_tag],
+         '{{index .Config.Labels "io.agentteams.attempt-capability-patch.sha256"}}', image_tag],
         capture_output=True, text=True, check=False,
     )
     if current.returncode == 0 and current.stdout.strip() == f"{SOURCE_COMMIT}|{patch_digest}":
@@ -73,14 +80,36 @@ def main() -> int:
                            stdout=output, check=True, timeout=120)
         extract_source(archive, source)
         run(["patch", "--batch", "--forward", "-p1", "-i", str(patch_file)], cwd=source)
+        selected_tests = ",".join(test_class.rsplit(".", 1)[-1] for test_class in REQUIRED_TESTS)
         run(["mvn", "--batch-mode", "--no-transfer-progress", "-pl", "agent-worker", "-am",
-             "-Dtest=ConfiguredAgentScopeHarnessFactoryTest", "-Dsurefire.failIfNoSpecifiedTests=false", "test"], cwd=source)
+             f"-Dtest={selected_tests}", "-Dsurefire.failIfNoSpecifiedTests=false", "test"], cwd=source)
         require_tests(source)
+        # Resolve Maven dependencies on the host, where the normal Maven
+        # settings/proxy are available. The runtime image only needs the
+        # platform-independent Boot JAR; do not make Docker's build network
+        # responsible for downloading packages a second time.
+        run(["mvn", "--batch-mode", "--no-transfer-progress", "-pl", "agent-worker", "-am",
+             "-DskipTests", "install"], cwd=source)
+        run(["mvn", "--batch-mode", "--no-transfer-progress", "-pl", "agent-worker",
+             "-DskipTests", "package", "spring-boot:repackage"], cwd=source)
+        boot_jar = source / "agent-worker/target/agentteams-agent-worker-0.1.0-SNAPSHOT-boot.jar"
+        if not boot_jar.is_file():
+            raise RuntimeError("Attempt-hardened Worker Boot JAR was not produced")
+        image_context = work / "runtime-image"
+        image_context.mkdir()
+        shutil.copy2(boot_jar, image_context / "app.jar")
+        (image_context / "Dockerfile").write_text("""FROM eclipse-temurin:21-jre
+WORKDIR /app
+COPY --chown=10001:0 app.jar /app/app.jar
+USER 10001
+EXPOSE 9090
+ENTRYPOINT [\"java\", \"-XX:MaxRAMPercentage=75\", \"-jar\", \"/app/app.jar\"]
+""", encoding="utf-8")
         run(["docker", "build", "--platform", "linux/amd64", "--label",
              "org.opencontainers.image.source=https://github.com/ly416123/agentteams-new",
              "--label", f"org.opencontainers.image.revision={SOURCE_COMMIT}",
-             "--label", f"io.agentteams.attempt-workspace-patch.sha256={patch_digest}",
-             "--tag", image_tag, "--file", "deploy/docker/worker.Dockerfile", "."], cwd=source)
+             "--label", f"io.agentteams.attempt-capability-patch.sha256={patch_digest}",
+             "--tag", image_tag, "--file", "Dockerfile", "."], cwd=image_context)
     return 0
 
 

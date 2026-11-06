@@ -140,6 +140,7 @@ services:
       PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       WORKER_ENROLLMENT_DB_PASSWORD: ${WORKER_ENROLLMENT_DB_PASSWORD:?set WORKER_ENROLLMENT_DB_PASSWORD in .env}
       CREDENTIAL_PROXY_DB_PASSWORD: ${CREDENTIAL_PROXY_DB_PASSWORD:?set CREDENTIAL_PROXY_DB_PASSWORD in .env}
+      AGENTTEAMS_TENANT_CREDENTIAL_REFS_JSON: ${AGENTTEAMS_TENANT_CREDENTIAL_REFS_JSON:-[]}
     entrypoint: ["/bin/sh", "-ec"]
     command:
       - |
@@ -171,6 +172,27 @@ services:
         psql -v ON_ERROR_STOP=1 -f /opt/worker-enrollment-rls.sql
         psql -v ON_ERROR_STOP=1 -f /opt/credential-proxy.sql
         psql -v ON_ERROR_STOP=1 <<'SQL'
+        \getenv provider_bindings_json AGENTTEAMS_TENANT_CREDENTIAL_REFS_JSON
+        WITH configured AS (
+          SELECT tenant_id, project_id, team_id
+          FROM jsonb_to_recordset(:'provider_bindings_json'::jsonb)
+            AS binding(tenant_id TEXT, project_id TEXT, team_id TEXT, model_credential_ref TEXT)
+        )
+        UPDATE public.tenant_model_proxy_credential_refs AS existing
+           SET enabled = false
+         WHERE NOT EXISTS (
+           SELECT 1 FROM configured
+            WHERE configured.tenant_id = existing.tenant_id
+              AND configured.project_id = existing.project_id
+              AND configured.team_id = existing.team_id
+         );
+        INSERT INTO public.tenant_model_proxy_credential_refs
+            (tenant_id, project_id, team_id, model_credential_ref, enabled)
+        SELECT tenant_id, project_id, team_id, model_credential_ref, true
+          FROM jsonb_to_recordset(:'provider_bindings_json'::jsonb)
+            AS binding(tenant_id TEXT, project_id TEXT, team_id TEXT, model_credential_ref TEXT)
+        ON CONFLICT (tenant_id, project_id, team_id) DO UPDATE
+          SET model_credential_ref = EXCLUDED.model_credential_ref, enabled = true;
         GRANT credential_proxy_query TO credential_proxy_runtime;
         SQL
     volumes:
@@ -289,9 +311,8 @@ services:
       AGENTTEAMS_MODEL_PROVIDER: chatgpt-plan
       AGENTTEAMS_MODEL: chatgpt-plan:gpt-5.6-luna
       AGENTTEAMS_MAX_CONCURRENT_TASKS: "1"
-      AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE: /run/secrets/model_proxy_token_worker_1
+      AGENTTEAMS_ATTEMPT_CREDENTIAL_ISSUE_URL: http://credential-proxy:8085/internal/v1/attempt-credentials
       AGENTTEAMS_CHATGPT_RESPONSES_URL: http://credential-proxy:8085/v1/responses
-    secrets: [model_proxy_token_worker_1]
     depends_on:
       gateway:
         condition: service_started
@@ -313,8 +334,6 @@ services:
     environment:
       <<: *worker-env
       AGENTTEAMS_AGENT_ID: ${WORKER_2_AGENT_ID:?set a registered Worker UUID}
-      AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE: /run/secrets/model_proxy_token_worker_2
-    secrets: [model_proxy_token_worker_2]
     depends_on:
       gateway:
         condition: service_started
@@ -336,8 +355,6 @@ services:
     environment:
       <<: *worker-env
       AGENTTEAMS_AGENT_ID: ${WORKER_3_AGENT_ID:?set a registered Worker UUID}
-      AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE: /run/secrets/model_proxy_token_worker_3
-    secrets: [model_proxy_token_worker_3]
     depends_on:
       gateway:
         condition: service_started
@@ -359,8 +376,6 @@ services:
     environment:
       <<: *worker-env
       AGENTTEAMS_AGENT_ID: ${WORKER_4_AGENT_ID:?set a registered Worker UUID}
-      AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE: /run/secrets/model_proxy_token_worker_4
-    secrets: [model_proxy_token_worker_4]
     depends_on:
       gateway:
         condition: service_started
@@ -382,8 +397,6 @@ services:
     environment:
       <<: *worker-env
       AGENTTEAMS_AGENT_ID: ${WORKER_5_AGENT_ID:?set a registered Worker UUID}
-      AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE: /run/secrets/model_proxy_token_worker_5
-    secrets: [model_proxy_token_worker_5]
     depends_on:
       gateway:
         condition: service_started
@@ -405,8 +418,6 @@ services:
     environment:
       <<: *worker-env
       AGENTTEAMS_AGENT_ID: ${WORKER_6_AGENT_ID:?set a registered Worker UUID}
-      AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE: /run/secrets/model_proxy_token_worker_6
-    secrets: [model_proxy_token_worker_6]
     depends_on:
       gateway:
         condition: service_started
@@ -428,8 +439,6 @@ services:
     environment:
       <<: *worker-env
       AGENTTEAMS_AGENT_ID: ${WORKER_7_AGENT_ID:?set a registered Worker UUID}
-      AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE: /run/secrets/model_proxy_token_worker_7
-    secrets: [model_proxy_token_worker_7]
     depends_on:
       gateway:
         condition: service_started
@@ -451,8 +460,6 @@ services:
     environment:
       <<: *worker-env
       AGENTTEAMS_AGENT_ID: ${WORKER_8_AGENT_ID:?set a registered Worker UUID}
-      AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE: /run/secrets/model_proxy_token_worker_8
-    secrets: [model_proxy_token_worker_8]
     depends_on:
       gateway:
         condition: service_started
@@ -485,22 +492,6 @@ services:
 secrets:
   maven_settings:
     file: ${MAVEN_SETTINGS_FILE:-/dev/null}
-  model_proxy_token_worker_1:
-    file: ${WORKER_1_MODEL_PROXY_TOKEN_FILE:?set WORKER_1_MODEL_PROXY_TOKEN_FILE to the enrolled proxy token file}
-  model_proxy_token_worker_2:
-    file: ${WORKER_2_MODEL_PROXY_TOKEN_FILE:?set WORKER_2_MODEL_PROXY_TOKEN_FILE to the enrolled proxy token file}
-  model_proxy_token_worker_3:
-    file: ${WORKER_3_MODEL_PROXY_TOKEN_FILE:?set WORKER_3_MODEL_PROXY_TOKEN_FILE to the enrolled proxy token file}
-  model_proxy_token_worker_4:
-    file: ${WORKER_4_MODEL_PROXY_TOKEN_FILE:?set WORKER_4_MODEL_PROXY_TOKEN_FILE to the enrolled proxy token file}
-  model_proxy_token_worker_5:
-    file: ${WORKER_5_MODEL_PROXY_TOKEN_FILE:?set WORKER_5_MODEL_PROXY_TOKEN_FILE to the enrolled proxy token file}
-  model_proxy_token_worker_6:
-    file: ${WORKER_6_MODEL_PROXY_TOKEN_FILE:?set WORKER_6_MODEL_PROXY_TOKEN_FILE to the enrolled proxy token file}
-  model_proxy_token_worker_7:
-    file: ${WORKER_7_MODEL_PROXY_TOKEN_FILE:?set WORKER_7_MODEL_PROXY_TOKEN_FILE to the enrolled proxy token file}
-  model_proxy_token_worker_8:
-    file: ${WORKER_8_MODEL_PROXY_TOKEN_FILE:?set WORKER_8_MODEL_PROXY_TOKEN_FILE to the enrolled proxy token file}
 
 volumes:
   postgres-data:

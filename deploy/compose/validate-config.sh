@@ -138,7 +138,6 @@ done
 if [ "$replicas" -gt 0 ]; then
   slot=1
   seen_ids=" "
-  seen_proxy_tokens=" "
   proxy_uid=$(value CREDENTIAL_PROXY_UID)
   proxy_uid=${proxy_uid:-10001}
   proxy_gid=$(value CREDENTIAL_PROXY_GID)
@@ -165,6 +164,64 @@ if [ "$replicas" -gt 0 ]; then
     echo "Provider credential directory owner must match CREDENTIAL_PROXY_UID" >&2
     exit 2
   fi
+  provider_bindings_json=$(value AGENTTEAMS_TENANT_CREDENTIAL_REFS_JSON)
+  if [ -z "$provider_bindings_json" ] || ! python3 - "$provider_root" "$proxy_uid" "$provider_bindings_json" <<'PYBINDINGS'
+import json
+import re
+import stat
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve(strict=True)
+expected_uid = int(sys.argv[2])
+rows = json.loads(sys.argv[3])
+if not isinstance(rows, list) or not rows:
+    raise SystemExit(1)
+seen = set()
+for row in rows:
+    if not isinstance(row, dict):
+        raise SystemExit(1)
+    tenant, project, team = (row.get(key) for key in ("tenant_id", "project_id", "team_id"))
+    reference = row.get("model_credential_ref")
+    if any(not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", value)
+           for value in (tenant, project, team)):
+        raise SystemExit(1)
+    key = (tenant, project, team)
+    if key in seen:
+        raise SystemExit(1)
+    seen.add(key)
+    if not isinstance(reference, str) or not reference.startswith("file:"):
+        raise SystemExit(1)
+    parts = reference[5:].split("/")
+    if len(parts) < 4 or parts[:3] != [tenant, project, team] or any(
+            not re.fullmatch(r"[A-Za-z0-9_-]+", part) for part in parts):
+        raise SystemExit(1)
+    target = root.joinpath(*parts)
+    cursor = root
+    for part in parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise SystemExit(1)
+    if not target.is_file() or not target.resolve(strict=True).is_relative_to(root):
+        raise SystemExit(1)
+    for directory in target.parents:
+        if directory == root.parent:
+            break
+        if not directory.is_relative_to(root):
+            continue
+        directory_stat = directory.stat()
+        if directory_stat.st_uid != expected_uid or stat.S_IMODE(directory_stat.st_mode) & 0o077:
+            raise SystemExit(1)
+    target_stat = target.stat()
+    if target_stat.st_uid != expected_uid or stat.S_IMODE(target_stat.st_mode) & 0o077:
+        raise SystemExit(1)
+    if not 0 < target_stat.st_size <= 64 * 1024:
+        raise SystemExit(1)
+PYBINDINGS
+  then
+    echo "AGENTTEAMS_TENANT_CREDENTIAL_REFS_JSON must define valid Tenant/Project/Team file bindings" >&2
+    exit 2
+  fi
   while [ "$slot" -le "$replicas" ]; do
     id=$(value "WORKER_${slot}_AGENT_ID")
     if ! printf '%s\n' "$id" | awk '/^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$/ { ok=1 } END { exit !ok }'; then
@@ -176,74 +233,6 @@ if [ "$replicas" -gt 0 ]; then
       *" $normalized_id "*) echo "Worker Agent UUIDs must be unique" >&2; exit 2 ;;
     esac
     seen_ids="$seen_ids$normalized_id "
-    model_proxy_file=$(value "WORKER_${slot}_MODEL_PROXY_TOKEN_FILE")
-    case "$model_proxy_file" in
-      /*) ;;
-      *) model_proxy_file="$(CDPATH= cd -- "$(dirname -- "$env_file")" && pwd)/$model_proxy_file" ;;
-    esac
-    if [ ! -r "$model_proxy_file" ] || [ ! -s "$model_proxy_file" ]; then
-      echo "WORKER_${slot}_MODEL_PROXY_TOKEN_FILE must point to a readable, non-empty proxy token file" >&2
-      exit 2
-    fi
-    if model_proxy_mode=$(stat -f '%Lp' "$model_proxy_file" 2>/dev/null); then :; else model_proxy_mode=$(stat -c '%a' "$model_proxy_file"); fi
-    if [ "$((0$model_proxy_mode & 077))" -ne 0 ]; then
-      echo "Worker model proxy token file must not be readable by group or other users" >&2
-      exit 2
-    fi
-    if model_proxy_owner=$(stat -f '%u' "$model_proxy_file" 2>/dev/null); then :; else model_proxy_owner=$(stat -c '%u' "$model_proxy_file"); fi
-    if [ "$model_proxy_owner" != "$proxy_uid" ]; then
-      echo "Worker model proxy token file owner must match CREDENTIAL_PROXY_UID" >&2
-      exit 2
-    fi
-    proxy_token=$(cat "$model_proxy_file")
-    case "$proxy_token" in atp_*) proxy_token_body=${proxy_token#atp_} ;; *) echo "Worker model proxy token file must contain an enrolled atp_ token" >&2; exit 2 ;; esac
-    case "$proxy_token_body" in ''|*[!A-Za-z0-9_-]*) echo "Worker model proxy token file contains an invalid token" >&2; exit 2 ;; esac
-    if [ "${#proxy_token_body}" -ne 43 ]; then echo "Worker model proxy token file contains a malformed token" >&2; exit 2; fi
-    case "$seen_proxy_tokens" in
-      *" $proxy_token "*) echo "Each active Worker must use a distinct model proxy token" >&2; exit 2 ;;
-    esac
-    seen_proxy_tokens="$seen_proxy_tokens$proxy_token "
-    unset proxy_token proxy_token_body
-    model_credential_ref=$(value "WORKER_${slot}_MODEL_CREDENTIAL_REF")
-    if ! python3 - "$provider_root" "$model_credential_ref" "$proxy_uid" <<'PY'
-import re
-import stat
-import sys
-from pathlib import Path
-
-root = Path(sys.argv[1])
-reference = sys.argv[2]
-expected_uid = int(sys.argv[3])
-if not reference.startswith("file:"):
-    raise SystemExit(1)
-parts = reference[5:].split("/")
-if len(parts) < 4 or any(not re.fullmatch(r"[A-Za-z0-9_-]+", part) for part in parts):
-    raise SystemExit(1)
-resolved_root = root.resolve(strict=True)
-target = resolved_root.joinpath(*parts)
-cursor = resolved_root
-for part in parts:
-    cursor = cursor / part
-    if cursor.is_symlink():
-        raise SystemExit(1)
-if not target.is_file():
-    raise SystemExit(1)
-target_stat = target.stat()
-for directory in (resolved_root, *reversed(target.parents)):
-    if not directory.is_relative_to(resolved_root):
-        continue
-    directory_stat = directory.stat()
-    if directory_stat.st_uid != expected_uid or stat.S_IMODE(directory_stat.st_mode) & 0o077:
-        raise SystemExit(1)
-if target_stat.st_uid != expected_uid or stat.S_IMODE(target_stat.st_mode) & 0o077:
-    raise SystemExit(1)
-if not 0 < target_stat.st_size <= 64 * 1024:
-    raise SystemExit(1)
-PY
-    then
-      echo "WORKER_${slot}_MODEL_CREDENTIAL_REF must resolve to an owner-only file under the matching tenant/project path" >&2
-      exit 2
-    fi
     credential_file=$(value "WORKER_${slot}_CREDENTIALS_FILE")
     case "$credential_file" in
       /*) ;;

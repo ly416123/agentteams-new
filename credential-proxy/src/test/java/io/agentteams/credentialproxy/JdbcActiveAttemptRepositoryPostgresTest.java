@@ -170,6 +170,8 @@ class JdbcActiveAttemptRepositoryPostgresTest {
                 String.class)).isEqualTo(sha256(issued.token()));
         assertThat(jdbc.queryForObject("SELECT model_credential_ref FROM attempt_model_proxy_credentials",
                 String.class)).isEqualTo("file:tenant-a/project-a/team-a/default");
+        assertThat(jdbc.queryForObject("SELECT session_id FROM attempt_model_proxy_credentials",
+                UUID.class)).isEqualTo(SESSION_ID);
         assertThatThrownBy(() -> restricted.queryForObject(
                 "SELECT token_sha256 FROM attempt_model_proxy_credentials", String.class))
                 .isInstanceOf(org.springframework.dao.DataAccessException.class);
@@ -355,6 +357,8 @@ class JdbcActiveAttemptRepositoryPostgresTest {
         String tenantBToken = "atp_" + "B".repeat(43);
         insertScope("TASK", tenantBTask, "tenant-b", "project-b", "team-b");
         insertActive(AGENT, tenantBTask, tenantBAttempt, tenantBLease);
+        jdbc.update("INSERT INTO agent_sessions(id, agent_id, expires_at, revoked_at) "
+                        + "VALUES (?, ?, now() + interval '10 minutes', NULL)", SESSION_ID, AGENT);
         insertAttemptCredential(tenantBCredential, AGENT, tenantBTask, tenantBAttempt, tenantBLease,
                 tenantBToken, "vault://tenant-b/project-b/chatgpt");
 
@@ -371,6 +375,9 @@ class JdbcActiveAttemptRepositoryPostgresTest {
         var candidate = new JdbcActiveAttemptRepository(restricted).findActiveAttempts(identity).getFirst();
         assertThat(candidate).isEqualTo(new ActiveAttemptCandidate(AGENT, "tenant-b", "project-b", "team-b",
                 tenantBTask, tenantBAttempt, tenantBLease, candidate.leaseExpiresAt(), true, true, true));
+        jdbc.update("UPDATE agent_sessions SET revoked_at = now() WHERE id = ?", SESSION_ID);
+        assertThat(restrictedAuthenticator.authenticate(tenantBToken)).isEmpty();
+        assertThat(restrictedAuthenticator.revalidate(identity)).isEmpty();
         assertThatThrownBy(() -> restricted.queryForObject(
                 "SELECT token_sha256 FROM attempt_model_proxy_credentials", String.class))
                 .isInstanceOf(org.springframework.dao.DataAccessException.class);
@@ -512,10 +519,10 @@ class JdbcActiveAttemptRepositoryPostgresTest {
 
     private void insertAttemptCredential(UUID credential, UUID agent, UUID task, UUID attempt, UUID lease,
             String token, String modelCredentialRef) throws Exception {
-        jdbc.update("INSERT INTO attempt_model_proxy_credentials(id, agent_id, task_id, attempt_id, lease_id, "
+        jdbc.update("INSERT INTO attempt_model_proxy_credentials(id, session_id, agent_id, task_id, attempt_id, lease_id, "
                         + "token_sha256, model_credential_ref, expires_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?, ?, now() + interval '10 minutes')",
-                credential, agent, task, attempt, lease, sha256(token), modelCredentialRef);
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, now() + interval '10 minutes')",
+                credential, SESSION_ID, agent, task, attempt, lease, sha256(token), modelCredentialRef);
     }
 
     private void insertActive(UUID agent, UUID task, UUID attempt, UUID lease) {

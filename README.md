@@ -2,7 +2,7 @@
 
 面向固定容量、多租户 Agent 协作的无 Kubernetes 部署架构。项目以 Java 21 为服务端主线，复用现有 AgentTeams 的任务、租约、Outbox、Gateway 和 Worker 能力，并提供 Docker Compose / systemd 部署路径。
 
-> 当前阶段：固定容量 Compose POC 已接入独立 Worker Enrollment 服务、OIDC scope 检查和每槽位会话凭据投放；签名 JWT→HTTP→PostgreSQL 测试及 DB 最小权限测试通过，覆盖哈希、撤销和 tenant/project/team 拒绝。上游 Gateway 会话 fail-closed 修复已包含在 `agentteams-java v0.1.5`，固定 digest 的 5 种 gRPC 握手场景已在本机全部通过且未跳过。Credential Proxy 会在每次请求出站前及流式传输期间复核 Attempt/Lease 与代理凭据/Session，撤销后关闭上游流；活动流默认上限为 64。真实 OIDC Provider、Worker runtime 任务闭环和生产验收仍未完成。
+> 当前阶段：固定容量 Compose POC 已接入独立 Worker Enrollment 服务、OIDC scope 检查和每槽位会话凭据投放；签名 JWT→HTTP→PostgreSQL 测试及 DB 最小权限测试通过，覆盖哈希、撤销和 tenant/project/team 拒绝。上游 Gateway 会话 fail-closed 修复已包含在 `agentteams-java v0.1.5`，固定 digest 的 5 种 gRPC 握手场景已在本机全部通过且未跳过。Credential Proxy 会在每次请求出站前及流式传输期间复核 Attempt/Lease 与代理凭据/Session，撤销后关闭上游流；活动流默认上限为 64。Worker 已在 L5 固定槽位部署验证：每个模型请求按当前 Task/Attempt/Lease 向 Credential Proxy 获取短期 token，不在 Worker 配置静态模型密钥；Worker 精确单测 31 项、Compose 配置单测 10 项均通过。当前仍未完成共享池的 Tenant-neutral Attempt capability、控制面领取/续领协议、真实 OIDC Provider、多租户公平派发接线和生产验收。
 
 ## 目标
 
@@ -67,16 +67,16 @@ agentteams-new/
 
 任何资源读取与变更都必须先验证组织、租户、项目和主体权限，再以授权后的 scope 查询数据。Task、Assignment、Attempt、Lease、Conversation、Memory、Artifact、workspace 和凭据授权都必须能追溯到同一租户执行上下文。每个固定 Worker 槽位绑定单一 Tenant/Project/Team，首期保持单 Worker 单活动 Attempt（`maxConcurrency=1`）；任务结束或取消后清理运行时会话、工具客户端、临时文件及凭据缓存。高敏租户绑定专属固定池；不支持的隔离等级必须拒绝任务，不允许静默降级。若以后要让同一进程跨租户复用，必须另行实现并通过 Attempt 全隔离验收后再启用。
 
-Worker 会话凭据已支持按 tenant/project/team 授权签发、哈希持久化、过期和撤销；每个 Compose Worker 槽位使用独立的 `0600` runtime env 文件。撤销阻止后续 Gateway 握手，不会主动断开已经建立的长连接。
+Worker 会话凭据已支持按 tenant/project/team 授权签发、哈希持久化、过期和撤销；每个 Compose Worker 槽位使用独立的 `0600` runtime env 文件。撤销阻止后续 Gateway 握手，不会主动断开已经建立的长连接。模型请求凭据由 Credential Proxy 按活动 Attempt 临时签发：Worker 仅持有短期、不缓存的 Attempt token；代理在每次请求和流式传输期间复核 Attempt、Lease 及其来源 Session，数据库仅存 token 哈希。该路径已经在固定 Tenant 槽位的 L5 POC 验证；它尚不能证明一个 Tenant-neutral Worker 可安全连续服务多个 Tenant。
 
-该 Gateway token 只用于 Worker 到 Gateway 的身份认证，不是模型/MCP 上游凭据。Worker 仍可能接触上游模型/MCP 密钥；在请求级凭证代理和负向安全验收完成前，不声明上游密钥与 Worker 隔离。
+该 Gateway token 只用于 Worker 到 Gateway 的身份认证，不是模型/MCP 上游凭据。模型凭据由请求级代理保管；MCP 上游凭据的统一代理与完整负向安全验收尚未完成，因此暂不声明所有上游密钥都与 Worker 隔离。
 
 ## 当前不承诺
 
 - 任务到达时创建 Worker 或自动扩缩容。
 - 用 Matrix 替代任务状态、租约或持久消息系统。
 - 仅凭普通本机容器提供等同 gVisor、Kata 或 MicroVM 的强隔离。
-- 在凭证代理完成前宣称上游密钥不会到达 Worker。
+- 宣称 Tenant-neutral Worker、Attempt capability 与 A/B 连续任务隔离已完成。
 - 真实 OIDC Provider 与真实多租户业务下的集成验收、生产就绪状态。
 
 ## Maven 制品

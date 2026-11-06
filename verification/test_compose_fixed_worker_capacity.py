@@ -12,6 +12,14 @@ EXAMPLE_ENV = ROOT / "deploy/compose/.env.example"
 
 
 class ComposeFixedWorkerCapacityTest(unittest.TestCase):
+    def test_worker_pool_uses_attempt_scoped_credentials_from_proxy(self) -> None:
+        compose = (ROOT / "deploy/compose/compose.yaml").read_text()
+        example_env = EXAMPLE_ENV.read_text()
+        self.assertIn("AGENTTEAMS_ATTEMPT_CREDENTIAL_ISSUE_URL: http://credential-proxy:8085/internal/v1/attempt-credentials", compose)
+        self.assertNotIn("model_proxy_token_worker_", compose)
+        self.assertIn("AGENTTEAMS_TENANT_CREDENTIAL_REFS_JSON=", example_env)
+        self.assertIn("jsonb_to_recordset", compose)
+
     def invoke_startup(
         self,
         replicas: int,
@@ -52,6 +60,10 @@ class ComposeFixedWorkerCapacityTest(unittest.TestCase):
                 "CREDENTIAL_PROXY_UID": str(os.getuid()),
                 "CREDENTIAL_PROXY_GID": str(os.getgid()),
                 "PROVIDER_CREDENTIALS_DIR": str(provider_root),
+                "AGENTTEAMS_TENANT_CREDENTIAL_REFS_JSON": (
+                    '[{"tenant_id":"tenant-a","project_id":"project-a","team_id":"team-a",'
+                    '"model_credential_ref":"file:tenant-a/project-a/team-a/chatgpt"}]'
+                ),
                 "WORKER_REPLICAS": str(replicas),
             })
             if deployment_mode == "self-hosted-small":
@@ -174,6 +186,10 @@ class ComposeFixedWorkerCapacityTest(unittest.TestCase):
                 "CONTROL_PLANE_DB_PASSWORD": "test-control-plane-password-with-32-chars",
                 "WORKER_ENROLLMENT_DB_PASSWORD": "test-enrollment-password-with-32-chars",
                 "CREDENTIAL_PROXY_DB_PASSWORD": "test-credential-proxy-password-with-32-chars",
+                "AGENTTEAMS_TENANT_CREDENTIAL_REFS_JSON": (
+                    '[{"tenant_id":"tenant-a","project_id":"project-a","team_id":"team-a",'
+                    '"model_credential_ref":"file:tenant-a/project-a/team-a/chatgpt"}]'
+                ),
                 "CONTROL_PLANE_BUILD_FROM_SOURCE": "true",
                 "CONTROL_PLANE_IMAGE": "agentteams-new/control-plane:v0.1.5-task-event-scope-guard-0156f2c",
                 "WORKER_BUILD_FROM_SOURCE": "true",
@@ -247,6 +263,9 @@ class ComposeFixedWorkerCapacityTest(unittest.TestCase):
                     if key == "CREDENTIAL_PROXY_DB_PASSWORD": value = "test-credential-proxy-password-with-32-chars"
                     if key == "CREDENTIAL_PROXY_UID": value = str(os.getuid())
                     if key == "CREDENTIAL_PROXY_GID": value = str(os.getgid())
+                    if key == "AGENTTEAMS_TENANT_CREDENTIAL_REFS_JSON":
+                        value = ('[{"tenant_id":"tenant-a","project_id":"project-a","team_id":"team-a",'
+                                 '"model_credential_ref":"file:tenant-a/project-a/team-a/chatgpt"}]')
                     if key == "PROVIDER_CREDENTIALS_DIR":
                         provider_root = temp / "provider"
                         provider = provider_root / "tenant-a/project-a/team-a/chatgpt"
@@ -268,24 +287,12 @@ class ComposeFixedWorkerCapacityTest(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             self.assertIn("WORKER_BUILD_FROM_SOURCE=true", result.stderr)
 
-    def test_rejects_model_proxy_token_shared_between_worker_slots(self) -> None:
-        self.invoke_startup(
-            2,
-            shared_proxy_tokens=True,
-            expected_error="Each active Worker must use a distinct model proxy token",
-        )
-
-    def test_workers_only_receive_model_proxy_tokens(self) -> None:
+    def test_workers_do_not_receive_static_model_proxy_tokens(self) -> None:
         compose = (ROOT / "deploy/compose/compose.yaml").read_text()
-        for slot in range(1, 9):
-            secret_name = f"model_proxy_token_worker_{slot}"
-            self.assertIn(f"AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE: /run/secrets/{secret_name}", compose)
-            self.assertIn(f"secrets: [{secret_name}]", compose)
-            self.assertRegex(
-                compose,
-                rf"{secret_name}:\n\s+file: \$\{{WORKER_{slot}_MODEL_PROXY_TOKEN_FILE:\?set WORKER_{slot}_MODEL_PROXY_TOKEN_FILE",
-            )
+        self.assertNotIn("AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE", compose)
+        self.assertNotIn("model_proxy_token_worker_", compose)
         self.assertIn("AGENTTEAMS_CHATGPT_RESPONSES_URL: http://credential-proxy:8085/v1/responses", compose)
+        self.assertIn("AGENTTEAMS_ATTEMPT_CREDENTIAL_ISSUE_URL: http://credential-proxy:8085/internal/v1/attempt-credentials", compose)
         self.assertIn("PROVIDER_CREDENTIALS_DIR:?set PROVIDER_CREDENTIALS_DIR", compose)
         self.assertNotIn("model_token_worker_", compose)
         self.assertRegex(compose, r"worker-egress:\n\s+internal: true")

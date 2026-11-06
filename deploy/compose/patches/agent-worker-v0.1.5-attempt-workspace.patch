@@ -1,70 +1,117 @@
+diff --git a/agent-worker/src/main/java/io/agentteams/worker/AgentTeamsWorker.java b/agent-worker/src/main/java/io/agentteams/worker/AgentTeamsWorker.java
+index 995d821..0f4f767 100644
+--- a/agent-worker/src/main/java/io/agentteams/worker/AgentTeamsWorker.java
++++ b/agent-worker/src/main/java/io/agentteams/worker/AgentTeamsWorker.java
+@@ -703,0 +704 @@ public final class AgentTeamsWorker implements AutoCloseable {
++            URI attemptCredentialIssueUrl,
+@@ -745,0 +747,5 @@ public final class AgentTeamsWorker implements AutoCloseable {
++            URI attemptCredentialIssueUrl = optionalUri(environment, "AGENTTEAMS_ATTEMPT_CREDENTIAL_ISSUE_URL");
++            if (attemptCredentialIssueUrl != null && gatewayAuthToken == null) {
++                throw new IllegalArgumentException(
++                        "AGENTTEAMS_GATEWAY_AUTH_TOKEN must be set when Attempt credentials are enabled");
++            }
+@@ -760,0 +767 @@ public final class AgentTeamsWorker implements AutoCloseable {
++                    attemptCredentialIssueUrl,
+diff --git a/agent-worker/src/main/java/io/agentteams/worker/WorkerRuntimeFactory.java b/agent-worker/src/main/java/io/agentteams/worker/WorkerRuntimeFactory.java
+index b57069c..ba8d84f 100644
+--- a/agent-worker/src/main/java/io/agentteams/worker/WorkerRuntimeFactory.java
++++ b/agent-worker/src/main/java/io/agentteams/worker/WorkerRuntimeFactory.java
+@@ -13,0 +14,3 @@ import io.agentteams.worker.chatgpt.ChatGptPlanModelProvider;
++import io.agentteams.worker.chatgpt.AttemptCredentialTokenSource;
++import io.agentteams.worker.chatgpt.ChatGptPlanModel;
++import io.agentteams.runtime.RuntimeTask;
+@@ -18,0 +22,2 @@ import java.util.Objects;
++import java.util.UUID;
++import java.util.function.Function;
+@@ -91,3 +96,15 @@ public final class WorkerRuntimeFactory {
+-            configured = new ConfiguredAgentScopeHarnessFactory(
+-                    ModelRegistry.resolve(configuration.model(), modelCreationContext(System.getenv())),
+-                    workspaceFactory, root);
++            var baseModel = ModelRegistry.resolve(configuration.model(), modelCreationContext(System.getenv()));
++            Function<RuntimeTask, io.agentscope.core.model.Model> modelForTask = task -> {
++                if (configuration.attemptCredentialIssueUrl() == null
++                        || !(baseModel instanceof ChatGptPlanModel chatGpt)) {
++                    return baseModel;
++                }
++                if (configuration.gatewayAuthToken() == null) {
++                    throw new IllegalStateException("Gateway session is required for Attempt credentials");
++                }
++                return chatGpt.withTokenSource(new AttemptCredentialTokenSource(configuration.attemptCredentialIssueUrl(),
++                        configuration.gatewayAuthToken(), requiredUuid(task, "taskId", task.id()),
++                        requiredUuid(task, "attemptId"), requiredUuid(task, "leaseId"),
++                        java.net.http.HttpClient.newHttpClient()));
++            };
++            configured = new ConfiguredAgentScopeHarnessFactory(baseModel, workspaceFactory, root, modelForTask);
+@@ -107,0 +125,14 @@ public final class WorkerRuntimeFactory {
++    private static UUID requiredUuid(RuntimeTask task, String key) {
++        return requiredUuid(task, key, null);
++    }
++
++    private static UUID requiredUuid(RuntimeTask task, String key, UUID fallback) {
++        String value = key.equals("taskId") ? task.id().toString() : task.metadata().get(key);
++        if ((value == null || value.isBlank()) && fallback != null) return fallback;
++        try {
++            return UUID.fromString(value);
++        } catch (RuntimeException invalid) {
++            throw new IllegalArgumentException("Attempt metadata is missing or invalid: " + key);
++        }
++    }
++
+diff --git a/agent-worker/src/main/java/io/agentteams/worker/agentscope/ConfiguredAgentScopeHarnessFactory.java b/agent-worker/src/main/java/io/agentteams/worker/agentscope/ConfiguredAgentScopeHarnessFactory.java
+index e680244..78b7018 100644
 --- a/agent-worker/src/main/java/io/agentteams/worker/agentscope/ConfiguredAgentScopeHarnessFactory.java
 +++ b/agent-worker/src/main/java/io/agentteams/worker/agentscope/ConfiguredAgentScopeHarnessFactory.java
-@@ -18,6 +18,9 @@
- import java.io.IOException;
- import java.nio.file.Files;
- import java.nio.file.Path;
+@@ -20,0 +21,3 @@ import java.nio.file.Path;
 +import java.nio.file.FileVisitResult;
 +import java.nio.file.SimpleFileVisitor;
 +import java.nio.file.attribute.BasicFileAttributes;
- import java.time.Instant;
- import java.util.Objects;
- import java.util.Map;
-@@ -97,12 +100,17 @@
-
-     @Override
-     public void release(UUID taskId) {
+@@ -27,0 +31 @@ import java.util.UUID;
++import java.util.function.Function;
+@@ -48,0 +53 @@ public final class ConfiguredAgentScopeHarnessFactory implements AgentScopeHarne
++    private final Function<RuntimeTask, Model> taskModelProvider;
+@@ -76,0 +82,5 @@ public final class ConfiguredAgentScopeHarnessFactory implements AgentScopeHarne
++        this(model, workspaceFactory, workspaceRoot, ignored -> model);
++    }
++
++    public ConfiguredAgentScopeHarnessFactory(Model model, AgentScopeWorkspaceFactory workspaceFactory,
++            Path workspaceRoot, Function<RuntimeTask, Model> taskModelProvider) {
+@@ -78 +88 @@ public final class ConfiguredAgentScopeHarnessFactory implements AgentScopeHarne
+-                new AgentScopeMcpRuntimePort(new EnvironmentMcpCredentialProvider()));
++                new AgentScopeMcpRuntimePort(new EnvironmentMcpCredentialProvider()), taskModelProvider);
+@@ -82,0 +93,5 @@ public final class ConfiguredAgentScopeHarnessFactory implements AgentScopeHarne
++        this(model, workspaceFactory, workspaceRoot, mcpRuntime, ignored -> model);
++    }
++
++    private ConfiguredAgentScopeHarnessFactory(Model model, AgentScopeWorkspaceFactory workspaceFactory,
++            Path workspaceRoot, McpRuntimePort mcpRuntime, Function<RuntimeTask, Model> taskModelProvider) {
+@@ -86,0 +102 @@ public final class ConfiguredAgentScopeHarnessFactory implements AgentScopeHarne
++        this.taskModelProvider = Objects.requireNonNull(taskModelProvider, "taskModelProvider");
+@@ -100 +116,4 @@ public final class ConfiguredAgentScopeHarnessFactory implements AgentScopeHarne
 -        bindings.remove(Objects.requireNonNull(taskId, "taskId"));
 +        AgentScopeWorkspaceFactory.WorkspaceBinding binding = bindings.remove(
 +                Objects.requireNonNull(taskId, "taskId"));
 +        if (binding == null || binding.profile() != SandboxProfile.NONE) return;
 +        deleteLocalWorkspace(workspaceFor(binding));
-     }
-
-     @Override
-     public void releaseAll() {
+@@ -105 +124,3 @@ public final class ConfiguredAgentScopeHarnessFactory implements AgentScopeHarne
 -        bindings.clear();
 +        for (UUID taskId : List.copyOf(bindings.keySet())) {
 +            release(taskId);
 +        }
-     }
-
-     @Override
-@@ -144,13 +152,17 @@
-             throw new IllegalArgumentException("sandbox workspace must expose a verified local workspace");
-         }
-         bindings.put(task.id(), binding);
+@@ -147 +168 @@ public final class ConfiguredAgentScopeHarnessFactory implements AgentScopeHarne
 -        Path workspace = binding.workspacePath().orElseGet(() -> workspaceRoot.resolve(task.id().toString()));
 +        Path workspace = workspaceFor(binding);
-         workspace = workspace.toAbsolutePath().normalize();
-         if (!workspace.startsWith(workspaceRoot)) {
-             throw new IllegalArgumentException("resolved workspace is outside the configured root");
-         }
-         try {
-             Files.createDirectories(workspace);
+@@ -153,0 +175,4 @@ public final class ConfiguredAgentScopeHarnessFactory implements AgentScopeHarne
 +            workspace = workspace.toRealPath();
 +            if (!workspace.startsWith(workspaceRoot)) {
 +                throw new IllegalArgumentException("resolved workspace is outside the configured root");
 +            }
-             String agentId = context.configuration().getOrDefault("worker_id",
-                     task.metadata().getOrDefault("agentId", "agent-worker"));
-             HarnessAgent.Builder builder = HarnessAgent.builder()
-@@ -159,7 +171,7 @@
-                     .defaultSessionId(required(task, "attemptId"))
-                     .model(model)
-                     .workspace(workspace)
+@@ -160 +185 @@ public final class ConfiguredAgentScopeHarnessFactory implements AgentScopeHarne
+-                    .model(model)
++                    .model(Objects.requireNonNull(taskModelProvider.apply(task), "task model provider returned null"))
+@@ -162 +187 @@ public final class ConfiguredAgentScopeHarnessFactory implements AgentScopeHarne
 -                    .stateStore(new JsonFileAgentStateStore(workspaceRoot.resolve(".agentscope-state")))
 +                    .stateStore(new JsonFileAgentStateStore(workspace.resolve(".agentscope-state")))
-                     .disableShellTool()
-                     .disableSubagents()
-                     .disableSessionPersistence()
-@@ -200,7 +212,37 @@
-         } catch (RuntimeException error) {
-             release(task.id());
-             throw error;
-+        }
-+    }
-+
+@@ -205,0 +231,30 @@ public final class ConfiguredAgentScopeHarnessFactory implements AgentScopeHarne
 +    private Path workspaceFor(AgentScopeWorkspaceFactory.WorkspaceBinding binding) {
 +        return binding.workspacePath().orElseGet(() -> workspaceRoot.resolve(binding.scopeId()));
 +    }
@@ -74,7 +121,7 @@
 +        if (!normalized.startsWith(workspaceRoot) || normalized.equals(workspaceRoot)) {
 +            LOG.log(System.Logger.Level.ERROR, "Refusing to remove workspace outside its root");
 +            return;
-         }
++        }
 +        try {
 +            Files.walkFileTree(normalized, new SimpleFileVisitor<>() {
 +                @Override
@@ -93,27 +140,175 @@
 +        } catch (IOException | RuntimeException error) {
 +            LOG.log(System.Logger.Level.WARNING, "Unable to remove terminal local workspace");
 +        }
-     }
-
-     private static Set<String> requiredTaskTools(String inputJson) {
---- a/agent-worker/src/test/java/io/agentteams/worker/agentscope/ConfiguredAgentScopeHarnessFactoryTest.java
-+++ b/agent-worker/src/test/java/io/agentteams/worker/agentscope/ConfiguredAgentScopeHarnessFactoryTest.java
-@@ -25,6 +25,8 @@
- import java.time.ZoneOffset;
- import java.util.List;
- import java.util.Map;
-+import java.util.HashSet;
-+import java.util.Set;
- import java.util.UUID;
- import java.util.concurrent.atomic.AtomicReference;
- import reactor.core.publisher.Flux;
-@@ -74,7 +76,76 @@
-                 Clock.fixed(Instant.parse("2026-08-26T00:00:00Z"), ZoneOffset.UTC), ignored -> { }, Map.of()));
-
-         assertThat(harness).isNotNull();
-+        harness.close();
 +    }
 +
+diff --git a/agent-worker/src/main/java/io/agentteams/worker/chatgpt/AttemptCredentialTokenSource.java b/agent-worker/src/main/java/io/agentteams/worker/chatgpt/AttemptCredentialTokenSource.java
+new file mode 100644
+index 0000000..74ef7af
+--- /dev/null
++++ b/agent-worker/src/main/java/io/agentteams/worker/chatgpt/AttemptCredentialTokenSource.java
+@@ -0,0 +1,91 @@
++package io.agentteams.worker.chatgpt;
++
++import com.fasterxml.jackson.databind.JsonNode;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import java.io.IOException;
++import java.io.InputStream;
++import java.net.URI;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
++import java.time.Duration;
++import java.time.Instant;
++import java.util.Objects;
++import java.util.UUID;
++
++/** Obtains a fresh, short-lived model capability for one active Attempt. */
++public final class AttemptCredentialTokenSource implements ChatGptPlanTokenSource {
++    private static final ObjectMapper JSON = new ObjectMapper();
++    private static final int MAX_RESPONSE_BYTES = 16 * 1024;
++    private final URI endpoint;
++    private final String workerSessionToken;
++    private final UUID taskId;
++    private final UUID attemptId;
++    private final UUID leaseId;
++    private final HttpClient http;
++
++    public AttemptCredentialTokenSource(URI endpoint, String workerSessionToken, UUID taskId,
++            UUID attemptId, UUID leaseId, HttpClient http) {
++        this.endpoint = validateEndpoint(endpoint);
++        this.workerSessionToken = requireText(workerSessionToken, "worker session token");
++        this.taskId = Objects.requireNonNull(taskId, "taskId");
++        this.attemptId = Objects.requireNonNull(attemptId, "attemptId");
++        this.leaseId = Objects.requireNonNull(leaseId, "leaseId");
++        this.http = Objects.requireNonNull(http, "http");
++    }
++
++    @Override
++    public String accessToken() {
++        try {
++            String body = JSON.createObjectNode().put("taskId", taskId.toString())
++                    .put("attemptId", attemptId.toString()).put("leaseId", leaseId.toString()).toString();
++            HttpRequest request = HttpRequest.newBuilder(endpoint).timeout(Duration.ofSeconds(10))
++                    .header("Authorization", "Bearer " + workerSessionToken)
++                    .header("Content-Type", "application/json")
++                    .header("Accept", "application/json")
++                    .header("Cache-Control", "no-store")
++                    .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8)).build();
++            HttpResponse<InputStream> response = http.send(request, HttpResponse.BodyHandlers.ofInputStream());
++            try (InputStream stream = response.body()) {
++                if (response.statusCode() != 201) throw denied();
++                byte[] bytes = stream.readNBytes(MAX_RESPONSE_BYTES + 1);
++                if (bytes.length > MAX_RESPONSE_BYTES) throw denied();
++                JsonNode result = JSON.readTree(bytes);
++                String token = result.path("token").asText("");
++                Instant expiresAt = Instant.parse(result.path("expiresAt").asText(""));
++                Instant now = Instant.now();
++                if (!token.matches("atp_[A-Za-z0-9_-]{43}") || !expiresAt.isAfter(now)
++                        || expiresAt.isAfter(now.plusSeconds(305))) {
++                    throw denied();
++                }
++                return token;
++            }
++        } catch (IOException | InterruptedException | RuntimeException error) {
++            if (error instanceof InterruptedException) Thread.currentThread().interrupt();
++            throw denied();
++        }
++    }
++
++    private static URI validateEndpoint(URI endpoint) {
++        Objects.requireNonNull(endpoint, "endpoint");
++        String scheme = endpoint.getScheme();
++        if (endpoint.getHost() == null || endpoint.getRawUserInfo() != null
++                || !("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme))
++                || endpoint.getFragment() != null) {
++            throw new IllegalArgumentException("Attempt credential endpoint is invalid");
++        }
++        return endpoint;
++    }
++
++    private static String requireText(String value, String name) {
++        if (value == null || value.isBlank() || value.chars().anyMatch(Character::isWhitespace)) {
++            throw new IllegalArgumentException(name + " is required");
++        }
++        return value;
++    }
++
++    private static IllegalStateException denied() {
++        return new IllegalStateException("Attempt credential could not be issued");
++    }
++}
+diff --git a/agent-worker/src/main/java/io/agentteams/worker/chatgpt/ChatGptPlanModel.java b/agent-worker/src/main/java/io/agentteams/worker/chatgpt/ChatGptPlanModel.java
+index d819f0c..445c369 100644
+--- a/agent-worker/src/main/java/io/agentteams/worker/chatgpt/ChatGptPlanModel.java
++++ b/agent-worker/src/main/java/io/agentteams/worker/chatgpt/ChatGptPlanModel.java
+@@ -104,0 +105,4 @@ public final class ChatGptPlanModel implements Model {
++            if (System.getenv("AGENTTEAMS_ATTEMPT_CREDENTIAL_ISSUE_URL") != null) {
++                return new ChatGptPlanModel(model,
++                        () -> { throw new IllegalStateException("Attempt-scoped model credential is required"); });
++            }
+@@ -114,0 +119,5 @@ public final class ChatGptPlanModel implements Model {
++    /** Returns a task-local model adapter whose credential is resolved for each request. */
++    public ChatGptPlanModel withTokenSource(ChatGptPlanTokenSource tokenSource) {
++        return new ChatGptPlanModel(modelName, endpoint, tokenSource, http);
++    }
++
+diff --git a/agent-worker/src/test/java/io/agentteams/worker/WorkerRuntimeFactoryTest.java b/agent-worker/src/test/java/io/agentteams/worker/WorkerRuntimeFactoryTest.java
+index 26abdd9..929bb7c 100644
+--- a/agent-worker/src/test/java/io/agentteams/worker/WorkerRuntimeFactoryTest.java
++++ b/agent-worker/src/test/java/io/agentteams/worker/WorkerRuntimeFactoryTest.java
+@@ -22,0 +23,23 @@ class WorkerRuntimeFactoryTest {
++    @Test
++    void requiresGatewaySessionWhenAttemptCredentialIssuanceIsEnabled() {
++        assertThatThrownBy(() -> AgentTeamsWorker.WorkerConfiguration.from(Map.of(
++                "AGENTTEAMS_AGENT_ID", "agent-a",
++                "AGENTTEAMS_ATTEMPT_CREDENTIAL_ISSUE_URL",
++                "http://credential-proxy:8085/internal/v1/attempt-credentials")))
++                .isInstanceOf(IllegalArgumentException.class)
++                .hasMessage("AGENTTEAMS_GATEWAY_AUTH_TOKEN must be set when Attempt credentials are enabled");
++    }
++
++    @Test
++    void configuresAttemptCredentialIssueEndpointWithoutTenantIdentity() {
++        var configuration = AgentTeamsWorker.WorkerConfiguration.from(Map.of(
++                "AGENTTEAMS_AGENT_ID", "agent-a",
++                "AGENTTEAMS_GATEWAY_AUTH_TOKEN", "ats_worker_session",
++                "AGENTTEAMS_ATTEMPT_CREDENTIAL_ISSUE_URL",
++                "http://credential-proxy:8085/internal/v1/attempt-credentials"));
++
++        assertThat(configuration.attemptCredentialIssueUrl()).hasToString(
++                "http://credential-proxy:8085/internal/v1/attempt-credentials");
++        assertThat(configuration.runtimeConfiguration()).doesNotContainKeys("tenant_id", "project_id");
++    }
++
+diff --git a/agent-worker/src/test/java/io/agentteams/worker/agentscope/ConfiguredAgentScopeHarnessFactoryTest.java b/agent-worker/src/test/java/io/agentteams/worker/agentscope/ConfiguredAgentScopeHarnessFactoryTest.java
+index 2b48c68..532e6c4 100644
+--- a/agent-worker/src/test/java/io/agentteams/worker/agentscope/ConfiguredAgentScopeHarnessFactoryTest.java
++++ b/agent-worker/src/test/java/io/agentteams/worker/agentscope/ConfiguredAgentScopeHarnessFactoryTest.java
+@@ -27,0 +28,2 @@ import java.util.Map;
++import java.util.HashSet;
++import java.util.Set;
+@@ -61,0 +64,18 @@ class ConfiguredAgentScopeHarnessFactoryTest {
++    @Test
++    void selectsModelForTheExactRuntimeTaskBeforeStartingItsHarness() {
++        AtomicReference<RuntimeTask> selectedTask = new AtomicReference<>();
++        RuntimeTask task = task("attempt-model-scope", "lease-model-scope");
++        ConfiguredAgentScopeHarnessFactory factory = new ConfiguredAgentScopeHarnessFactory(
++                new TestModel(), AgentScopeWorkspaceFactory.testOnly(new ReadySandboxRuntime(),
++                        Clock.systemUTC(), root), root, runtimeTask -> {
++                            selectedTask.set(runtimeTask);
++                            return new TestModel();
++                        });
++
++        var harness = factory.create(task, context());
++
++        assertThat(selectedTask.get()).isSameAs(task);
++        harness.close();
++        factory.release(task.id());
++    }
++
+@@ -79,0 +100,69 @@ class ConfiguredAgentScopeHarnessFactoryTest {
 +    @Test
 +    void givesEachAttemptOfOneTaskAnIsolatedLocalWorkspace() throws Exception {
 +        UUID taskId = UUID.randomUUID();
@@ -177,27 +372,20 @@
 +        Path workspace = localWorkspace();
 +        Files.writeString(workspace.resolve("private-data.txt"), "remove on terminal release");
 +
-         harness.close();
++        harness.close();
 +        factory.release(taskId);
 +
 +        assertThat(workspace).doesNotExist();
-     }
-
-     @Test
-@@ -355,11 +426,40 @@
-     }
-
-     private RuntimeTask task(String attemptId, String leaseId) {
++    }
++
+@@ -358 +447,5 @@ class ConfiguredAgentScopeHarnessFactoryTest {
 -        return new RuntimeTask(UUID.randomUUID(), "chat", "hello", Map.of(
 +        return task(UUID.randomUUID(), attemptId, leaseId);
 +    }
 +
 +    private RuntimeTask task(UUID taskId, String attemptId, String leaseId) {
 +        return new RuntimeTask(taskId, "chat", "hello", Map.of(
-                 "tenantId", "tenant-a", "projectId", "project-a", "teamId", "team-a",
-                 "agentId", "agent-a", "attemptId", attemptId, "leaseId", leaseId));
-     }
-
+@@ -362,0 +456,25 @@ class ConfiguredAgentScopeHarnessFactoryTest {
 +    private Path localWorkspace() throws Exception {
 +        try (var paths = Files.list(root)) {
 +            return paths.filter(Files::isDirectory)
@@ -223,6 +411,98 @@
 +                "agentId", "agent-a", "attemptId", attempt, "leaseId", lease));
 +    }
 +
-     private RuntimeTask sandboxTask(String attemptId) {
-         return new RuntimeTask(UUID.randomUUID(), "chat", "hello", Map.ofEntries(
-                 Map.entry("tenantId", "tenant-a"), Map.entry("projectId", "project-a"),
+diff --git a/agent-worker/src/test/java/io/agentteams/worker/chatgpt/AttemptCredentialTokenSourceTest.java b/agent-worker/src/test/java/io/agentteams/worker/chatgpt/AttemptCredentialTokenSourceTest.java
+new file mode 100644
+index 0000000..1864317
+--- /dev/null
++++ b/agent-worker/src/test/java/io/agentteams/worker/chatgpt/AttemptCredentialTokenSourceTest.java
+@@ -0,0 +1,89 @@
++package io.agentteams.worker.chatgpt;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++
++import com.sun.net.httpserver.HttpServer;
++import java.net.InetSocketAddress;
++import java.net.URI;
++import java.net.http.HttpClient;
++import java.nio.charset.StandardCharsets;
++import java.time.Instant;
++import java.util.UUID;
++import java.util.concurrent.atomic.AtomicInteger;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++
++class AttemptCredentialTokenSourceTest {
++    private HttpServer server;
++    private AtomicInteger requests;
++    private String requestBody;
++    private String authorization;
++
++    @BeforeEach
++    void startServer() throws Exception {
++        requests = new AtomicInteger();
++        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
++        server.createContext("/internal/v1/attempt-credentials", exchange -> {
++            authorization = exchange.getRequestHeaders().getFirst("Authorization");
++            requestBody = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
++            int request = requests.incrementAndGet();
++            String response = "{\"token\":\"atp_" + "a".repeat(42) + request
++                    + "\",\"expiresAt\":\"" + Instant.now().plusSeconds(60) + "\"}";
++            byte[] bytes = response.getBytes(StandardCharsets.UTF_8);
++            exchange.getResponseHeaders().add("Content-Type", "application/json");
++            exchange.getResponseHeaders().add("Cache-Control", "no-store");
++            exchange.sendResponseHeaders(201, bytes.length);
++            exchange.getResponseBody().write(bytes);
++            exchange.close();
++        });
++        server.start();
++    }
++
++    @AfterEach
++    void stopServer() {
++        if (server != null) server.stop(0);
++    }
++
++    @Test
++    void reissuesAttemptScopedTokenOnEveryModelRequest() {
++        UUID taskId = UUID.randomUUID();
++        UUID attemptId = UUID.randomUUID();
++        UUID leaseId = UUID.randomUUID();
++        AttemptCredentialTokenSource source = new AttemptCredentialTokenSource(
++                URI.create("http://127.0.0.1:" + server.getAddress().getPort()
++                        + "/internal/v1/attempt-credentials"),
++                "ats_worker_session", taskId, attemptId, leaseId, HttpClient.newHttpClient());
++
++        String first = source.accessToken();
++        String second = source.accessToken();
++
++        assertThat(first).startsWith("atp_");
++        assertThat(second).startsWith("atp_").isNotEqualTo(first);
++        assertThat(requests).hasValue(2);
++        assertThat(authorization).isEqualTo("Bearer ats_worker_session");
++        assertThat(requestBody).contains(taskId.toString(), attemptId.toString(), leaseId.toString());
++        assertThat(requestBody).doesNotContain("tenant", "credentialRef", "modelCredentialRef");
++    }
++
++    @Test
++    void rejectsAResponseWithoutAValidShortLivedAttemptToken() {
++        server.removeContext("/internal/v1/attempt-credentials");
++        server.createContext("/internal/v1/attempt-credentials", exchange -> {
++            byte[] bytes = "{\"token\":\"provider-secret\",\"expiresAt\":\"2999-01-01T00:00:00Z\"}"
++                    .getBytes(StandardCharsets.UTF_8);
++            exchange.sendResponseHeaders(201, bytes.length);
++            exchange.getResponseBody().write(bytes);
++            exchange.close();
++        });
++        AttemptCredentialTokenSource source = new AttemptCredentialTokenSource(
++                URI.create("http://127.0.0.1:" + server.getAddress().getPort()
++                        + "/internal/v1/attempt-credentials"),
++                "ats_worker_session", UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID(),
++                HttpClient.newHttpClient());
++
++        assertThatThrownBy(source::accessToken).isInstanceOf(IllegalStateException.class)
++                .hasMessage("Attempt credential could not be issued");
++    }
++}
