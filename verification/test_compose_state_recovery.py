@@ -68,11 +68,15 @@ networks:
             def compose(project: str, *args: str) -> str:
                 result = subprocess.run(
                     ["docker", "compose", "-p", project, "--env-file", str(env_file), "-f", str(compose_file), *args],
-                    check=True,
                     capture_output=True,
                     text=True,
                     timeout=180,
                 )
+                if result.returncode != 0:
+                    raise AssertionError(
+                        f"Compose command failed ({result.returncode}): {args}\n"
+                        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+                    )
                 return result.stdout
 
             def nats(project: str, *args: str) -> str:
@@ -91,7 +95,8 @@ networks:
                 for _ in range(60):
                     ready = subprocess.run(
                         ["docker", "compose", "-p", source, "--env-file", str(env_file), "-f", str(compose_file),
-                         "exec", "-T", "postgres", "pg_isready", "-U", "agentteams", "-d", "agentteams"],
+                         "exec", "-T", "postgres", "pg_isready", "-h", "127.0.0.1", "-U", "agentteams",
+                         "-d", "agentteams"],
                         capture_output=True,
                         text=True,
                     )
