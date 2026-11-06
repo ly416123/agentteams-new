@@ -1368,3 +1368,277 @@ index 0000000..62da7a1
 +    OR (type = 'ROLLBACK' AND status IN ('SUCCEEDED', 'FAILED'))
 +    OR (type = 'TERMINATE' AND status IN ('PENDING', 'RUNNING', 'SUCCEEDED', 'FAILED'))
 +);
+--- a/control-plane/src/main/java/io/agentteams/controlplane/persistence/AgentRepository.java
++++ b/control-plane/src/main/java/io/agentteams/controlplane/persistence/AgentRepository.java
+@@ -174,6 +174,14 @@
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1
++                         FROM agent_leases lease
++                        WHERE lease.agent_id = a.id
++                          AND lease.status = 'ACTIVE'
++                          AND lease.released_at IS NULL
++                          AND lease.expires_at > ?
++                   )
++                   AND NOT EXISTS (
++                       SELECT 1
+                          FROM jsonb_array_elements_text(
+                               CASE
+                                   WHEN jsonb_typeof(CAST(? AS jsonb)->'requiredCapabilities') = 'array'
+@@ -185,7 +193,8 @@
+                  ORDER BY a.id
+                  LIMIT 1
+                  FOR UPDATE OF a SKIP LOCKED
+-                """, this::map, taskId, JdbcSupport.timestamp(now), JdbcSupport.json(taskSpecJson),
++                """, this::map, taskId, JdbcSupport.timestamp(now), JdbcSupport.timestamp(now),
++                JdbcSupport.json(taskSpecJson),
+                 JdbcSupport.json(taskSpecJson)).stream().findFirst();
+     }
+
+--- a/control-plane/src/test/java/io/agentteams/controlplane/persistence/FoundationRepositoryIT.java
++++ b/control-plane/src/test/java/io/agentteams/controlplane/persistence/FoundationRepositoryIT.java
+@@ -846,6 +846,104 @@
+                 .isEqualTo(matchingAgent.id());
+     }
+
++    @Test
++    void doesNotSelectProjectWorkerWithAnActiveLease() {
++        Instant now = Instant.parse("2026-11-06T00:00:00Z");
++        UUID agentId = UUID.randomUUID();
++        UUID taskId = UUID.randomUUID();
++        UUID attemptId = UUID.randomUUID();
++        UUID leaseId = UUID.randomUUID();
++        AgentRecord agent = AgentRecord.create(agentId, "leased-project-worker", AgentPhase.READY,
++                "agentscope", "{\"agentscope\":\"true\"}", now);
++        TaskRecord task = TaskRecord.draft(taskId, "active lease task", "description", "actor", "test", now);
++        TaskAttemptRecord attempt = TaskAttemptRecord.fromDomain(new TaskAttempt(
++                attemptId, taskId, leaseId, TaskPhase.ASSIGNED, now, now, now.plusSeconds(60), null,
++                "scheduler", "test", null, null, 0));
++        TaskAssignmentRecord assignment = new TaskAssignmentRecord(UUID.randomUUID(), taskId, attemptId, agentId,
++                TaskPhase.ASSIGNED, now, null, null, "{}", now, now, 0);
++        AgentLeaseRecord lease = new AgentLeaseRecord(leaseId, agentId, attemptId, now,
++                now.plusSeconds(60), null, "ACTIVE", now, now, 0);
++        persistence.createFoundation(agent, task, attempt, assignment, lease, now);
++        insertScope("WORKER", agentId, "tenant-a", "project-a");
++        insertScope("TASK", taskId, "tenant-a", "project-a");
++
++        assertThat(new AgentRepository(jdbc).findReadyMatchingInTaskProject(
++                "{\"requiredCapabilities\":[\"agentscope\"]}", taskId, now))
++                .as("one fixed Worker slot cannot receive a second active Attempt")
++                .isEmpty();
++
++        jdbc.update("UPDATE agent_leases SET status = 'RELEASED', released_at = ?, updated_at = ? WHERE id = ?",
++                Timestamp.from(now.plusSeconds(1)), Timestamp.from(now.plusSeconds(1)), leaseId);
++        assertThat(new AgentRepository(jdbc).findReadyMatchingInTaskProject(
++                "{\"requiredCapabilities\":[\"agentscope\"]}", taskId, now.plusSeconds(2)))
++                .as("a Worker slot becomes selectable after its lease is released")
++                .get()
++                .extracting(AgentRecord::id)
++                .isEqualTo(agentId);
++    }
++
++    @Test
++    void concurrentProjectAssignmentsCannotCreateTwoActiveLeasesForOneWorker() throws Exception {
++        Instant now = Instant.parse("2026-11-06T00:00:00Z");
++        UUID agentId = UUID.randomUUID();
++        AgentRecord agent = AgentRecord.create(agentId, "contended-project-worker", AgentPhase.READY,
++                "agentscope", "{}", now);
++        persistence.createAgent(agent);
++
++        UUID taskA = insertQueuedScopedTask(now, "tenant-a", "project-a");
++        UUID taskB = insertQueuedScopedTask(now, "tenant-a", "project-a");
++        insertScope("WORKER", agentId, "tenant-a", "project-a");
++
++        CountDownLatch bothTransactionsStarted = new CountDownLatch(2);
++        CountDownLatch startAssignments = new CountDownLatch(1);
++        ExecutorService executor = Executors.newFixedThreadPool(2);
++        try {
++            Callable<Boolean> assignment = () -> {
++                bothTransactionsStarted.countDown();
++                if (!startAssignments.await(5, TimeUnit.SECONDS)) {
++                    throw new IllegalStateException("assignment concurrency test timed out");
++                }
++                UUID taskId = Thread.currentThread().getName().endsWith("1") ? taskA : taskB;
++                try {
++                    new io.agentteams.controlplane.service.TaskAssignmentService(persistence, Duration.ofMinutes(2))
++                            .queueReadyTask(taskId, now);
++                    return true;
++                } catch (IllegalStateException noWorkerAvailable) {
++                    if (!"no READY agent matches task capabilities".equals(noWorkerAvailable.getMessage())) {
++                        throw noWorkerAvailable;
++                    }
++                    return false;
++                }
++            };
++            Future<Boolean> first = executor.submit(assignment);
++            Future<Boolean> second = executor.submit(assignment);
++            assertThat(bothTransactionsStarted.await(5, TimeUnit.SECONDS)).isTrue();
++            startAssignments.countDown();
++
++            assertThat(List.of(first.get(15, TimeUnit.SECONDS), second.get(15, TimeUnit.SECONDS)))
++                    .as("exactly one queued task can claim the fixed Worker slot")
++                    .containsExactlyInAnyOrder(true, false);
++            assertThat(jdbc.queryForObject("SELECT count(*) FROM agent_leases WHERE agent_id = ? "
++                    + "AND status = 'ACTIVE' AND released_at IS NULL", Long.class, agentId)).isEqualTo(1L);
++            assertThat(jdbc.queryForObject("SELECT count(*) FROM tasks WHERE id IN (?, ?) AND phase = 'ASSIGNED'",
++                    Long.class, taskA, taskB)).isEqualTo(1L);
++        } finally {
++            startAssignments.countDown();
++            executor.shutdownNow();
++        }
++    }
++
++    private UUID insertQueuedScopedTask(Instant now, String tenant, String project) {
++        UUID taskId = UUID.randomUUID();
++        persistence.inTransaction(tx -> {
++            tx.tasks().insert(new TaskRecord(taskId, "queued-" + taskId, "", TaskPhase.QUEUED, 0,
++                    "{}", "actor", "test", null, null, now, now, 0));
++            return null;
++        });
++        insertScope("TASK", taskId, tenant, project);
++        return taskId;
++    }
++
+     private void insertScope(String resourceType, UUID resourceId, String tenant, String project) {
+         jdbc.update("""
+                 INSERT INTO resource_scopes(resource_type, resource_id, tenant_id, project_id, team, created_at, updated_at)
+--- /dev/null
++++ b/control-plane/src/main/java/io/agentteams/controlplane/scheduling/TenantFairQueue.java
+@@ -0,0 +1,80 @@
++package io.agentteams.controlplane.scheduling;
++
++import java.util.ArrayList;
++import java.util.Comparator;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Objects;
++import java.util.UUID;
++
++/** Deterministic weighted-deficit selection across tenant queues for a fixed number of Worker slots. */
++public final class TenantFairQueue {
++    private final Map<UUID, Integer> deficitByTenant = new HashMap<>();
++    private UUID nextTenant;
++
++    public synchronized List<UUID> select(List<TenantQueue> queues, int globalSlots) {
++        Objects.requireNonNull(queues, "queues");
++        if (globalSlots < 0) throw new IllegalArgumentException("globalSlots must not be negative");
++        List<TenantQueue> ordered = queues.stream().sorted(Comparator.comparing(TenantQueue::tenantId)).toList();
++        Map<UUID, TenantQueue> byTenant = new HashMap<>();
++        for (TenantQueue queue : ordered) {
++            if (byTenant.put(queue.tenantId(), queue) != null) {
++                throw new IllegalArgumentException("tenant queue must be unique");
++            }
++        }
++        deficitByTenant.keySet().retainAll(byTenant.keySet());
++        if (ordered.isEmpty()) {
++            nextTenant = null;
++            return List.of();
++        }
++        if (nextTenant == null || !byTenant.containsKey(nextTenant)) nextTenant = ordered.get(0).tenantId();
++        List<UUID> selected = new ArrayList<>(globalSlots);
++        int cursor = indexOf(ordered, nextTenant);
++        int idleVisits = 0;
++        while (selected.size() < globalSlots && idleVisits < ordered.size()) {
++            TenantQueue queue = ordered.get(cursor);
++            if (queue.tasks().isEmpty() || queue.activeAttempts() + selectedCount(selected, queue.tenantId())
++                    >= queue.maxActiveAttempts()) {
++                deficitByTenant.put(queue.tenantId(), 0);
++                cursor = (cursor + 1) % ordered.size();
++                nextTenant = ordered.get(cursor).tenantId();
++                idleVisits++;
++                continue;
++            }
++            int deficit = deficitByTenant.getOrDefault(queue.tenantId(), 0);
++            if (deficit == 0) deficit = queue.weight();
++            selected.add(queue.tenantId());
++            queue.tasks().remove(0);
++            deficitByTenant.put(queue.tenantId(), deficit - 1);
++            if (deficit - 1 == 0) {
++                cursor = (cursor + 1) % ordered.size();
++                nextTenant = ordered.get(cursor).tenantId();
++            }
++            idleVisits = selected.isEmpty() ? idleVisits + 1 : 0;
++        }
++        return List.copyOf(selected);
++    }
++
++    private static int indexOf(List<TenantQueue> queues, UUID tenantId) {
++        for (int i = 0; i < queues.size(); i++) if (queues.get(i).tenantId().equals(tenantId)) return i;
++        return 0;
++    }
++
++    private static long selectedCount(List<UUID> selected, UUID tenantId) {
++        return selected.stream().filter(tenantId::equals).count();
++    }
++
++    public record TenantQueue(UUID tenantId, int weight, int activeAttempts, int maxActiveAttempts,
++            List<UUID> tasks) {
++        public TenantQueue {
++            Objects.requireNonNull(tenantId, "tenantId");
++            Objects.requireNonNull(tasks, "tasks");
++            if (weight < 1 || weight > 100) throw new IllegalArgumentException("weight must be 1..100");
++            if (activeAttempts < 0 || maxActiveAttempts < 1 || activeAttempts > maxActiveAttempts) {
++                throw new IllegalArgumentException("invalid tenant active attempt quota");
++            }
++            tasks = new ArrayList<>(tasks);
++        }
++    }
++}
+--- /dev/null
++++ b/control-plane/src/test/java/io/agentteams/controlplane/scheduling/TenantFairQueueTest.java
+@@ -0,0 +1,54 @@
++package io.agentteams.controlplane.scheduling;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++
++import java.util.ArrayList;
++import java.util.List;
++import java.util.UUID;
++import org.junit.jupiter.api.Test;
++
++class TenantFairQueueTest {
++    private static final UUID TENANT_A = UUID.fromString("00000000-0000-0000-0000-000000000001");
++    private static final UUID TENANT_B = UUID.fromString("00000000-0000-0000-0000-000000000002");
++
++    @Test
++    void weightedDeficitRoundRobinPreservesLongTermTenantWeights() {
++        TenantFairQueue queue = new TenantFairQueue();
++        List<UUID> selected = new ArrayList<>();
++        for (int i = 0; i < 30; i++) {
++            selected.addAll(queue.select(List.of(tenant(TENANT_A, 2, 0, 100, 30),
++                    tenant(TENANT_B, 1, 0, 100, 30)), 1));
++        }
++        assertThat(selected).filteredOn(TENANT_A::equals).hasSize(20);
++        assertThat(selected).filteredOn(TENANT_B::equals).hasSize(10);
++    }
++
++    @Test
++    void activeQuotaAndGlobalSlotsBoundEachSelection() {
++        TenantFairQueue queue = new TenantFairQueue();
++        assertThat(queue.select(List.of(tenant(TENANT_A, 10, 2, 2, 10),
++                tenant(TENANT_B, 1, 0, 1, 10)), 2)).containsExactly(TENANT_B);
++    }
++
++    @Test
++    void skipsEmptyAndQuotaBlockedTenantsWithoutLosingOtherTenantCapacity() {
++        TenantFairQueue queue = new TenantFairQueue();
++        assertThat(queue.select(List.of(tenant(TENANT_A, 1, 0, 2, 0),
++                tenant(TENANT_B, 1, 2, 2, 5)), 3)).isEmpty();
++        assertThat(queue.select(List.of(tenant(TENANT_B, 1, 0, 2, 5)), 2))
++                .containsExactly(TENANT_B, TENANT_B);
++    }
++
++    @Test
++    void validatesTenantWeightsAndQuotaInputs() {
++        assertThatThrownBy(() -> tenant(TENANT_A, 0, 0, 1, 1)).isInstanceOf(IllegalArgumentException.class);
++        assertThatThrownBy(() -> tenant(TENANT_A, 1, 2, 1, 1)).isInstanceOf(IllegalArgumentException.class);
++    }
++
++    private static TenantFairQueue.TenantQueue tenant(UUID id, int weight, int active, int maximum, int queued) {
++        List<UUID> tasks = new ArrayList<>();
++        for (int i = 0; i < queued; i++) tasks.add(UUID.nameUUIDFromBytes((id + ":" + i).getBytes()));
++        return new TenantFairQueue.TenantQueue(id, weight, active, maximum, tasks);
++    }
++}

@@ -66,6 +66,8 @@ def require_tests(source: Path) -> None:
         "io.agentteams.controlplane.skill.SkillControllerTest": 6,
         "io.agentteams.controlplane.quality.JdbcArtifactQualityEventRepositoryTest": 6,
         "io.agentteams.controlplane.worker.WorkerDrainLifecycleTest": 9,
+        "io.agentteams.controlplane.persistence.FoundationRepositoryIT": 2,
+        "io.agentteams.controlplane.scheduling.TenantFairQueueTest": 4,
     }
     for class_name, expected_count in expected.items():
         report = reports / f"TEST-{class_name}.xml"
@@ -113,7 +115,7 @@ def main() -> int:
         run([
             "mvn", "--batch-mode", "--no-transfer-progress", "-P", "!colima-testcontainers",
             "-pl", "control-plane", "-am",
-            "-Dtest=ControlPlaneExecutionEventAdapterTest,JdbcTaskEventScopeGuardPostgresTest,ConfigDeploymentServiceTest,TeamDeploymentRepositoryTest,SkillControllerTest,JdbcArtifactQualityEventRepositoryTest,WorkerDrainLifecycleTest",
+            "-Dtest=ControlPlaneExecutionEventAdapterTest,JdbcTaskEventScopeGuardPostgresTest,ConfigDeploymentServiceTest,TeamDeploymentRepositoryTest,SkillControllerTest,JdbcArtifactQualityEventRepositoryTest,WorkerDrainLifecycleTest,FoundationRepositoryIT#doesNotSelectProjectWorkerWithAnActiveLease+concurrentProjectAssignmentsCannotCreateTwoActiveLeasesForOneWorker,TenantFairQueueTest",
             "-Dsurefire.failIfNoSpecifiedTests=false", "test",
         ], cwd=source)
         run([

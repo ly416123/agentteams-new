@@ -24,18 +24,24 @@
 
 ### 任务 1：盘点现有派发路径与锁边界
 
-- [ ] 标记 Task 进入持久队列、Attempt 创建、Agent/Worker 分配、Lease 创建及 NATS 发布的事务边界。
-- [ ] 查清当前固定槽位的并发度、失败重试、租约续期、任务取消和副作用幂等语义。
-- [ ] 画出每个可用槽位的最大活动 Attempt 数，以及可用于 Tenant fairness 的现有持久化字段。
-- [ ] 若无法原子领取 Task/Attempt/Lease，先记录最小 schema/事务变更，再进入调度实现。
+- [x] 标记 Task 进入持久队列、Attempt 创建、Agent/Worker 分配、Lease 创建及 NATS 发布的事务边界。
+- [x] 查清当前固定槽位的并发度、失败重试、租约续期、任务取消和副作用幂等语义。
+- [x] 画出每个可用槽位的最大活动 Attempt 数，以及可用于 Tenant fairness 的现有持久化字段。
+- [x] 若无法原子领取 Task/Attempt/Lease，先记录最小 schema/事务变更，再进入调度实现。
 
-**完成证据：** `control-plane-v0.1.5-task-event-scope.patch` 中的派发调用链、当前 Schema/SQL、现有 `WorkerDrainLifecycleTest`/TaskEvent 集成测试，以及一个能复现队列/租约状态的 Compose 场景。
+**完成证据（2026-11-06 固定上游源码 commit `0156f2c1fecdc868cb4a0f4f13fb068bb4162834`）：** `TaskAssignmentScheduler` 由单一 `scheduler_leases` 租约激活，每秒扫描；`TaskRepository.findIdsByPhase(QUEUED)` 当前按 `priority DESC, created_at ASC, id ASC` 全局分页，`queuedTaskOffset` 是内存偏移，仅避免无容量旧页长期挡住新任务，没有 Tenant fairness。单项分配在一个数据库事务中锁 Task、选 Agent、更新 Task phase、插入 Attempt/Assignment/Agent Lease，并通过 outbox 记录 `TaskAssigned`；Worker 侧 NATS 只是事件通知，DB 是队列和状态事实来源。`findReadyMatchingInTaskProject` 只按 Task/Worker Tenant+Project scope 匹配并锁定 READY Agent，没有排除有效活动 `agent_leases`；Team 路径则已调用 `countActiveForAgent`。因此目前 Project scope 批次可能把同一仍为 READY 的 Agent 连续分配给多个任务，槽位单活动 Attempt 不变量尚未被所有路径保证。Attempt Lease 使用配置时长（当前默认 30s）续租；`TaskAssignmentScheduler` 负责到期 Lease 恢复。可复用的持久 scope 是 `resource_scopes` 的 TASK/WORKER 行；tasks 本身没有 Tenant 列，Tenant queue 必须从 TASK scope 解析。缺 scope 的全局池回退只适用于匿名 local-dev，必须在共享池入口拒绝。现有 Testcontainers `FoundationRepositoryIT` 仅证明无 scope 全局回退和 scoped Tenant/Project 匹配，没有验证同 Agent 已有活动 Lease 时拒绝再次分配。
+
+调度算法实现前的先行容量修复：已按 TDD 在 pinned-source 隔离副本中先运行回归测试并复现失败（活动 Lease 时仍选中 READY Worker），然后在 Project scope Agent 选择 SQL 加入有效活动 Lease 检查；同一 Testcontainers PostgreSQL 测试确认活动 Lease 返回空，标记 RELEASED 后重新选中该 Worker。Team 路径已有活动 Lease 检查与 Agent 行锁。干净上游副本应用全部 Compose patch 的 `patch --dry-run` 已通过；本地 PostgreSQL 集成测试分别实跑 1/1 通过：活动 Lease/释放可重用，以及两个并发任务只产生一个活动 Lease。实现和两项 PostgreSQL 测试已纳入 Compose Control Plane hardening patch；新增纯 `TenantFairQueue` weighted deficit 轮询组件，测试锁定 A:B 权重 2:1 长期分配比例、活动上限、空队列/配额阻塞及非法配置。第一次算法测试暴露轮转游标导致的 1:1 退化，修正后 4/4 通过。纯组件和所有测试已纳入 Compose Control Plane hardening patch；构建门禁分别要求 PostgreSQL 两项、调度单测四项零失败/错误/跳过。调度算法尚未接入数据库 Candidate 加载/TaskAssignmentScheduler，也未实现持久化 Tenant 权重/并发/队列配额，不能称为端到端公平派发已完成。
 
 ### 任务 2：定义并测试租户公平调度器
 
-- [ ] 为公平轮转和 Tenant 活动上限写纯单元测试：权重高的 Tenant 长期获得相应更多机会，但任何 Tenant 都不能绕过并发上限。
+- [x] 为公平轮转和 Tenant 活动上限写纯单元测试：权重高的 Tenant 长期获得相应更多机会，但任何 Tenant 都不能绕过并发上限。
+- [ ] 将纯调度器接入 Control Plane 持久队列读取，确保每 Tenant 的候选列表按优先级/入队时间排序，并在租户资格耗尽后选择其他可运行租户。
+- [x] PostgreSQL 回归：Agent 已有活动 Lease 时 Project scope 选择为空；Lease 释放后重新可选。
+- [x] 两个 Task 并发分配的事务竞争测试：恰好一个任务被派发，且同一 Agent 只有一个活动 Lease。
 - [ ] 覆盖只有一个 Tenant、有多个 Tenant、空队列、过额任务和任务取消后额度释放。
-- [ ] 先实现确定性的加权公平轮询组件，不在算法内读取数据库或调用 NATS。
+- [x] 先实现确定性的加权 deficit 轮询组件，不在算法内读取数据库或调用 NATS。
+- [ ] 决定公平游标和 deficit 跨 Control Plane 重启的持久化策略；不能让进程重启长期偏向 UUID 排序靠前的 Tenant。
 - [ ] 通过调度端口把合格 Tenant 的下一条任务与全局可用槽位连接起来。
 
 **完成证据：** 将算法测试加入上游临时源码补丁，`build-control-plane-hardening.py` 的报告门禁精确检查测试数和零跳过；算法测试重复运行稳定，排队顺序和配额拒绝原因可解释。
@@ -43,6 +49,7 @@
 ### 任务 3：实现持久化原子领取和配额
 
 - [ ] 设计带迁移的 Tenant 调度配置/额度持久化；为权重、最大活动 Attempt、最大队列深度设置范围校验。
+- [ ] `TaskRepository.findIdsByPhase` 在共享 Worker 模式拒绝无 TASK scope 的任务；只允许无认证的 local-dev 继续使用全局池回退。
 - [ ] 为任务领取、Attempt、Lease 和配额计数设计一个可回滚数据库事务；并发实例通过 `FOR UPDATE SKIP LOCKED` 或等价行锁避免双领取。
 - [ ] 对 Task/Attempt 的 Tenant/Project/Team scope 做服务端解析；不接受 Worker 提供的租户身份覆盖调度记录。
 - [ ] 覆盖取消、重试、Attempt 终态、Worker 失联/Lease 到期时配额释放和幂等恢复。
