@@ -66,11 +66,11 @@ jobs:
           report = ET.parse(
               "credential-proxy/target/surefire-reports/TEST-io.agentteams.credentialproxy.AttemptExecutionContextResolverTest.xml"
           ).getroot()
-          assert report.attrib["tests"] == "9", report.attrib
+          assert report.attrib["tests"] == "12", report.attrib
           assert report.attrib["skipped"] == "0", report.attrib
           assert report.attrib["failures"] == "0", report.attrib
           assert report.attrib["errors"] == "0", report.attrib
-          print("All 9 Attempt context authorization tests executed successfully.")
+          print("All 12 Attempt context authorization tests executed successfully.")
           PY
 
       - name: Require credential proxy database boundary tests to execute
@@ -81,11 +81,11 @@ jobs:
           report = ET.parse(
               "credential-proxy/target/surefire-reports/TEST-io.agentteams.credentialproxy.JdbcActiveAttemptRepositoryPostgresTest.xml"
           ).getroot()
-          assert report.attrib["tests"] == "9", report.attrib
+          assert report.attrib["tests"] == "10", report.attrib
           assert report.attrib["skipped"] == "0", report.attrib
           assert report.attrib["failures"] == "0", report.attrib
           assert report.attrib["errors"] == "0", report.attrib
-          print("All 9 PostgreSQL credential proxy boundary tests executed successfully.")
+          print("All 10 PostgreSQL credential proxy boundary tests executed successfully.")
           PY
 
       - name: Require credential source security tests to execute
