@@ -81,11 +81,26 @@ jobs:
           report = ET.parse(
               "credential-proxy/target/surefire-reports/TEST-io.agentteams.credentialproxy.JdbcActiveAttemptRepositoryPostgresTest.xml"
           ).getroot()
-          assert report.attrib["tests"] == "10", report.attrib
+          assert report.attrib["tests"] == "13", report.attrib
           assert report.attrib["skipped"] == "0", report.attrib
           assert report.attrib["failures"] == "0", report.attrib
           assert report.attrib["errors"] == "0", report.attrib
-          print("All 10 PostgreSQL credential proxy boundary tests executed successfully.")
+          print("All 13 PostgreSQL credential proxy boundary tests executed successfully.")
+          PY
+
+      - name: Require Attempt credential handoff endpoint tests to execute
+        run: |
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+
+          report = ET.parse(
+              "credential-proxy/target/surefire-reports/TEST-io.agentteams.credentialproxy.AttemptCredentialIssueControllerTest.xml"
+          ).getroot()
+          assert report.attrib["tests"] == "3", report.attrib
+          assert report.attrib["skipped"] == "0", report.attrib
+          assert report.attrib["failures"] == "0", report.attrib
+          assert report.attrib["errors"] == "0", report.attrib
+          print("All three Attempt credential handoff endpoint tests executed successfully.")
           PY
 
       - name: Require credential source security tests to execute

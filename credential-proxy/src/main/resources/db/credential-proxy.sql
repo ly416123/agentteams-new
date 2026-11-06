@@ -38,6 +38,19 @@ CREATE UNIQUE INDEX IF NOT EXISTS attempt_model_proxy_credentials_one_live_token
     WHERE revoked_at IS NULL;
 REVOKE ALL ON TABLE public.attempt_model_proxy_credentials FROM PUBLIC;
 
+-- Provider references are provisioned by deployment administration. Workers
+-- cannot choose or enumerate them. The issuer resolves one by TASK scope.
+CREATE TABLE IF NOT EXISTS public.tenant_model_proxy_credential_refs (
+    tenant_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    team_id TEXT NOT NULL,
+    model_credential_ref TEXT NOT NULL,
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    PRIMARY KEY (tenant_id, project_id, team_id),
+    CHECK (length(model_credential_ref) BETWEEN 1 AND 512)
+);
+REVOKE ALL ON TABLE public.tenant_model_proxy_credential_refs FROM PUBLIC;
+
 GRANT USAGE ON SCHEMA public TO credential_proxy_query_owner, credential_proxy_query;
 GRANT CREATE ON SCHEMA public TO credential_proxy_query_owner;
 GRANT SELECT (id, task_id, lease_id, phase, lease_expires_at)
@@ -51,18 +64,23 @@ GRANT SELECT (resource_type, resource_id, tenant_id, project_id, team)
 GRANT SELECT (id, session_id, agent_id, tenant_id, project_id, team_id, token_sha256,
               model_credential_ref, expires_at, revoked_at)
     ON TABLE public.worker_model_proxy_credentials TO credential_proxy_query_owner;
-GRANT SELECT (id, agent_id, expires_at, revoked_at)
+GRANT SELECT (id, agent_id, token_sha256, expires_at, revoked_at)
     ON TABLE public.agent_sessions TO credential_proxy_query_owner;
 GRANT SELECT (agent_id, tenant_id, project_id, team_id)
     ON TABLE public.worker_enrollment_agent_scopes TO credential_proxy_query_owner;
 GRANT SELECT (id, agent_id, task_id, attempt_id, lease_id, token_sha256,
               model_credential_ref, expires_at, revoked_at)
     ON TABLE public.attempt_model_proxy_credentials TO credential_proxy_query_owner;
+GRANT SELECT (tenant_id, project_id, team_id, model_credential_ref, enabled)
+    ON TABLE public.tenant_model_proxy_credential_refs TO credential_proxy_query_owner;
+GRANT INSERT, UPDATE (revoked_at) ON TABLE public.attempt_model_proxy_credentials
+    TO credential_proxy_query_owner;
 
 ALTER TABLE public.worker_model_proxy_credentials ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.agent_sessions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.worker_enrollment_agent_scopes ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.attempt_model_proxy_credentials ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.tenant_model_proxy_credential_refs ENABLE ROW LEVEL SECURITY;
 
 DROP POLICY IF EXISTS credential_proxy_owner_model_credentials_read
     ON public.worker_model_proxy_credentials;
@@ -79,6 +97,20 @@ DROP POLICY IF EXISTS credential_proxy_owner_attempt_credentials_read
     ON public.attempt_model_proxy_credentials;
 CREATE POLICY credential_proxy_owner_attempt_credentials_read
     ON public.attempt_model_proxy_credentials FOR SELECT TO credential_proxy_query_owner USING (true);
+DROP POLICY IF EXISTS credential_proxy_owner_attempt_credentials_insert
+    ON public.attempt_model_proxy_credentials;
+CREATE POLICY credential_proxy_owner_attempt_credentials_insert
+    ON public.attempt_model_proxy_credentials FOR INSERT TO credential_proxy_query_owner
+    WITH CHECK (true);
+DROP POLICY IF EXISTS credential_proxy_owner_attempt_credentials_update
+    ON public.attempt_model_proxy_credentials;
+CREATE POLICY credential_proxy_owner_attempt_credentials_update
+    ON public.attempt_model_proxy_credentials FOR UPDATE TO credential_proxy_query_owner
+    USING (true) WITH CHECK (true);
+DROP POLICY IF EXISTS credential_proxy_owner_tenant_credential_refs_read
+    ON public.tenant_model_proxy_credential_refs;
+CREATE POLICY credential_proxy_owner_tenant_credential_refs_read
+    ON public.tenant_model_proxy_credential_refs FOR SELECT TO credential_proxy_query_owner USING (true);
 
 -- Retire the older caller-scoped overload without dropping it: external
 -- database objects may depend on its signature during an in-place upgrade.
@@ -378,6 +410,122 @@ ALTER FUNCTION public.credential_proxy_authenticate_v2(TEXT)
     OWNER TO credential_proxy_query_owner;
 REVOKE ALL ON FUNCTION public.credential_proxy_authenticate_v2(TEXT) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.credential_proxy_authenticate_v2(TEXT)
+    TO credential_proxy_query;
+
+-- A Gateway-authenticated Worker asks for its active Attempt credential only
+-- after receiving TaskAssigned. The bearer session is never stored here: only
+-- its hash is checked, and only the new Attempt token hash is persisted.
+CREATE OR REPLACE FUNCTION public.credential_proxy_issue_attempt(
+    p_worker_session_sha256 TEXT,
+    p_task_id UUID,
+    p_attempt_id UUID,
+    p_lease_id UUID,
+    p_token_sha256 TEXT,
+    p_credential_id UUID,
+    p_ttl_seconds INTEGER
+)
+RETURNS TABLE (
+    credential_id UUID,
+    agent_id UUID,
+    tenant_id TEXT,
+    project_id TEXT,
+    team_id TEXT,
+    model_credential_ref TEXT,
+    expires_at TIMESTAMPTZ
+)
+LANGUAGE plpgsql
+VOLATILE
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    v_agent_id UUID;
+    v_tenant_id TEXT;
+    v_project_id TEXT;
+    v_team_id TEXT;
+    v_model_credential_ref TEXT;
+    v_lease_expires_at TIMESTAMPTZ;
+    v_attempt_expires_at TIMESTAMPTZ;
+    v_expires_at TIMESTAMPTZ;
+BEGIN
+    IF p_worker_session_sha256 IS NULL OR p_token_sha256 IS NULL OR p_credential_id IS NULL
+       OR p_task_id IS NULL OR p_attempt_id IS NULL OR p_lease_id IS NULL
+       OR p_worker_session_sha256 !~ '^[0-9a-fA-F]{64}$'
+       OR p_token_sha256 !~ '^[0-9a-fA-F]{64}$'
+       OR p_ttl_seconds IS NULL OR p_ttl_seconds < 1 OR p_ttl_seconds > 300 THEN
+        RETURN;
+    END IF;
+
+    -- Serialize retries for the same capability without granting table locks
+    -- or write access on assignment and lease tables to this function owner.
+    PERFORM pg_advisory_xact_lock(hashtextextended(p_attempt_id::TEXT || ':' || p_lease_id::TEXT, 0));
+
+    SELECT session.agent_id INTO v_agent_id
+      FROM public.agent_sessions AS session
+     WHERE session.token_sha256 = p_worker_session_sha256::CHAR(64)
+       AND session.revoked_at IS NULL
+       AND session.expires_at > statement_timestamp();
+    IF v_agent_id IS NULL THEN RETURN; END IF;
+
+    SELECT task_scope.tenant_id, task_scope.project_id, task_scope.team,
+           credential_ref.model_credential_ref, lease.expires_at, attempt.lease_expires_at
+      INTO v_tenant_id, v_project_id, v_team_id, v_model_credential_ref,
+           v_lease_expires_at, v_attempt_expires_at
+      FROM public.task_assignments AS assignment
+      JOIN public.task_attempts AS attempt
+        ON attempt.id = assignment.attempt_id AND attempt.task_id = assignment.task_id
+      JOIN public.agent_leases AS lease
+        ON lease.id = attempt.lease_id AND lease.task_attempt_id = attempt.id
+       AND lease.agent_id = assignment.agent_id
+      JOIN public.resource_scopes AS task_scope
+        ON task_scope.resource_type = 'TASK' AND task_scope.resource_id = assignment.task_id
+      JOIN public.tenant_model_proxy_credential_refs AS credential_ref
+        ON credential_ref.tenant_id = task_scope.tenant_id
+       AND credential_ref.project_id = task_scope.project_id
+       AND credential_ref.team_id = task_scope.team
+       AND credential_ref.enabled
+     WHERE assignment.task_id = p_task_id
+       AND assignment.attempt_id = p_attempt_id
+       AND assignment.agent_id = v_agent_id
+       AND assignment.phase IN ('ASSIGNED', 'ACCEPTED', 'RUNNING')
+       AND assignment.released_at IS NULL
+       AND attempt.phase IN ('ASSIGNED', 'ACCEPTED', 'RUNNING')
+       AND attempt.lease_expires_at > statement_timestamp()
+       AND attempt.lease_id = p_lease_id
+       AND lease.id = p_lease_id
+       AND lease.status = 'ACTIVE'
+       AND lease.released_at IS NULL
+       AND lease.expires_at > statement_timestamp();
+    IF v_tenant_id IS NULL THEN RETURN; END IF;
+
+    v_expires_at := LEAST(statement_timestamp() + make_interval(secs => p_ttl_seconds),
+                           v_lease_expires_at, v_attempt_expires_at);
+    IF v_expires_at <= statement_timestamp() THEN RETURN; END IF;
+
+    UPDATE public.attempt_model_proxy_credentials AS credential
+       SET revoked_at = statement_timestamp()
+     WHERE credential.attempt_id = p_attempt_id
+       AND credential.lease_id = p_lease_id
+       AND credential.revoked_at IS NULL;
+
+    INSERT INTO public.attempt_model_proxy_credentials (
+        id, agent_id, task_id, attempt_id, lease_id, token_sha256,
+        model_credential_ref, expires_at
+    ) VALUES (
+        p_credential_id, v_agent_id, p_task_id, p_attempt_id, p_lease_id,
+        p_token_sha256::CHAR(64), v_model_credential_ref, v_expires_at
+    );
+
+    RETURN QUERY SELECT p_credential_id, v_agent_id, v_tenant_id, v_project_id,
+                        v_team_id, v_model_credential_ref, v_expires_at;
+END;
+$$;
+
+ALTER FUNCTION public.credential_proxy_issue_attempt(TEXT, UUID, UUID, UUID, TEXT, UUID, INTEGER)
+    OWNER TO credential_proxy_query_owner;
+REVOKE ALL ON FUNCTION public.credential_proxy_issue_attempt(TEXT, UUID, UUID, UUID, TEXT, UUID, INTEGER)
+    FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.credential_proxy_issue_attempt(TEXT, UUID, UUID, UUID, TEXT, UUID, INTEGER)
     TO credential_proxy_query;
 
 CREATE OR REPLACE FUNCTION public.credential_proxy_revalidate_v2(p_proxy_credential_id UUID)

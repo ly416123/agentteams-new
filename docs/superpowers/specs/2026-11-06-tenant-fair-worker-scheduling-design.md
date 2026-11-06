@@ -30,9 +30,9 @@ Attempt 心跳和 Lease 到期用于发现失联 Worker；超时策略区分可�
 
 ### Attempt capability 实现进度
 
-Credential Proxy 已增加第二种身份模式的本地实现：原 Enrollment 凭据继续绑定 Tenant/Project/Team；Attempt 凭据绑定 Agent + Attempt + Lease，数据库从 TASK `resource_scopes` 派生 Tenant/Project/Team，并在每次代理鉴权及流式转发前确认同一活动 Assignment/Attempt/Lease。数据库仅保留新 token 的 SHA-256，代理上下文有效期不超过 Lease。对应 PostgreSQL Testcontainers 用例已实际运行通过。
+Credential Proxy 已增加第二种身份模式：原 Enrollment 凭据继续绑定 Tenant/Project/Team；Attempt 凭据绑定 Agent + Attempt + Lease，数据库从 TASK `resource_scopes` 派生 Tenant/Project/Team，并在每次代理鉴权及流式转发前确认同一活动 Assignment/Attempt/Lease。新增内部签发 API，使用 Gateway session hash 验证 Agent，只允许对该 Agent 当前活动的 Attempt 签发；Provider credential ref 从部署侧可信映射解析，Worker 不能自报 Tenant 或凭据引用。数据库仅保留新 token 的 SHA-256，Attempt token 只能在 Lease 有效时使用，签发时到期时间不晚于当前 Lease。Credential Proxy 全量 54 项测试通过（13 项 PostgreSQL 用例、3 项签发 API 用例，零跳过）。
 
-这只是 Credential Proxy 的一段能力，**尚不代表共享 Worker 已端到端打通**。当前仍缺 Control Plane 在领取任务事务中签发/轮换该 capability、Worker 安全领取 capability 的传输协议（不能把明文 bearer token 写入普通持久 Outbox）、TaskEvent/Artifact/workspace 全链路验证 Attempt/Lease、按 Task Tenant 选择可信 Provider credential ref，以及 Attempt 结束后的上下文/workspace 清理。以上完成并通过双租户真实 Worker 验收前，禁止把 Worker 的长期 scope 检查移除，也不能把当前 Tenant-bound Worker 宣称为 Tenant-neutral 共享槽位。
+这只是 Credential Proxy 的一段能力，**尚不代表共享 Worker 已端到端打通**。当前仍缺 Control Plane 分配事务关联和 Worker 领取/续领协议（不能把明文 bearer token 写入普通持久 Outbox）、受保护的内部传输、TaskEvent/Artifact/workspace 全链路验证 Attempt/Lease，以及 Attempt 结束后的上下文/workspace 清理。长任务 token 到期时间不超过签发时 Lease；Worker 尚未实现续领，因此 Lease 续期后的长任务模型调用尚未打通。Provider credential ref 映射也必须由部署方可信配置。以上完成并通过双租户真实 Worker 验收前，禁止把 Worker 的长期 scope 检查移除，也不能把当前 Tenant-bound Worker 宣称为 Tenant-neutral 共享槽位。
 
 ## 并发运行模型
 
