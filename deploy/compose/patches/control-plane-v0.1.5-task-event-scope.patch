@@ -1301,3 +1301,65 @@ index b022df1..8ae589f 100644
      }
 
      private WorkerOperation invokeActivate(UUID agentId, long expectedVersion, String idempotencyKey) {
+diff --git a/control-plane/src/test/java/io/agentteams/controlplane/worker/WorkerDrainLifecycleTest.java b/control-plane/src/test/java/io/agentteams/controlplane/worker/WorkerDrainLifecycleTest.java
+index 8ae589f..c046454 100644
+--- a/control-plane/src/test/java/io/agentteams/controlplane/worker/WorkerDrainLifecycleTest.java
++++ b/control-plane/src/test/java/io/agentteams/controlplane/worker/WorkerDrainLifecycleTest.java
+@@ -9,6 +9,12 @@ import io.agentteams.controlplane.persistence.FoundationPersistenceService;
+ import io.agentteams.controlplane.persistence.TaskAttemptRecord;
+ import io.agentteams.controlplane.persistence.TaskRecord;
+ import io.agentteams.controlplane.service.WorkerLifecycleConflictException;
++import io.agentteams.controlplane.service.TaskAssignmentService;
++import io.agentteams.controlplane.security.AuthorizationException;
++import io.agentteams.controlplane.security.AuthorizationService;
++import io.agentteams.controlplane.security.Principal;
++import io.agentteams.controlplane.security.PrincipalContext;
++import io.agentteams.controlplane.security.ResourceScopeRepository;
+ import io.agentteams.domain.agent.AgentPhase;
+ import io.agentteams.domain.task.TaskPhase;
+ import java.lang.reflect.InvocationTargetException;
+@@ -128,6 +134,44 @@ class WorkerDrainLifecycleTest {
+                 .hasMessage("WORKER_NOT_DRAINED");
+     }
+
++    @Test
++    void drainingWorkerCannotReceiveAnotherTaskAssignment() {
++        UUID agentId = readyAgent();
++        UUID taskId = UUID.randomUUID();
++        operations.drain(agentId, 0, "drain-before-assignment-1");
++        persistence.inTransaction(tx -> {
++            tx.tasks().insert(new TaskRecord(taskId, "queued", "", TaskPhase.QUEUED, 0, "{}", "actor", "test",
++                    null, null, NOW, NOW, 0));
++            return null;
++        });
++
++        assertThatThrownBy(() -> new TaskAssignmentService(persistence, Duration.ofMinutes(2))
++                .queueReadyTask(taskId, NOW))
++                .isInstanceOf(IllegalStateException.class)
++                .hasMessage("no READY agent matches task capabilities");
++        assertThat(persistence.findTask(taskId)).get().extracting(TaskRecord::phase).isEqualTo(TaskPhase.QUEUED);
++    }
++
++    @Test
++    void refusesActivationWhenCallerCannotSeeTheWorkerTenantScope() {
++        UUID agentId = UUID.randomUUID();
++        ResourceScopeRepository scopes = org.mockito.Mockito.mock(ResourceScopeRepository.class);
++        org.mockito.Mockito.doThrow(new AuthorizationException("resource is outside caller project"))
++                .when(scopes).requireVisible("WORKER", agentId);
++        WorkerOperationService scoped = new WorkerOperationService(persistence,
++                java.time.Clock.fixed(NOW, java.time.ZoneOffset.UTC), Duration.ofMinutes(2), scopes);
++        PrincipalContext.set(new Principal("tenant-b-user",
++                new AuthorizationService.Scope("tenant-b", "project-b", "team-b"), java.util.Set.of()));
++        try {
++            assertThatThrownBy(() -> scoped.activate(agentId, 1, "cross-tenant-activate-1"))
++                    .isInstanceOf(AuthorizationException.class)
++                    .hasMessage("resource is outside caller project");
++            org.mockito.Mockito.verify(scopes).requireVisible("WORKER", agentId);
++        } finally {
++            PrincipalContext.clear();
++        }
++    }
++
+     private UUID readyAgent() {
+         UUID id = UUID.randomUUID();
+         persistence.inTransaction(tx -> {

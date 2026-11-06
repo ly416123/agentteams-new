@@ -65,7 +65,7 @@ def require_tests(source: Path) -> None:
         "io.agentteams.controlplane.team.TeamDeploymentRepositoryTest": 4,
         "io.agentteams.controlplane.skill.SkillControllerTest": 6,
         "io.agentteams.controlplane.quality.JdbcArtifactQualityEventRepositoryTest": 6,
-        "io.agentteams.controlplane.worker.WorkerDrainLifecycleTest": 6,
+        "io.agentteams.controlplane.worker.WorkerDrainLifecycleTest": 8,
     }
     for class_name, expected_count in expected.items():
         report = reports / f"TEST-{class_name}.xml"
