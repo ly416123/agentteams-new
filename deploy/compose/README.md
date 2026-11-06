@@ -114,10 +114,20 @@ Gateway Token 和模型代理 Token 互不通用；数据库只存两者的 SHA-
 
 撤销会阻止后续 Gateway 握手，并同步撤销关联的模型代理 Token；v0.1.5 不会主动断开已建立的 Gateway 连接。每个活动槽位必须使用不同的代理 Token 文件；多个同 Tenant/Project 的 Worker 可引用同一个受 scope 保护的 Provider 凭据。
 
+### 安全重启固定槽位
+
+使用具备该 Worker Project scope 的 OIDC 用户 access token。将 token 保存到当前用户拥有且权限为 `0600` 的文件，然后在 `deploy/compose` 目录运行：
+
+```sh
+python3 ./restart-worker.py 1 /secure/path/control-plane-access-token --env-file .env
+```
+
+脚本先调用 Control Plane Drain 并等待 operation 进入 `DRAINED`；到达前不会停止 Worker。随后只重启对应 `worker-N` 固定槽位，等待 Gateway 重新握手，再通过 Activate 恢复同一 Agent 为 READY。脚本会打印 Drain/Activate operation ID，不会把 token 写入参数、日志或容器环境。Drain 或 Gateway 重连超时会安全退出并保留 Worker 的 DRAINING 状态，需先查看 operation 状态，再恢复流程；不要用 `TERMINATE` 替代。升级时先在 `.env` 锁定新 Worker image digest 并拉取镜像，再执行该命令。
+
 ## 状态与运维
 
 - PostgreSQL 与 NATS JetStream 数据存放于命名卷 `postgres-data`、`nats-data`。
-- 备份前先暂停新任务提交，并确认没有运行中 Attempt；随后停止全部任务生产者/消费者，保持整个备份窗口没有 Task 或 Artifact 写入。当前 POC 没有专用 Worker drain 命令，需由操作者确认 Attempt 已排空。`backup-state.sh` 会检查所选 Compose project，只允许 PostgreSQL、NATS 和可选 SeaweedFS 运行；发现其他运行服务时，会在创建备份目录前拒绝执行。该检查只覆盖当前 Compose project，仍需确认外部 Task/Artifact 写入方已暂停。脚本生成 PostgreSQL custom dump、4 个 JetStream 持久 Stream 快照；启用对象存储时，还会停止 SeaweedFS 并归档 `seaweedfs-data` 卷。备份目录及文件权限收紧为 `0700/0600`，包含敏感租户数据；转移到异机后仍需加密和限制访问。
+- 备份前先暂停新任务提交，并确认没有运行中 Attempt；随后停止全部任务生产者/消费者，保持整个备份窗口没有 Task 或 Artifact 写入。可以先逐槽位调用 `restart-worker.py` 的 Drain 流程，但备份窗口仍需停止所有 Worker 和应用写入方。`backup-state.sh` 会检查所选 Compose project，只允许 PostgreSQL、NATS 和可选 SeaweedFS 运行；发现其他运行服务时，会在创建备份目录前拒绝执行。该检查只覆盖当前 Compose project，仍需确认外部 Task/Artifact 写入方已暂停。脚本生成 PostgreSQL custom dump、4 个 JetStream 持久 Stream 快照；启用对象存储时，还会停止 SeaweedFS 并归档 `seaweedfs-data` 卷。备份目录及文件权限收紧为 `0700/0600`，包含敏感租户数据；转移到异机后仍需加密和限制访问。
 
 ```sh
 docker compose --env-file .env --profile secure-api --profile worker-pool stop \

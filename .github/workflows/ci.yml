@@ -133,6 +133,7 @@ jobs:
           bash -n deploy/compose/*.sh
           python3 -m unittest \
             verification.test_compose_fixed_worker_capacity \
+            verification.test_compose_worker_restart \
             verification.test_compose_oidc_url_contract \
             verification.test_compose_control_plane_database_roles \
             verification.test_fixed_capacity_estimator \
