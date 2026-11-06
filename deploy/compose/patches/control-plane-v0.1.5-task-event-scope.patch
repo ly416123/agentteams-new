@@ -1071,3 +1071,233 @@ index 0000000..b022df1
 +        }
 +    }
 +}
+diff --git a/control-plane/src/main/java/io/agentteams/controlplane/api/AgentController.java b/control-plane/src/main/java/io/agentteams/controlplane/api/AgentController.java
+index 5955da6..fe2458e 100644
+--- a/control-plane/src/main/java/io/agentteams/controlplane/api/AgentController.java
++++ b/control-plane/src/main/java/io/agentteams/controlplane/api/AgentController.java
+@@ -91,6 +91,17 @@ public final class AgentController {
+         return ResponseEntity.accepted().body(WorkerOperationResponse.from(operation));
+     }
+
++    @PostMapping("/{id}/operations/activate")
++    public ResponseEntity<WorkerOperationResponse> requestActivate(
++            @PathVariable UUID id,
++            @RequestHeader(value = IDEMPOTENCY_HEADER, required = false) String idempotencyKey,
++            @RequestBody LifecycleRequest request, @RequestParam(required = false) String projectId) {
++        requireIdempotencyKey(idempotencyKey);
++        requireProjectScope(projectId);
++        WorkerOperation operation = operations().activate(id, expectedVersion(request), idempotencyKey);
++        return ResponseEntity.ok(WorkerOperationResponse.from(operation));
++    }
++
+     @PostMapping("/{id}/operations/rollout")
+     public ResponseEntity<WorkerOperationResponse> requestRollout(
+             @PathVariable UUID id,
+diff --git a/control-plane/src/main/java/io/agentteams/controlplane/worker/WorkerOperationRepository.java b/control-plane/src/main/java/io/agentteams/controlplane/worker/WorkerOperationRepository.java
+index 350907b..300b921 100644
+--- a/control-plane/src/main/java/io/agentteams/controlplane/worker/WorkerOperationRepository.java
++++ b/control-plane/src/main/java/io/agentteams/controlplane/worker/WorkerOperationRepository.java
+@@ -108,6 +108,30 @@ public final class WorkerOperationRepository {
+                 this::map, agentId).stream().findFirst();
+     }
+
++    public List<UUID> findPendingDrainAgentIds() {
++        return jdbc.query("SELECT agent_id FROM worker_operations WHERE type = 'DRAIN' "
++                + "AND status IN ('PENDING', 'RUNNING') ORDER BY agent_id, created_at, id",
++                (rs, row) -> rs.getObject(1, UUID.class));
++    }
++
++    public Optional<WorkerOperation> findPendingDrainForUpdate(UUID agentId) {
++        return jdbc.query(select() + " WHERE agent_id = ? AND type = 'DRAIN' "
++                + "AND status IN ('PENDING', 'RUNNING') ORDER BY created_at DESC, id DESC LIMIT 1 FOR UPDATE",
++                this::map, agentId).stream().findFirst();
++    }
++
++    public Optional<WorkerOperation> findLatestDrain(UUID agentId) {
++        return jdbc.query(select() + " WHERE agent_id = ? AND type = 'DRAIN' "
++                + "ORDER BY created_at DESC, id DESC LIMIT 1", this::map, agentId).stream().findFirst();
++    }
++
++    public boolean isGatewayOnline(UUID agentId, Instant since) {
++        return !jdbc.queryForList("SELECT agent_id FROM gateway_agent_state "
++                + "WHERE agent_id = ? AND presence = 'ONLINE' AND connection_id IS NOT NULL "
++                + "AND last_seen_at >= ? FOR UPDATE", UUID.class, agentId,
++                JdbcSupport.timestamp(since)).isEmpty();
++    }
++
+     public Optional<WorkerOperation> findActiveByAgentForUpdate(UUID agentId, Instant now) {
+         return jdbc.query(select() + " WHERE agent_id = ? AND status IN ('PENDING', 'RUNNING')"
+                         + " AND lease_expires_at > ? ORDER BY created_at, id LIMIT 1 FOR UPDATE",
+@@ -125,7 +149,7 @@ public final class WorkerOperationRepository {
+     public Optional<WorkerOperation> findActiveLifecycleByAgent(UUID agentId, Instant now) {
+         return jdbc.query(select() + " WHERE agent_id = ?"
+                         + " AND status IN ('PENDING', 'RUNNING')"
+-                        + " AND lease_expires_at > ? ORDER BY created_at, id LIMIT 1",
++                        + " AND (type = 'DRAIN' OR lease_expires_at > ?) ORDER BY created_at, id LIMIT 1",
+                 this::map, agentId, JdbcSupport.timestamp(now)).stream().findFirst();
+     }
+
+@@ -137,7 +161,8 @@ public final class WorkerOperationRepository {
+
+     public List<WorkerOperation> findExpiredForUpdate(Instant now) {
+         return jdbc.query(select() + " WHERE status IN ('PENDING', 'RUNNING')"
+-                        + " AND lease_expires_at <= ? ORDER BY lease_expires_at, id FOR UPDATE SKIP LOCKED",
++                        + " AND type <> 'DRAIN' AND lease_expires_at <= ? "
++                        + "ORDER BY lease_expires_at, id FOR UPDATE SKIP LOCKED",
+                 this::map, JdbcSupport.timestamp(now));
+     }
+
+diff --git a/control-plane/src/main/java/io/agentteams/controlplane/worker/WorkerOperationService.java b/control-plane/src/main/java/io/agentteams/controlplane/worker/WorkerOperationService.java
+index 35f2f06..efb4dea 100644
+--- a/control-plane/src/main/java/io/agentteams/controlplane/worker/WorkerOperationService.java
++++ b/control-plane/src/main/java/io/agentteams/controlplane/worker/WorkerOperationService.java
+@@ -61,6 +61,62 @@ public final class WorkerOperationService {
+                 correlationOrRandom());
+     }
+
++    /** Re-enables a drained, still registered worker after the Gateway reconnects. */
++    public WorkerOperation activate(UUID agentId, long expectedAgentVersion, String idempotencyKey) {
++        Objects.requireNonNull(agentId, "agentId");
++        requireKey(idempotencyKey);
++        requireVisible(agentId);
++        Instant now = clock.instant();
++        return persistence.inTransaction(tx -> {
++            var existing = tx.workerOperations().findByAgentAndIdempotencyKey(agentId, idempotencyKey);
++            if (existing.isPresent()) {
++                assertSameActivation(existing.get(), expectedAgentVersion);
++                return existing.get();
++            }
++            AgentRecord current = tx.agents().findByIdForUpdate(agentId)
++                    .orElseThrow(() -> new ResourceNotFoundException("agent", agentId));
++            existing = tx.workerOperations().findByAgentAndIdempotencyKey(agentId, idempotencyKey);
++            if (existing.isPresent()) {
++                assertSameActivation(existing.get(), expectedAgentVersion);
++                return existing.get();
++            }
++            if (current.version() != expectedAgentVersion) {
++                throw new io.agentteams.controlplane.persistence.OptimisticLockFailure(
++                        "agent", agentId, expectedAgentVersion, current.version());
++            }
++            if (current.phase() != AgentPhase.DRAINING) {
++                throw new WorkerLifecycleConflictException("WORKER_NOT_DRAINING");
++            }
++            if (tx.agentLeases().countActiveForAgent(agentId) > 0) {
++                throw new WorkerLifecycleConflictException("WORKER_HAS_ACTIVE_TASKS");
++            }
++            WorkerOperation drain = tx.workerOperations().findLatestDrain(agentId)
++                    .orElseThrow(() -> new WorkerLifecycleConflictException("WORKER_NOT_DRAINED"));
++            if (drain.status() != WorkerOperationStatus.DRAINED) {
++                throw new WorkerLifecycleConflictException("WORKER_NOT_DRAINED");
++            }
++            if (!tx.workerOperations().isGatewayOnline(agentId, now.minusSeconds(30))) {
++                throw new WorkerLifecycleConflictException("WORKER_NOT_ONLINE");
++            }
++            tx.agents().updatePhase(agentId, AgentPhase.READY, expectedAgentVersion, now);
++            WorkerOperation activated = new WorkerOperation(UUID.randomUUID(), agentId, WorkerOperationType.ACTIVATE,
++                    WorkerOperationStatus.SUCCEEDED, null, null, null, null, "{}", idempotencyKey,
++                    expectedAgentVersion, PrincipalContext.actorOr("control-plane"), null, null,
++                    correlationOrRandom(), now, now, 0);
++            tx.workerOperations().insert(activated);
++            FoundationPersistenceService.appendEvent(tx, "agent", agentId, "WorkerActivated",
++                    "{\"operationId\":\"" + activated.id() + "\"}", now, expectedAgentVersion + 1);
++            return activated;
++        });
++    }
++
++    private static void assertSameActivation(WorkerOperation operation, long expectedAgentVersion) {
++        if (operation.type() != WorkerOperationType.ACTIVATE
++                || operation.expectedAgentVersion() != expectedAgentVersion) {
++            throw new IdempotencyConflictException(operation.idempotencyKey(), "worker activation");
++        }
++    }
++
+     public WorkerOperation rollout(UUID agentId, WorkerRolloutRequest request) {
+         Objects.requireNonNull(request, "request");
+         return request(agentId, WorkerOperationType.ROLLOUT, request.expectedAgentVersion(),
+@@ -349,7 +405,8 @@ public final class WorkerOperationService {
+             var active = tx.workerOperations().findActiveByAgentForUpdate(agentId);
+             if (active.isPresent()) {
+                 WorkerOperation inProgress = active.get();
+-                if (inProgress.leaseExpiresAt() != null && !now.isBefore(inProgress.leaseExpiresAt())) {
++                if (inProgress.type() != WorkerOperationType.DRAIN && inProgress.leaseExpiresAt() != null
++                        && !now.isBefore(inProgress.leaseExpiresAt())) {
+                     WorkerOperation expired = tx.workerOperations().updateStatus(inProgress.id(),
+                             WorkerOperationStatus.FAILED, "OPERATION_LEASE_EXPIRED", inProgress.version(), now);
+                     FoundationPersistenceService.appendEvent(tx, "worker_operation", expired.id(),
+@@ -450,6 +507,19 @@ public final class WorkerOperationService {
+     public static int recoverExpiredOperations(
+             io.agentteams.controlplane.persistence.FoundationTransaction tx, Instant now) {
+         int recovered = 0;
++        for (UUID agentId : tx.workerOperations().findPendingDrainAgentIds()) {
++            AgentRecord agent = tx.agents().findByIdForUpdate(agentId).orElse(null);
++            if (agent == null || agent.phase() != AgentPhase.DRAINING
++                    || tx.agentLeases().countActiveForAgent(agentId) > 0) continue;
++            WorkerOperation drain = tx.workerOperations().findPendingDrainForUpdate(agentId).orElse(null);
++            if (drain == null) continue;
++            WorkerOperation drained = tx.workerOperations().updateStatus(drain.id(), WorkerOperationStatus.DRAINED,
++                    null, drain.version(), now);
++            FoundationPersistenceService.appendEvent(tx, "worker_operation", drained.id(),
++                    "WorkerOperationDrained", "{\"operationId\":\"" + drained.id() + "\"}", now,
++                    drained.version());
++            recovered++;
++        }
+         for (WorkerOperation expired : tx.workerOperations().findExpiredForUpdate(now)) {
+             WorkerOperation failed = tx.workerOperations().updateStatus(expired.id(), WorkerOperationStatus.FAILED,
+                     "OPERATION_LEASE_EXPIRED", expired.version(), now);
+diff --git a/control-plane/src/main/java/io/agentteams/controlplane/worker/WorkerOperationType.java b/control-plane/src/main/java/io/agentteams/controlplane/worker/WorkerOperationType.java
+index 8ee9740..9ffc3fe 100644
+--- a/control-plane/src/main/java/io/agentteams/controlplane/worker/WorkerOperationType.java
++++ b/control-plane/src/main/java/io/agentteams/controlplane/worker/WorkerOperationType.java
+@@ -2,6 +2,7 @@ package io.agentteams.controlplane.worker;
+
+ public enum WorkerOperationType {
+     DRAIN,
++    ACTIVATE,
+     ROLLOUT,
+     ROLLBACK,
+     TERMINATE
+diff --git a/control-plane/src/main/resources/db/migration/V122__compose_worker_drain_activate.sql b/control-plane/src/main/resources/db/migration/V122__compose_worker_drain_activate.sql
+new file mode 100644
+index 0000000..62da7a1
+--- /dev/null
++++ b/control-plane/src/main/resources/db/migration/V122__compose_worker_drain_activate.sql
+@@ -0,0 +1,12 @@
++ALTER TABLE worker_operations DROP CONSTRAINT worker_operations_type_check;
++ALTER TABLE worker_operations ADD CONSTRAINT worker_operations_type_check
++    CHECK (type IN ('DRAIN', 'ACTIVATE', 'ROLLOUT', 'ROLLBACK', 'TERMINATE'));
++
++ALTER TABLE worker_operations DROP CONSTRAINT worker_operations_type_status_check;
++ALTER TABLE worker_operations ADD CONSTRAINT worker_operations_type_status_check CHECK (
++    (type = 'DRAIN' AND status IN ('PENDING', 'RUNNING', 'DRAINED', 'FAILED'))
++    OR (type = 'ACTIVATE' AND status = 'SUCCEEDED')
++    OR (type = 'ROLLOUT' AND status IN ('PENDING', 'RUNNING', 'SUCCEEDED', 'FAILED', 'ROLLED_BACK'))
++    OR (type = 'ROLLBACK' AND status IN ('SUCCEEDED', 'FAILED'))
++    OR (type = 'TERMINATE' AND status IN ('PENDING', 'RUNNING', 'SUCCEEDED', 'FAILED'))
++);
+diff --git a/control-plane/src/test/java/io/agentteams/controlplane/worker/WorkerDrainLifecycleTest.java b/control-plane/src/test/java/io/agentteams/controlplane/worker/WorkerDrainLifecycleTest.java
+index b022df1..8ae589f 100644
+--- a/control-plane/src/test/java/io/agentteams/controlplane/worker/WorkerDrainLifecycleTest.java
++++ b/control-plane/src/test/java/io/agentteams/controlplane/worker/WorkerDrainLifecycleTest.java
+@@ -123,11 +123,9 @@ class WorkerDrainLifecycleTest {
+         UUID agentId = readyAgent();
+         operations.drain(agentId, 0, "drain-not-ready-1");
+         insertGatewayOnline(agentId);
+-        insertActiveLease(agentId);
+-
+         assertThatThrownBy(() -> invokeActivate(agentId, 1, "activate-not-drained-1"))
+                 .isInstanceOf(WorkerLifecycleConflictException.class)
+-                .hasMessage("WORKER_HAS_ACTIVE_TASKS");
++                .hasMessage("WORKER_NOT_DRAINED");
+     }
+
+     private UUID readyAgent() {
+@@ -166,7 +164,8 @@ class WorkerDrainLifecycleTest {
+                     (agent_id, connection_id, presence, phase, runtime, runtime_version, capabilities,
+                      connected_at, last_seen_at, disconnected_at, updated_at)
+                 VALUES (?, ?, 'ONLINE', 'READY', 'agentscope', 'v0.1.5', '{}'::jsonb, ?, ?, NULL, ?)
+-                """, agentId.toString(), UUID.randomUUID(), NOW, NOW, NOW);
++                """, agentId.toString(), UUID.randomUUID(), java.sql.Timestamp.from(NOW),
++                java.sql.Timestamp.from(NOW), java.sql.Timestamp.from(NOW));
+     }
+
+     private WorkerOperation invokeActivate(UUID agentId, long expectedVersion, String idempotencyKey) {
