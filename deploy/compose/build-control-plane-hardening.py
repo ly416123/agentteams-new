@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import os
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -15,11 +16,35 @@ from pathlib import Path
 
 
 SOURCE_COMMIT = "0156f2c1fecdc868cb4a0f4f13fb068bb4162834"
+SOURCE_TAG = "v0.1.5"
 IMAGE_TAG = "agentteams-new/control-plane:v0.1.5-task-event-scope-guard-0156f2c"
 
 
 def run(command: list[str], *, cwd: Path | None = None) -> None:
     subprocess.run(command, cwd=cwd, check=True)
+
+
+def output(command: list[str]) -> str:
+    return subprocess.run(command, capture_output=True, text=True, check=True).stdout.strip()
+
+
+def require_pinned_tag() -> None:
+    reference = output([
+        "gh", "api", f"repos/ly416123/agentteams-java/git/ref/tags/{SOURCE_TAG}",
+        "--jq", ".object.sha + \" \" + .object.type",
+    ])
+    object_sha, object_type = reference.split()
+    if object_type == "tag":
+        resolved = output([
+            "gh", "api", f"repos/ly416123/agentteams-java/git/tags/{object_sha}",
+            "--jq", ".object.sha",
+        ])
+    elif object_type == "commit":
+        resolved = object_sha
+    else:
+        raise RuntimeError(f"unexpected source tag object type: {object_type}")
+    if resolved != SOURCE_COMMIT:
+        raise RuntimeError(f"source tag {SOURCE_TAG} resolves to {resolved}, expected {SOURCE_COMMIT}")
 
 
 def configure_testcontainers_docker_host() -> None:
@@ -61,13 +86,15 @@ def require_tests(source: Path) -> None:
     expected = {
         "io.agentteams.controlplane.application.ControlPlaneExecutionEventAdapterTest": 3,
         "io.agentteams.controlplane.application.JdbcTaskEventScopeGuardPostgresTest": 4,
+        "io.agentteams.controlplane.artifact.InternalArtifactUploadControllerTest": 8,
         "io.agentteams.controlplane.config.ConfigDeploymentServiceTest": 7,
         "io.agentteams.controlplane.team.TeamDeploymentRepositoryTest": 4,
         "io.agentteams.controlplane.skill.SkillControllerTest": 6,
         "io.agentteams.controlplane.quality.JdbcArtifactQualityEventRepositoryTest": 6,
         "io.agentteams.controlplane.worker.WorkerDrainLifecycleTest": 9,
-        "io.agentteams.controlplane.persistence.FoundationRepositoryIT": 2,
+        "io.agentteams.controlplane.persistence.FoundationRepositoryIT": 3,
         "io.agentteams.controlplane.scheduling.TenantFairQueueTest": 4,
+        "io.agentteams.controlplane.service.TaskAssignmentServiceTest": 8,
     }
     for class_name, expected_count in expected.items():
         report = reports / f"TEST-{class_name}.xml"
@@ -102,20 +129,21 @@ def main() -> int:
     if current.returncode == 0 and current.stdout.strip() == f"{SOURCE_COMMIT}|{patch_digest}":
         print(f"Reusing locally built hardened image {image_tag}")
         return 0
+    require_pinned_tag()
     with tempfile.TemporaryDirectory(prefix="agentteams-new-control-plane-") as temp:
         work = Path(temp)
         archive = work / "source.tar.gz"
         source = work / "source"
         source.mkdir()
         with archive.open("wb") as output:
-            subprocess.run(["gh", "api", f"repos/ly416123/agentteams-java/tarball/{SOURCE_COMMIT}"],
+            subprocess.run(["gh", "api", f"repos/ly416123/agentteams-java/tarball/{SOURCE_TAG}"],
                            stdout=output, check=True, timeout=120)
         extract_source(archive, source)
         run(["patch", "--batch", "--forward", "-p1", "-i", str(patch_file)], cwd=source)
         run([
             "mvn", "--batch-mode", "--no-transfer-progress", "-P", "!colima-testcontainers",
             "-pl", "control-plane", "-am",
-            "-Dtest=ControlPlaneExecutionEventAdapterTest,JdbcTaskEventScopeGuardPostgresTest,ConfigDeploymentServiceTest,TeamDeploymentRepositoryTest,SkillControllerTest,JdbcArtifactQualityEventRepositoryTest,WorkerDrainLifecycleTest,FoundationRepositoryIT#doesNotSelectProjectWorkerWithAnActiveLease+concurrentProjectAssignmentsCannotCreateTwoActiveLeasesForOneWorker,TenantFairQueueTest",
+            "-Dtest=ControlPlaneExecutionEventAdapterTest,JdbcTaskEventScopeGuardPostgresTest,InternalArtifactUploadControllerTest,ConfigDeploymentServiceTest,TeamDeploymentRepositoryTest,SkillControllerTest,JdbcArtifactQualityEventRepositoryTest,WorkerDrainLifecycleTest,FoundationRepositoryIT#doesNotSelectProjectWorkerWithAnActiveLease+concurrentProjectAssignmentsCannotCreateTwoActiveLeasesForOneWorker+createsTenantNeutralWorkerSlotsAndAssignmentBindingSchema,TenantFairQueueTest,TaskAssignmentServiceTest",
             "-Dsurefire.failIfNoSpecifiedTests=false", "test",
         ], cwd=source)
         run([
@@ -131,12 +159,32 @@ def main() -> int:
         ], cwd=source)
         require_tests(source)
         run([
+            "mvn", "--batch-mode", "--no-transfer-progress",
+            "-pl", "control-plane", "-DskipTests", "package", "spring-boot:repackage",
+        ], cwd=source)
+        runtime_context = work / "runtime-image"
+        runtime_context.mkdir()
+        shutil.copy2(
+            source / "control-plane/target/agentteams-control-plane-0.1.0-SNAPSHOT.jar",
+            runtime_context / "app.jar",
+        )
+        (runtime_context / "Dockerfile").write_text(
+            "FROM dockerproxy.net/library/eclipse-temurin@"
+            "sha256:0b99b3376fbb50dbf9c0af8535fdd5b8eb0d3fdfc8b1e4967f383b6919f6901a\n"
+            "WORKDIR /app\n"
+            "COPY app.jar /app/app.jar\n"
+            "USER 10001\n"
+            "EXPOSE 8080\n"
+            'ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75", "-jar", "/app/app.jar"]\n',
+            encoding="utf-8",
+        )
+        run([
             "docker", "build", "--platform", "linux/amd64", "--label",
             "org.opencontainers.image.source=https://github.com/ly416123/agentteams-new",
             "--label", f"org.opencontainers.image.revision={SOURCE_COMMIT}",
             "--label", f"io.agentteams.task-event-scope-patch.sha256={patch_digest}",
-            "--tag", image_tag, "--file", "deploy/docker/control-plane.Dockerfile", ".",
-        ], cwd=source)
+            "--tag", image_tag, "--file", "Dockerfile", ".",
+        ], cwd=runtime_context)
     return 0
 
 

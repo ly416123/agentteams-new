@@ -94,6 +94,7 @@ services:
       SPRING_DATASOURCE_PASSWORD: ${CONTROL_PLANE_DB_PASSWORD:?set CONTROL_PLANE_DB_PASSWORD in .env}
       SPRING_FLYWAY_USER: agentteams
       SPRING_FLYWAY_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      AGENTTEAMS_SCHEDULER_WORKER_SLOTS_ENABLED: ${WORKER_SLOT_SCHEDULING_ENABLED:-false}
       AGENTTEAMS_NATS_ENABLED: "true"
       AGENTTEAMS_NATS_URL: nats://nats:4222
       AGENTTEAMS_OUTBOX_RELAY_ENABLED: "true"
@@ -141,6 +142,7 @@ services:
       WORKER_ENROLLMENT_DB_PASSWORD: ${WORKER_ENROLLMENT_DB_PASSWORD:?set WORKER_ENROLLMENT_DB_PASSWORD in .env}
       CREDENTIAL_PROXY_DB_PASSWORD: ${CREDENTIAL_PROXY_DB_PASSWORD:?set CREDENTIAL_PROXY_DB_PASSWORD in .env}
       AGENTTEAMS_TENANT_CREDENTIAL_REFS_JSON: ${AGENTTEAMS_TENANT_CREDENTIAL_REFS_JSON:-[]}
+      AGENTTEAMS_WORKER_SLOT_IDS_JSON: ${WORKER_SLOT_IDS_JSON:-[]}
     entrypoint: ["/bin/sh", "-ec"]
     command:
       - |
@@ -171,6 +173,14 @@ services:
         SQL
         psql -v ON_ERROR_STOP=1 -f /opt/worker-enrollment-rls.sql
         psql -v ON_ERROR_STOP=1 -f /opt/credential-proxy.sql
+        psql -v ON_ERROR_STOP=1 <<'SQL'
+        \getenv worker_slot_ids_json AGENTTEAMS_WORKER_SLOT_IDS_JSON
+        INSERT INTO public.worker_slots(id, status)
+        SELECT slot_id_text::uuid, 'ACTIVE'
+          FROM jsonb_array_elements_text(:'worker_slot_ids_json'::jsonb) AS slot(slot_id_text)
+        ON CONFLICT (id) DO UPDATE
+          SET status = 'ACTIVE', updated_at = statement_timestamp();
+        SQL
         psql -v ON_ERROR_STOP=1 <<'SQL'
         \getenv provider_bindings_json AGENTTEAMS_TENANT_CREDENTIAL_REFS_JSON
         WITH configured AS (
@@ -304,14 +314,14 @@ services:
       - path: ${WORKER_1_CREDENTIALS_FILE:-./secrets/worker-1.runtime.env}
         required: false
     environment: &worker-env
-      AGENTTEAMS_AGENT_ID: ${WORKER_1_AGENT_ID:?set a registered Worker UUID}
+      AGENTTEAMS_AGENT_ID: ${WORKER_1_SLOT_ID:-00000000-0000-0000-0000-000000000001}
       AGENTTEAMS_GATEWAY_HOST: gateway
       AGENTTEAMS_GATEWAY_PORT: "9090"
       AGENTTEAMS_RUNTIME: AGENTSCOPE
       AGENTTEAMS_MODEL_PROVIDER: chatgpt-plan
       AGENTTEAMS_MODEL: chatgpt-plan:gpt-5.6-luna
       AGENTTEAMS_MAX_CONCURRENT_TASKS: "1"
-      AGENTTEAMS_ATTEMPT_CREDENTIAL_ISSUE_URL: http://credential-proxy:8085/internal/v1/attempt-credentials
+      AGENTTEAMS_ATTEMPT_CAPABILITY_ISSUE_URL: http://credential-proxy:8085/internal/v1/attempt-capabilities
       AGENTTEAMS_CHATGPT_RESPONSES_URL: http://credential-proxy:8085/v1/responses
     depends_on:
       gateway:
@@ -333,7 +343,7 @@ services:
         required: false
     environment:
       <<: *worker-env
-      AGENTTEAMS_AGENT_ID: ${WORKER_2_AGENT_ID:?set a registered Worker UUID}
+      AGENTTEAMS_AGENT_ID: ${WORKER_2_SLOT_ID:-00000000-0000-0000-0000-000000000002}
     depends_on:
       gateway:
         condition: service_started
@@ -354,7 +364,7 @@ services:
         required: false
     environment:
       <<: *worker-env
-      AGENTTEAMS_AGENT_ID: ${WORKER_3_AGENT_ID:?set a registered Worker UUID}
+      AGENTTEAMS_AGENT_ID: ${WORKER_3_SLOT_ID:-00000000-0000-0000-0000-000000000003}
     depends_on:
       gateway:
         condition: service_started
@@ -375,7 +385,7 @@ services:
         required: false
     environment:
       <<: *worker-env
-      AGENTTEAMS_AGENT_ID: ${WORKER_4_AGENT_ID:?set a registered Worker UUID}
+      AGENTTEAMS_AGENT_ID: ${WORKER_4_SLOT_ID:-00000000-0000-0000-0000-000000000004}
     depends_on:
       gateway:
         condition: service_started
@@ -396,7 +406,7 @@ services:
         required: false
     environment:
       <<: *worker-env
-      AGENTTEAMS_AGENT_ID: ${WORKER_5_AGENT_ID:?set a registered Worker UUID}
+      AGENTTEAMS_AGENT_ID: ${WORKER_5_SLOT_ID:-00000000-0000-0000-0000-000000000005}
     depends_on:
       gateway:
         condition: service_started
@@ -417,7 +427,7 @@ services:
         required: false
     environment:
       <<: *worker-env
-      AGENTTEAMS_AGENT_ID: ${WORKER_6_AGENT_ID:?set a registered Worker UUID}
+      AGENTTEAMS_AGENT_ID: ${WORKER_6_SLOT_ID:-00000000-0000-0000-0000-000000000006}
     depends_on:
       gateway:
         condition: service_started
@@ -438,7 +448,7 @@ services:
         required: false
     environment:
       <<: *worker-env
-      AGENTTEAMS_AGENT_ID: ${WORKER_7_AGENT_ID:?set a registered Worker UUID}
+      AGENTTEAMS_AGENT_ID: ${WORKER_7_SLOT_ID:-00000000-0000-0000-0000-000000000007}
     depends_on:
       gateway:
         condition: service_started
@@ -459,7 +469,7 @@ services:
         required: false
     environment:
       <<: *worker-env
-      AGENTTEAMS_AGENT_ID: ${WORKER_8_AGENT_ID:?set a registered Worker UUID}
+      AGENTTEAMS_AGENT_ID: ${WORKER_8_SLOT_ID:-00000000-0000-0000-0000-000000000008}
     depends_on:
       gateway:
         condition: service_started

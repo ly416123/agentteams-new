@@ -11,6 +11,7 @@ compose() {
 }
 deployment_mode=$(awk -F= '$1 == "DEPLOYMENT_MODE" { value=$2 } END { gsub(/[[:space:]]/, "", value); print value }' "$env_file")
 replicas=$(awk -F= '$1 == "WORKER_REPLICAS" { value=$2 } END { gsub(/[[:space:]]/, "", value); print value }' "$env_file")
+gateway_image=agentteams-new/gateway:v0.1.5-session-bound-artifacts-0156f2c
 if [ "$deployment_mode" = "self-hosted-small" ] || [ "$replicas" -gt 0 ]; then
   control_plane_image=$(python3 - "$env_file" <<'PY'
 from pathlib import Path
@@ -26,6 +27,8 @@ PY
   )
   echo "Building the pinned TASK_EVENT-hardened Control Plane from agentteams-new's source patch"
   python3 "$script_dir/build-control-plane-hardening.py" "$control_plane_image"
+  echo "Building the pinned session-bound Artifact Gateway from agentteams-new's source patch"
+  python3 "$script_dir/build-gateway-hardening.py" "$gateway_image"
 fi
 if [ "$replicas" -gt 0 ]; then
   worker_image=agentteams-new/agent-worker:v0.1.5-attempt-capability-0156f2c
@@ -53,7 +56,7 @@ if [ "$storage_enabled" = "true" ]; then
 fi
 if [ "$replicas" -eq 0 ]; then
   echo "WORKER_REPLICAS=0; starting infrastructure without Workers"
-  compose up -d postgres nats nats-bootstrap control-plane gateway
+  GATEWAY_IMAGE="$gateway_image" compose up -d postgres nats nats-bootstrap control-plane gateway
   exit 0
 fi
 
@@ -63,4 +66,4 @@ while [ "$slot" -le "$replicas" ]; do
   set -- "$@" "worker-$slot"
   slot=$((slot + 1))
 done
-WORKER_IMAGE="$worker_image" compose --profile secure-api --profile worker-pool up -d "$@" worker-enrollment credential-proxy
+GATEWAY_IMAGE="$gateway_image" WORKER_IMAGE="$worker_image" compose --profile secure-api --profile worker-pool up -d "$@" worker-enrollment credential-proxy

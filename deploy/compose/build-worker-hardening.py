@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import shutil
 import subprocess
 import sys
@@ -13,11 +14,16 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 SOURCE_COMMIT = "0156f2c1fecdc868cb4a0f4f13fb068bb4162834"
+SOURCE_TAG = "v0.1.5"
 IMAGE_TAG = "agentteams-new/agent-worker:v0.1.5-attempt-capability-0156f2c"
 REQUIRED_TESTS = {
     "io.agentteams.worker.agentscope.ConfiguredAgentScopeHarnessFactoryTest": 19,
     "io.agentteams.worker.chatgpt.AttemptCredentialTokenSourceTest": 2,
-    "io.agentteams.worker.WorkerRuntimeFactoryTest": 10,
+    "io.agentteams.worker.chatgpt.AttemptCapabilityTokenSourceTest": 3,
+    "io.agentteams.worker.WorkerRuntimeFactoryTest": 12,
+    "io.agentteams.runtime.GatewayRuntimeAdapterTest": 10,
+    "io.agentteams.runtime.GatewayRuntimeAdapterArtifactUploadTest": 5,
+    "io.agentteams.runtime.GrpcRuntimeArtifactUploadPortTest": 1,
 }
 
 
@@ -45,13 +51,29 @@ def extract_source(archive: Path, destination: Path) -> None:
 
 
 def require_tests(source: Path) -> None:
-    report_dir = source / "agent-worker/target/surefire-reports"
     for test_class, expected_tests in REQUIRED_TESTS.items():
+        module = "runtime" if test_class.startswith("io.agentteams.runtime.") else "agent-worker"
+        report_dir = source / module / "target/surefire-reports"
         report = report_dir / f"TEST-{test_class}.xml"
         suite = ET.parse(report).getroot()
         if (suite.attrib["tests"] != str(expected_tests) or suite.attrib["skipped"] != "0"
                 or suite.attrib["failures"] != "0" or suite.attrib["errors"] != "0"):
             raise RuntimeError(f"required Worker Attempt credential tests failed for {test_class}: {suite.attrib}")
+
+
+def require_pinned_source_tag() -> None:
+    reference = json.loads(subprocess.run(
+        ["gh", "api", f"repos/ly416123/agentteams-java/git/ref/tags/{SOURCE_TAG}"],
+        capture_output=True, text=True, check=True, timeout=30,
+    ).stdout)
+    target = reference["object"]
+    if target["type"] == "tag":
+        target = json.loads(subprocess.run(
+            ["gh", "api", f"repos/ly416123/agentteams-java/git/tags/{target['sha']}"],
+            capture_output=True, text=True, check=True, timeout=30,
+        ).stdout)["object"]
+    if target["type"] != "commit" or target["sha"] != SOURCE_COMMIT:
+        raise RuntimeError(f"upstream {SOURCE_TAG} must resolve to the pinned Worker source commit")
 
 
 def main() -> int:
@@ -75,8 +97,9 @@ def main() -> int:
         archive = work / "source.tar.gz"
         source = work / "source"
         source.mkdir()
+        require_pinned_source_tag()
         with archive.open("wb") as output:
-            subprocess.run(["gh", "api", f"repos/ly416123/agentteams-java/tarball/{SOURCE_COMMIT}"],
+            subprocess.run(["gh", "api", f"repos/ly416123/agentteams-java/tarball/{SOURCE_TAG}"],
                            stdout=output, check=True, timeout=120)
         extract_source(archive, source)
         run(["patch", "--batch", "--forward", "-p1", "-i", str(patch_file)], cwd=source)
@@ -98,7 +121,18 @@ def main() -> int:
         image_context = work / "runtime-image"
         image_context.mkdir()
         shutil.copy2(boot_jar, image_context / "app.jar")
-        (image_context / "Dockerfile").write_text("""FROM eclipse-temurin:21-jre
+        base_image = "eclipse-temurin:21-jre"
+        base_check = subprocess.run(
+            ["docker", "image", "inspect", base_image], capture_output=True, check=False,
+        )
+        if base_check.returncode != 0:
+            fallback_check = subprocess.run(
+                ["docker", "image", "inspect", IMAGE_TAG], capture_output=True, check=False,
+            )
+            if fallback_check.returncode != 0:
+                raise RuntimeError("no local Java 21 Worker base image is available and Docker Hub is unreachable")
+            base_image = IMAGE_TAG
+        (image_context / "Dockerfile").write_text(f"""FROM {base_image}
 WORKDIR /app
 COPY --chown=10001:0 app.jar /app/app.jar
 USER 10001

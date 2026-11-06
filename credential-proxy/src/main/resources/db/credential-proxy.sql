@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS public.attempt_model_proxy_credentials (
     revoked_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT statement_timestamp()
 );
--- Legacy POC capabilities cannot be tied to the session that requested them;
+-- Legacy POC capabilities cannot be tied to the session that requested them,
 -- revoke them as part of upgrade before enforcing session binding.
 ALTER TABLE public.attempt_model_proxy_credentials ADD COLUMN IF NOT EXISTS session_id UUID;
 DELETE FROM public.attempt_model_proxy_credentials WHERE session_id IS NULL;
@@ -43,6 +43,29 @@ CREATE UNIQUE INDEX IF NOT EXISTS attempt_model_proxy_credentials_one_live_token
     ON public.attempt_model_proxy_credentials (attempt_id, lease_id)
     WHERE revoked_at IS NULL;
 REVOKE ALL ON TABLE public.attempt_model_proxy_credentials FROM PUBLIC;
+
+-- Tenant-neutral slot credentials are bound to the exact active assignment.
+-- The plaintext capability is returned once, only its SHA-256 digest is kept.
+CREATE TABLE IF NOT EXISTS public.attempt_execution_capabilities (
+    id UUID PRIMARY KEY,
+    worker_slot_session_id UUID NOT NULL REFERENCES public.worker_slot_sessions(id) ON DELETE RESTRICT,
+    worker_slot_id UUID NOT NULL REFERENCES public.worker_slots(id) ON DELETE RESTRICT,
+    task_id UUID NOT NULL,
+    assignment_id UUID NOT NULL,
+    attempt_id UUID NOT NULL,
+    lease_id UUID NOT NULL,
+    token_sha256 CHAR(64) NOT NULL UNIQUE,
+    expires_at TIMESTAMPTZ NOT NULL,
+    revoked_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT statement_timestamp()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS attempt_execution_capabilities_one_live_attempt
+    ON public.attempt_execution_capabilities (attempt_id, lease_id)
+    WHERE revoked_at IS NULL;
+CREATE INDEX IF NOT EXISTS attempt_execution_capabilities_slot_idx
+    ON public.attempt_execution_capabilities (worker_slot_id, expires_at)
+    WHERE revoked_at IS NULL;
+REVOKE ALL ON TABLE public.attempt_execution_capabilities FROM PUBLIC;
 
 -- Provider references are provisioned by deployment administration. Workers
 -- cannot choose or enumerate them. The issuer resolves one by TASK scope.
@@ -61,10 +84,22 @@ GRANT USAGE ON SCHEMA public TO credential_proxy_query_owner, credential_proxy_q
 GRANT CREATE ON SCHEMA public TO credential_proxy_query_owner;
 GRANT SELECT (id, task_id, lease_id, phase, lease_expires_at)
     ON TABLE public.task_attempts TO credential_proxy_query_owner;
-GRANT SELECT (task_id, attempt_id, agent_id, phase, released_at)
+GRANT UPDATE (id) ON TABLE public.task_attempts TO credential_proxy_query_owner;
+GRANT SELECT (id, task_id, attempt_id, agent_id, phase, released_at)
     ON TABLE public.task_assignments TO credential_proxy_query_owner;
+GRANT UPDATE (id) ON TABLE public.task_assignments TO credential_proxy_query_owner;
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'task_assignments'
+                  AND column_name = 'worker_slot_id') THEN
+        EXECUTE 'GRANT SELECT (worker_slot_id) ON TABLE public.task_assignments TO credential_proxy_query_owner';
+    END IF;
+END;
+$$;
 GRANT SELECT (id, agent_id, task_attempt_id, expires_at, released_at, status)
     ON TABLE public.agent_leases TO credential_proxy_query_owner;
+GRANT UPDATE (id) ON TABLE public.agent_leases TO credential_proxy_query_owner;
 GRANT SELECT (resource_type, resource_id, tenant_id, project_id, team)
     ON TABLE public.resource_scopes TO credential_proxy_query_owner;
 GRANT SELECT (id, session_id, agent_id, tenant_id, project_id, team_id, token_sha256,
@@ -77,15 +112,27 @@ GRANT SELECT (agent_id, tenant_id, project_id, team_id)
 GRANT SELECT (id, session_id, agent_id, task_id, attempt_id, lease_id, token_sha256,
               model_credential_ref, expires_at, revoked_at)
     ON TABLE public.attempt_model_proxy_credentials TO credential_proxy_query_owner;
+GRANT SELECT (id, status) ON TABLE public.worker_slots TO credential_proxy_query_owner;
+GRANT UPDATE (id) ON TABLE public.worker_slots TO credential_proxy_query_owner;
+GRANT SELECT (id, slot_id, expires_at, revoked_at)
+    ON TABLE public.worker_slot_sessions TO credential_proxy_query_owner;
+GRANT SELECT (id, worker_slot_session_id, worker_slot_id, task_id, assignment_id, attempt_id,
+              lease_id, token_sha256, expires_at, revoked_at)
+    ON TABLE public.attempt_execution_capabilities TO credential_proxy_query_owner;
 GRANT SELECT (tenant_id, project_id, team_id, model_credential_ref, enabled)
     ON TABLE public.tenant_model_proxy_credential_refs TO credential_proxy_query_owner;
 GRANT INSERT, UPDATE (revoked_at) ON TABLE public.attempt_model_proxy_credentials
+    TO credential_proxy_query_owner;
+GRANT INSERT, UPDATE (revoked_at) ON TABLE public.attempt_execution_capabilities
     TO credential_proxy_query_owner;
 
 ALTER TABLE public.worker_model_proxy_credentials ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.agent_sessions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.worker_enrollment_agent_scopes ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.attempt_model_proxy_credentials ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.attempt_execution_capabilities ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.worker_slots ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.worker_slot_sessions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.tenant_model_proxy_credential_refs ENABLE ROW LEVEL SECURITY;
 
 DROP POLICY IF EXISTS credential_proxy_owner_model_credentials_read
@@ -113,10 +160,37 @@ DROP POLICY IF EXISTS credential_proxy_owner_attempt_credentials_update
 CREATE POLICY credential_proxy_owner_attempt_credentials_update
     ON public.attempt_model_proxy_credentials FOR UPDATE TO credential_proxy_query_owner
     USING (true) WITH CHECK (true);
+DROP POLICY IF EXISTS credential_proxy_owner_execution_capabilities_read
+    ON public.attempt_execution_capabilities;
+CREATE POLICY credential_proxy_owner_execution_capabilities_read
+    ON public.attempt_execution_capabilities FOR SELECT TO credential_proxy_query_owner USING (true);
+DROP POLICY IF EXISTS credential_proxy_owner_execution_capabilities_insert
+    ON public.attempt_execution_capabilities;
+CREATE POLICY credential_proxy_owner_execution_capabilities_insert
+    ON public.attempt_execution_capabilities FOR INSERT TO credential_proxy_query_owner WITH CHECK (true);
+DROP POLICY IF EXISTS credential_proxy_owner_execution_capabilities_update
+    ON public.attempt_execution_capabilities;
+CREATE POLICY credential_proxy_owner_execution_capabilities_update
+    ON public.attempt_execution_capabilities FOR UPDATE TO credential_proxy_query_owner
+    USING (true) WITH CHECK (true);
+DROP POLICY IF EXISTS credential_proxy_owner_worker_slots_read ON public.worker_slots;
+CREATE POLICY credential_proxy_owner_worker_slots_read
+    ON public.worker_slots FOR SELECT TO credential_proxy_query_owner USING (true);
+DROP POLICY IF EXISTS credential_proxy_owner_worker_slots_lock ON public.worker_slots;
+CREATE POLICY credential_proxy_owner_worker_slots_lock
+    ON public.worker_slots FOR UPDATE TO credential_proxy_query_owner USING (true) WITH CHECK (true);
+DROP POLICY IF EXISTS credential_proxy_owner_worker_slot_sessions_read ON public.worker_slot_sessions;
+CREATE POLICY credential_proxy_owner_worker_slot_sessions_read
+    ON public.worker_slot_sessions FOR SELECT TO credential_proxy_query_owner USING (true);
 DROP POLICY IF EXISTS credential_proxy_owner_tenant_credential_refs_read
     ON public.tenant_model_proxy_credential_refs;
 CREATE POLICY credential_proxy_owner_tenant_credential_refs_read
     ON public.tenant_model_proxy_credential_refs FOR SELECT TO credential_proxy_query_owner USING (true);
+
+-- Slot-session identity is resolved only by a SECURITY DEFINER Enrollment
+-- function. The Credential Proxy does not read bearer hashes from its tables.
+GRANT EXECUTE ON FUNCTION public.worker_enrollment_worker_slot_session_context_by_token_sha256(CHAR(64))
+    TO credential_proxy_query, credential_proxy_query_owner;
 
 -- Retire the older caller-scoped overload without dropping it: external
 -- database objects may depend on its signature during an in-place upgrade.
@@ -250,6 +324,58 @@ AS $$
        AND credential.expires_at > statement_timestamp()
        AND session.revoked_at IS NULL
        AND session.expires_at > statement_timestamp()
+       AND assignment.phase IN ('ASSIGNED', 'ACCEPTED', 'RUNNING')
+       AND assignment.released_at IS NULL
+       AND attempt.phase IN ('ASSIGNED', 'ACCEPTED', 'RUNNING')
+       AND attempt.lease_expires_at > statement_timestamp()
+       AND lease.status = 'ACTIVE'
+       AND lease.released_at IS NULL
+       AND lease.expires_at > statement_timestamp()
+    UNION ALL
+    SELECT assignment.agent_id,
+           task_scope.tenant_id,
+           task_scope.project_id,
+           task_scope.team,
+           assignment.task_id,
+           assignment.attempt_id,
+           lease.id,
+           LEAST(lease.expires_at, attempt.lease_expires_at, capability.expires_at),
+           TRUE,
+           TRUE,
+           TRUE
+      FROM public.attempt_execution_capabilities AS capability
+      JOIN public.worker_slot_sessions AS slot_session
+        ON slot_session.id = capability.worker_slot_session_id
+       AND slot_session.slot_id = capability.worker_slot_id
+      JOIN public.worker_slots AS slot
+        ON slot.id = capability.worker_slot_id
+       AND slot.status = 'ACTIVE'
+      JOIN public.task_assignments AS assignment
+        ON assignment.id = capability.assignment_id
+       AND assignment.task_id = capability.task_id
+       AND assignment.attempt_id = capability.attempt_id
+       AND assignment.worker_slot_id = capability.worker_slot_id
+      JOIN public.task_attempts AS attempt
+        ON attempt.id = capability.attempt_id
+       AND attempt.task_id = capability.task_id
+       AND attempt.lease_id = capability.lease_id
+      JOIN public.agent_leases AS lease
+        ON lease.id = capability.lease_id
+       AND lease.task_attempt_id = attempt.id
+       AND lease.agent_id = assignment.agent_id
+      JOIN public.resource_scopes AS task_scope
+        ON task_scope.resource_type = 'TASK'
+       AND task_scope.resource_id = capability.task_id
+      JOIN public.tenant_model_proxy_credential_refs AS credential_ref
+        ON credential_ref.tenant_id = task_scope.tenant_id
+       AND credential_ref.project_id = task_scope.project_id
+       AND credential_ref.team_id = task_scope.team
+       AND credential_ref.enabled
+     WHERE capability.id = p_proxy_credential_id
+       AND capability.revoked_at IS NULL
+       AND capability.expires_at > statement_timestamp()
+       AND slot_session.revoked_at IS NULL
+       AND slot_session.expires_at > statement_timestamp()
        AND assignment.phase IN ('ASSIGNED', 'ACCEPTED', 'RUNNING')
        AND assignment.released_at IS NULL
        AND attempt.phase IN ('ASSIGNED', 'ACCEPTED', 'RUNNING')
@@ -544,6 +670,107 @@ REVOKE ALL ON FUNCTION public.credential_proxy_issue_attempt(TEXT, UUID, UUID, U
 GRANT EXECUTE ON FUNCTION public.credential_proxy_issue_attempt(TEXT, UUID, UUID, UUID, TEXT, UUID, INTEGER)
     TO credential_proxy_query;
 
+-- A tenant-neutral Worker slot requests a short execution capability after
+-- receiving TaskAssigned. Assignment identity comes from the database, the
+-- Worker-supplied identifiers are only selectors and must all match.
+CREATE OR REPLACE FUNCTION public.credential_proxy_issue_attempt_capability(
+    p_slot_session_sha256 TEXT,
+    p_task_id UUID,
+    p_assignment_id UUID,
+    p_attempt_id UUID,
+    p_lease_id UUID,
+    p_token_sha256 TEXT,
+    p_capability_id UUID,
+    p_ttl_seconds INTEGER
+)
+RETURNS TABLE (capability_id UUID, expires_at TIMESTAMPTZ)
+LANGUAGE plpgsql
+VOLATILE
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    v_slot_id UUID;
+    v_slot_session_id UUID;
+    v_lease_expires_at TIMESTAMPTZ;
+    v_attempt_expires_at TIMESTAMPTZ;
+    v_expires_at TIMESTAMPTZ;
+BEGIN
+    IF p_slot_session_sha256 IS NULL OR p_token_sha256 IS NULL OR p_capability_id IS NULL
+       OR p_task_id IS NULL OR p_assignment_id IS NULL OR p_attempt_id IS NULL OR p_lease_id IS NULL
+       OR p_slot_session_sha256 !~ '^[0-9a-fA-F]{64}$'
+       OR p_token_sha256 !~ '^[0-9a-fA-F]{64}$'
+       OR p_ttl_seconds IS NULL OR p_ttl_seconds < 1 OR p_ttl_seconds > 300 THEN
+        RETURN;
+    END IF;
+
+    SELECT session_context.session_id, session_context.slot_id
+      INTO v_slot_session_id, v_slot_id
+      FROM public.worker_enrollment_worker_slot_session_context_by_token_sha256(
+            p_slot_session_sha256::CHAR(64)) AS session_context
+     WHERE session_context.revoked_at IS NULL
+       AND session_context.expires_at > statement_timestamp();
+    IF v_slot_id IS NULL OR v_slot_session_id IS NULL THEN RETURN; END IF;
+
+    PERFORM pg_advisory_xact_lock(hashtextextended(p_assignment_id::TEXT, 0));
+
+    SELECT lease.expires_at, attempt.lease_expires_at
+      INTO v_lease_expires_at, v_attempt_expires_at
+      FROM public.task_assignments AS assignment
+      JOIN public.worker_slots AS slot
+        ON slot.id = assignment.worker_slot_id AND slot.status = 'ACTIVE'
+      JOIN public.task_attempts AS attempt
+        ON attempt.id = assignment.attempt_id AND attempt.task_id = assignment.task_id
+      JOIN public.agent_leases AS lease
+        ON lease.id = attempt.lease_id AND lease.task_attempt_id = attempt.id
+       AND lease.agent_id = assignment.agent_id
+      JOIN public.resource_scopes AS task_scope
+        ON task_scope.resource_type = 'TASK' AND task_scope.resource_id = assignment.task_id
+     WHERE assignment.id = p_assignment_id
+       AND assignment.task_id = p_task_id
+       AND assignment.attempt_id = p_attempt_id
+       AND assignment.worker_slot_id = v_slot_id
+       AND assignment.phase IN ('ASSIGNED', 'ACCEPTED', 'RUNNING')
+       AND assignment.released_at IS NULL
+       AND attempt.phase IN ('ASSIGNED', 'ACCEPTED', 'RUNNING')
+       AND attempt.lease_id = p_lease_id
+       AND attempt.lease_expires_at > statement_timestamp()
+       AND lease.id = p_lease_id
+       AND lease.status = 'ACTIVE'
+       AND lease.released_at IS NULL
+       AND lease.expires_at > statement_timestamp()
+     FOR UPDATE OF assignment, slot, attempt, lease;
+    IF v_lease_expires_at IS NULL OR v_attempt_expires_at IS NULL THEN RETURN; END IF;
+
+    v_expires_at := LEAST(statement_timestamp() + make_interval(secs => p_ttl_seconds),
+                           v_lease_expires_at, v_attempt_expires_at);
+    IF v_expires_at <= statement_timestamp() THEN RETURN; END IF;
+
+    UPDATE public.attempt_execution_capabilities AS existing
+       SET revoked_at = COALESCE(existing.revoked_at, statement_timestamp())
+     WHERE existing.assignment_id = p_assignment_id
+       AND existing.attempt_id = p_attempt_id
+       AND existing.lease_id = p_lease_id
+       AND existing.revoked_at IS NULL;
+
+    INSERT INTO public.attempt_execution_capabilities (
+        id, worker_slot_session_id, worker_slot_id, task_id, assignment_id, attempt_id, lease_id,
+        token_sha256, expires_at
+    ) VALUES (
+        p_capability_id, v_slot_session_id, v_slot_id, p_task_id, p_assignment_id, p_attempt_id, p_lease_id,
+        p_token_sha256::CHAR(64), v_expires_at
+    );
+    RETURN QUERY SELECT p_capability_id, v_expires_at;
+END;
+$$;
+
+ALTER FUNCTION public.credential_proxy_issue_attempt_capability(TEXT, UUID, UUID, UUID, UUID, TEXT, UUID, INTEGER)
+    OWNER TO credential_proxy_query_owner;
+REVOKE ALL ON FUNCTION public.credential_proxy_issue_attempt_capability(
+    TEXT, UUID, UUID, UUID, UUID, TEXT, UUID, INTEGER) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.credential_proxy_issue_attempt_capability(
+    TEXT, UUID, UUID, UUID, UUID, TEXT, UUID, INTEGER) TO credential_proxy_query;
+
 CREATE OR REPLACE FUNCTION public.credential_proxy_revalidate_v2(p_proxy_credential_id UUID)
 RETURNS TABLE (
     proxy_credential_id UUID,
@@ -616,4 +843,202 @@ ALTER FUNCTION public.credential_proxy_revalidate_v2(UUID)
     OWNER TO credential_proxy_query_owner;
 REVOKE ALL ON FUNCTION public.credential_proxy_revalidate_v2(UUID) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.credential_proxy_revalidate_v2(UUID)
+    TO credential_proxy_query;
+
+CREATE OR REPLACE FUNCTION public.credential_proxy_attempt_capability_identity(
+    p_capability_id UUID,
+    p_token_sha256 TEXT
+)
+RETURNS TABLE (
+    proxy_credential_id UUID,
+    agent_id UUID,
+    tenant_id TEXT,
+    project_id TEXT,
+    team_id TEXT,
+    model_credential_ref TEXT,
+    attempt_id UUID,
+    lease_id UUID
+)
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+    SELECT capability.id, assignment.agent_id, task_scope.tenant_id,
+           task_scope.project_id, task_scope.team, credential_ref.model_credential_ref,
+           capability.attempt_id, capability.lease_id
+      FROM public.attempt_execution_capabilities AS capability
+      JOIN public.worker_slot_sessions AS slot_session
+        ON slot_session.id = capability.worker_slot_session_id
+       AND slot_session.slot_id = capability.worker_slot_id
+      JOIN public.worker_slots AS slot
+        ON slot.id = capability.worker_slot_id AND slot.status = 'ACTIVE'
+      JOIN public.task_assignments AS assignment
+        ON assignment.id = capability.assignment_id
+       AND assignment.task_id = capability.task_id
+       AND assignment.attempt_id = capability.attempt_id
+       AND assignment.worker_slot_id = capability.worker_slot_id
+      JOIN public.task_attempts AS attempt
+        ON attempt.id = capability.attempt_id
+       AND attempt.task_id = capability.task_id
+       AND attempt.lease_id = capability.lease_id
+      JOIN public.agent_leases AS lease
+        ON lease.id = capability.lease_id
+       AND lease.task_attempt_id = attempt.id
+       AND lease.agent_id = assignment.agent_id
+      JOIN public.resource_scopes AS task_scope
+        ON task_scope.resource_type = 'TASK'
+       AND task_scope.resource_id = capability.task_id
+      JOIN public.tenant_model_proxy_credential_refs AS credential_ref
+        ON credential_ref.tenant_id = task_scope.tenant_id
+       AND credential_ref.project_id = task_scope.project_id
+       AND credential_ref.team_id = task_scope.team
+       AND credential_ref.enabled
+     WHERE num_nonnulls(p_capability_id, p_token_sha256) = 1
+       AND (p_capability_id IS NULL OR capability.id = p_capability_id)
+       AND (p_token_sha256 IS NULL OR (
+            p_token_sha256 ~ '^[0-9a-fA-F]{64}$'
+            AND capability.token_sha256 = p_token_sha256::CHAR(64)))
+       AND capability.revoked_at IS NULL
+       AND capability.expires_at > statement_timestamp()
+       AND slot_session.revoked_at IS NULL
+       AND slot_session.expires_at > statement_timestamp()
+       AND assignment.phase IN ('ASSIGNED', 'ACCEPTED', 'RUNNING')
+       AND assignment.released_at IS NULL
+       AND attempt.phase IN ('ASSIGNED', 'ACCEPTED', 'RUNNING')
+       AND attempt.lease_expires_at > statement_timestamp()
+       AND lease.status = 'ACTIVE'
+       AND lease.released_at IS NULL
+       AND lease.expires_at > statement_timestamp()
+$$;
+ALTER FUNCTION public.credential_proxy_attempt_capability_identity(UUID, TEXT)
+    OWNER TO credential_proxy_query_owner;
+REVOKE ALL ON FUNCTION public.credential_proxy_attempt_capability_identity(UUID, TEXT) FROM PUBLIC;
+
+-- Gateway receives an Attempt capability only on slot execution events. Keep
+-- validation behind a narrow boolean function so its runtime role cannot read
+-- capability hashes or tenant assignment tables.
+CREATE OR REPLACE FUNCTION public.credential_proxy_gateway_validate_attempt_capability(
+    p_token_sha256 TEXT,
+    p_worker_slot_id UUID,
+    p_agent_id UUID,
+    p_task_id UUID,
+    p_attempt_id UUID,
+    p_lease_id UUID
+)
+RETURNS BOOLEAN
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+    SELECT EXISTS (
+        SELECT 1
+          FROM public.attempt_execution_capabilities AS capability
+          JOIN public.worker_slot_sessions AS slot_session
+            ON slot_session.id = capability.worker_slot_session_id
+           AND slot_session.slot_id = capability.worker_slot_id
+          JOIN public.worker_slots AS slot
+            ON slot.id = capability.worker_slot_id
+           AND slot.status = 'ACTIVE'
+          JOIN public.task_assignments AS assignment
+            ON assignment.id = capability.assignment_id
+           AND assignment.task_id = capability.task_id
+           AND assignment.attempt_id = capability.attempt_id
+           AND assignment.worker_slot_id = capability.worker_slot_id
+          JOIN public.task_attempts AS attempt
+            ON attempt.id = capability.attempt_id
+           AND attempt.task_id = capability.task_id
+           AND attempt.lease_id = capability.lease_id
+          JOIN public.agent_leases AS lease
+            ON lease.id = capability.lease_id
+           AND lease.task_attempt_id = attempt.id
+           AND lease.agent_id = assignment.agent_id
+          JOIN public.resource_scopes AS task_scope
+            ON task_scope.resource_type = 'TASK'
+           AND task_scope.resource_id = capability.task_id
+          JOIN public.tenant_model_proxy_credential_refs AS credential_ref
+            ON credential_ref.tenant_id = task_scope.tenant_id
+           AND credential_ref.project_id = task_scope.project_id
+           AND credential_ref.team_id = task_scope.team
+           AND credential_ref.enabled
+         WHERE p_token_sha256 ~ '^[0-9a-fA-F]{64}$'
+           AND capability.token_sha256 = p_token_sha256::CHAR(64)
+           AND capability.worker_slot_id = p_worker_slot_id
+           AND assignment.agent_id = p_agent_id
+           AND capability.task_id = p_task_id
+           AND capability.attempt_id = p_attempt_id
+           AND capability.lease_id = p_lease_id
+           AND capability.revoked_at IS NULL
+           AND capability.expires_at > statement_timestamp()
+           AND slot_session.revoked_at IS NULL
+           AND slot_session.expires_at > statement_timestamp()
+           AND assignment.phase IN ('ASSIGNED', 'ACCEPTED', 'RUNNING')
+           AND assignment.released_at IS NULL
+           AND attempt.phase IN ('ASSIGNED', 'ACCEPTED', 'RUNNING')
+           AND attempt.lease_expires_at > statement_timestamp()
+           AND lease.status = 'ACTIVE'
+           AND lease.released_at IS NULL
+           AND lease.expires_at > statement_timestamp()
+    )
+$$;
+ALTER FUNCTION public.credential_proxy_gateway_validate_attempt_capability(TEXT, UUID, UUID, UUID, UUID, UUID)
+    OWNER TO credential_proxy_query_owner;
+REVOKE ALL ON FUNCTION public.credential_proxy_gateway_validate_attempt_capability(TEXT, UUID, UUID, UUID, UUID, UUID)
+    FROM PUBLIC;
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'agentteams') THEN
+        GRANT EXECUTE ON FUNCTION public.credential_proxy_gateway_validate_attempt_capability(TEXT, UUID, UUID, UUID, UUID, UUID)
+            TO agentteams;
+    END IF;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.credential_proxy_authenticate_attempt_capability(p_token_sha256 TEXT)
+RETURNS TABLE (
+    proxy_credential_id UUID,
+    agent_id UUID,
+    tenant_id TEXT,
+    project_id TEXT,
+    team_id TEXT,
+    model_credential_ref TEXT,
+    attempt_id UUID,
+    lease_id UUID
+)
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+    SELECT * FROM public.credential_proxy_attempt_capability_identity(NULL, p_token_sha256)
+$$;
+ALTER FUNCTION public.credential_proxy_authenticate_attempt_capability(TEXT)
+    OWNER TO credential_proxy_query_owner;
+REVOKE ALL ON FUNCTION public.credential_proxy_authenticate_attempt_capability(TEXT) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.credential_proxy_authenticate_attempt_capability(TEXT)
+    TO credential_proxy_query;
+
+CREATE OR REPLACE FUNCTION public.credential_proxy_revalidate_attempt_capability(p_capability_id UUID)
+RETURNS TABLE (
+    proxy_credential_id UUID,
+    agent_id UUID,
+    tenant_id TEXT,
+    project_id TEXT,
+    team_id TEXT,
+    model_credential_ref TEXT,
+    attempt_id UUID,
+    lease_id UUID
+)
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+    SELECT * FROM public.credential_proxy_attempt_capability_identity(p_capability_id, NULL)
+$$;
+ALTER FUNCTION public.credential_proxy_revalidate_attempt_capability(UUID)
+    OWNER TO credential_proxy_query_owner;
+REVOKE ALL ON FUNCTION public.credential_proxy_revalidate_attempt_capability(UUID) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.credential_proxy_revalidate_attempt_capability(UUID)
     TO credential_proxy_query;

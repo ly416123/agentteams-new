@@ -45,6 +45,13 @@ public class CredentialProxyApplication {
     }
 
     @Bean
+    AttemptExecutionCapabilityIssuer attemptExecutionCapabilityIssuer(
+            JdbcTemplate jdbc,
+            @Value("${agentteams.credential-proxy.attempt-capability-ttl-seconds:120}") int ttlSeconds) {
+        return new JdbcAttemptExecutionCapabilityIssuer(jdbc, ttlSeconds);
+    }
+
+    @Bean
     AttemptExecutionContextResolver attemptExecutionContextResolver(
             ActiveAttemptRepository attempts, Clock credentialProxyClock) {
         return new AttemptExecutionContextResolver(attempts, credentialProxyClock);

@@ -56,7 +56,9 @@ Control Plane 仅绑定到 `127.0.0.1:${CONTROL_PLANE_PORT}`；PostgreSQL、NATS
 
 ## 固定 Worker 槽位
 
-`WORKER_REPLICAS` 取值为 0 到 8。每个槽位有固定且唯一的 `AGENTTEAMS_AGENT_ID`；不要使用 `docker compose --scale`，它会复制同一个槽位身份。启动脚本只选择前 N 个槽位，不会一并拉起全部 Worker。
+`WORKER_REPLICAS` 取值为 0 到 8。每个槽位使用固定且唯一的 `WORKER_N_SLOT_ID`；不要使用 `docker compose --scale`，它会复制同一个槽位身份。`WORKER_SLOT_IDS_JSON` 必须按相同顺序包含这些 UUID，启动前由 Enrollment DB setup 预置。启动脚本只选择前 N 个槽位，不会一并拉起全部 Worker。
+
+slot session 与 Attempt capability 已接入 Worker 启动配置：Worker 用 tenant-neutral slot bearer 建立 Gateway 会话；模型请求、Task execution events、Artifact prepare/complete 共享同一 Attempt capability，并在临近到期时续签。`WORKER_SLOT_SCHEDULING_ENABLED` 默认关闭，Control Plane 只有在 slot-aware Assignment、Lease 与公平队列路径完成真实闭环验收后才能开启。workspace 访问的 Attempt capability 校验和真实 A/B 共享槽位执行仍未验收。
 
 ### 估算固定容量
 
@@ -80,23 +82,13 @@ docker compose --env-file .env -f compose.yaml --profile secure-api up -d contro
 docker compose --env-file .env -f compose.yaml ps
 ```
 
-Agent scope 必须在 `metadata.scope` 中包含 enrollment 配置所使用的 `tenant`、`project`、`team` 值。申请 OIDC access token 的主体需带 `worker:session:manage` 权限。为每个要启用的槽位单独签发 token（bearer token 从安全的临时文件读取，不要放进 shell history）：
+申请 OIDC access token 的主体需带 `worker:slot:session:manage` 权限。为每个要启用的固定槽位单独签发 tenant-neutral session。OIDC 主体需要 `worker:slot:session:manage` 权限；token 只写入权限为 `0600` 的 env 文件，不要放进 shell history：
 
 ```sh
-./enroll-worker.sh http://127.0.0.1:8090 <agent-uuid> /secure/path/oidc-access-token ./secrets/worker-1.runtime.env
+./enroll-worker-slot.sh http://127.0.0.1:8090 <slot-uuid> /secure/path/oidc-access-token ./secrets/worker-1.runtime.env
 ```
 
-基础用法只把 Gateway token 写入槽位文件；明文仅在 Enrollment 响应和本机受限文件短暂出现，数据库存哈希。设置 `.env` 中对应的 `WORKER_1_CREDENTIALS_FILE` 路径（相对路径以本目录为准）、`WORKER_REPLICAS=1`，再启动：
-
-Enrollment 也会为模型代理创建独立短期凭据。附加 `ttl-seconds`、Tenant/Project 下的非敏感 `model-credential-ref` 和代理 Token 文件路径：
-
-```sh
-./enroll-worker.sh http://127.0.0.1:8090 <agent-uuid> /secure/path/oidc-access-token \
-  ./secrets/worker-1.runtime.env 604800 file:tenant-a/project-a/team-a/chatgpt ./secrets/worker-1.model-proxy-token
-```
-
-Gateway session 和 Attempt 模型 token 互不通用；数据库只存 Gateway session 与模型 token 的 SHA-256。Worker 每次发起模型调用时，用当前活动 Assignment/Attempt/Lease 向内部签发接口请求一个最多 120 秒且不晚于 Lease 的 token；凭据记录绑定原 Gateway session，撤销 session 后新签发和现有 token 的认证/流式重验证均失败。Worker 不把 `atp_` token 写入文件。Responses API 请求发往内部 Credential Proxy；Proxy 逐请求校验唯一活动 Assignment/Attempt/Lease，并从持久 TASK scope 解析 Tenant/Project/Team，再读取受信 Provider ref 对应的 Secret、替换 Authorization 并流式转发。客户端不能通过请求体或 header 选择租户/Attempt；非成功上游错误正文不会回传给 Worker。
-
+`WORKER_1_CREDENTIALS_FILE` 指向上述 session 文件，`WORKER_1_SLOT_ID` 与 `WORKER_SLOT_IDS_JSON` 的第一个 UUID 必须相同。Credential Proxy 以 Attempt capability 校验当前 Assignment/Attempt/Lease，再按持久 TASK scope 选择租户 Provider secret；模型 token 不落盘。启动前需确认配额、公平派发和 Artifact/workspace 隔离仍满足当前验证状态。
 ```sh
 ./start-workers.sh
 ```
@@ -104,7 +96,7 @@ Gateway session 和 Attempt 模型 token 互不通用；数据库只存 Gateway 
 
 命令中显式列出槽位，避免 Compose profile 一次启动全部 8 个 Worker。Worker 并发固定为 1。增加容量需要修改版本化部署配置、执行受控变更并确认注册状态；任务高峰超过容量时由系统排队/限流，不创建 Worker。
 
-启动脚本会校验每个活动槽位的 Agent UUID、独立凭据文件和文件权限，并自动开启 `secure-api` 与 `worker-pool` profile。不要复用槽位凭据文件。
+启动脚本会校验每个活动槽位的 slot UUID、slot session 文件和文件权限，并自动开启 `secure-api` 与 `worker-pool` profile。不要复用槽位凭据文件。
 
 轮换时先签发新 token 到当前槽位文件，重启对应 Worker 使其重新握手，再撤销旧 session：
 
@@ -113,6 +105,8 @@ Gateway session 和 Attempt 模型 token 互不通用；数据库只存 Gateway 
 ```
 
 撤销会阻止后续 Gateway 握手及模型请求，并使已签发的 Attempt token 在下一次认证或流式 Lease 检查时失效；v0.1.5 不会主动断开已建立的 Gateway 连接。多个固定 Worker 槽位可作为租户中立执行容量，Tenant 凭据由活动 Task scope 选择，不再绑定 Worker 槽位。任务派发目前仍需完成 Tenant-neutral Enrollment 与公平队列接线后，才能实现多租户共享运行。
+
+Enrollment 提供全局 slot session 管理 API：`POST /api/v1/worker-slots/{slotId}/sessions` 与 `DELETE /api/v1/worker-slots/{slotId}/sessions/{sessionId}`。签发要求 OIDC `worker:slot:session:manage` 权限，不读取 Tenant/Project/Team claims；响应禁止缓存，数据库只存 token SHA-256。派生 Gateway 可用 slot bearer 建立 gRPC 会话，并把在线状态写到 `worker-slot:<UUID>` 独立命名空间，不创建或更新租户 Agent。Task events 与 Artifact prepare/complete 都要求匹配具体 Task/Attempt/Lease 的短期 capability；workspace 访问仍需补 capability 边界，slot 调度也继续默认关闭。
 
 ### 安全重启固定槽位
 
@@ -159,6 +153,6 @@ COMPOSE_PROJECT_NAME=agentteams-restore-2026-11-05 ./start-workers.sh .env
 ## 当前限制
 
 - Worker 镜像仍沿用旧仓库发布制品；本仓库没有复制业务状态机。
-- 此部署拓扑尚未证明跨租户会话、workspace、工具状态和 Artifact 的强隔离。多租户上线前必须完成 `docs/plans/2026-11-04-agentteams-new-bootstrap.md` 的批次 2 验收。
+- 此部署拓扑尚未完成同一 Worker 上 Tenant A/B 连续复用、workspace/工具状态隔离和 Artifact 全链路验收。多租户上线前必须完成 `docs/plans/2026-11-04-agentteams-new-bootstrap.md` 的批次 2 验收。
 - 本机容器网络隔离不能替代任务级 sandbox。对不可信代码/工具执行应拒绝或接入明确的 gVisor/Kata/MicroVM Provider。
 - Compose 不提供高可用控制面、多主机调度、自动扩缩容或 Kubernetes 等价 Sandbox。

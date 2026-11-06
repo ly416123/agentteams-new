@@ -223,14 +223,31 @@ PYBINDINGS
     exit 2
   fi
   while [ "$slot" -le "$replicas" ]; do
-    id=$(value "WORKER_${slot}_AGENT_ID")
+    id=$(value "WORKER_${slot}_SLOT_ID")
     if ! printf '%s\n' "$id" | awk '/^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$/ { ok=1 } END { exit !ok }'; then
-      echo "WORKER_${slot}_AGENT_ID must be a UUID registered with this Control Plane" >&2
+      echo "WORKER_${slot}_SLOT_ID must be a provisioned Worker slot UUID" >&2
+      exit 2
+    fi
+    if ! python3 - "$id" "$slot" "$(value WORKER_SLOT_IDS_JSON)" <<'PYSLOTS'
+import json
+import sys
+import uuid
+
+slot_id, index, raw_slots = sys.argv[1], int(sys.argv[2]) - 1, sys.argv[3]
+try:
+    slots = [str(uuid.UUID(item)) for item in json.loads(raw_slots)]
+except (ValueError, TypeError, json.JSONDecodeError):
+    raise SystemExit(1)
+if index >= len(slots) or slots[index] != str(uuid.UUID(slot_id)) or len(set(slots)) != len(slots):
+    raise SystemExit(1)
+PYSLOTS
+    then
+      echo "WORKER_${slot}_SLOT_ID must match the same position in WORKER_SLOT_IDS_JSON" >&2
       exit 2
     fi
     normalized_id=$(printf '%s' "$id" | tr '[:upper:]' '[:lower:]')
     case "$seen_ids" in
-      *" $normalized_id "*) echo "Worker Agent UUIDs must be unique" >&2; exit 2 ;;
+      *" $normalized_id "*) echo "Worker slot UUIDs must be unique" >&2; exit 2 ;;
     esac
     seen_ids="$seen_ids$normalized_id "
     credential_file=$(value "WORKER_${slot}_CREDENTIALS_FILE")
@@ -238,8 +255,8 @@ PYBINDINGS
       /*) ;;
       *) credential_file="$(CDPATH= cd -- "$(dirname -- "$env_file")" && pwd)/$credential_file" ;;
     esac
-    if [ ! -r "$credential_file" ] || ! grep -Eq '^AGENTTEAMS_GATEWAY_AUTH_TOKEN=ats_[A-Za-z0-9_-]{40,}$' "$credential_file"; then
-      echo "WORKER_${slot}_CREDENTIALS_FILE must contain an enrolled Gateway token" >&2
+    if [ ! -r "$credential_file" ] || ! grep -Eq '^AGENTTEAMS_GATEWAY_AUTH_TOKEN=wslot_[A-Za-z0-9_-]{40,}$' "$credential_file"; then
+      echo "WORKER_${slot}_CREDENTIALS_FILE must contain a Worker slot session token" >&2
       exit 2
     fi
     if mode=$(stat -f '%Lp' "$credential_file" 2>/dev/null); then :; else mode=$(stat -c '%a' "$credential_file"); fi

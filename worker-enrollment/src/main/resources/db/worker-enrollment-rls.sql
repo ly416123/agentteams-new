@@ -7,6 +7,27 @@ CREATE TABLE IF NOT EXISTS worker_enrollment_agent_scopes (
     team_id TEXT NOT NULL
 );
 
+-- Tenant-neutral fixed execution capacity. A slot has no Tenant/Project/Team
+-- scope, and each TaskAssignment will bind it to one active Attempt.
+CREATE TABLE IF NOT EXISTS worker_slots (
+    id UUID PRIMARY KEY,
+    status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'DRAINING', 'DISABLED')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT statement_timestamp(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT statement_timestamp()
+);
+
+CREATE TABLE IF NOT EXISTS worker_slot_sessions (
+    id UUID PRIMARY KEY,
+    slot_id UUID NOT NULL REFERENCES worker_slots(id) ON DELETE CASCADE,
+    subject TEXT NOT NULL CHECK (length(btrim(subject)) > 0),
+    token_sha256 CHAR(64) NOT NULL UNIQUE CHECK (token_sha256 ~ '^[0-9a-f]{64}$'),
+    expires_at TIMESTAMPTZ NOT NULL,
+    revoked_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT statement_timestamp()
+);
+CREATE INDEX IF NOT EXISTS worker_slot_sessions_active_idx
+    ON worker_slot_sessions(slot_id, expires_at) WHERE revoked_at IS NULL;
+
 CREATE UNIQUE INDEX IF NOT EXISTS agent_sessions_id_agent_id_key
     ON agent_sessions (id, agent_id);
 
@@ -339,3 +360,156 @@ CREATE POLICY worker_enrollment_model_proxy_credentials_update_scope
         AND project_id = NULLIF(current_setting('agentteams.project_id', true), '')
         AND team_id = NULLIF(current_setting('agentteams.team_id', true), '')
     );
+
+-- The runtime Enrollment role can manage slot sessions only through these
+-- narrow functions. It receives neither SELECT nor DML privileges on the tables.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'worker_enrollment_slot_owner') THEN
+        CREATE ROLE worker_enrollment_slot_owner
+            NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+    END IF;
+END;
+$$;
+ALTER ROLE worker_enrollment_slot_owner
+    WITH NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+ALTER TABLE worker_slots OWNER TO worker_enrollment_slot_owner;
+ALTER TABLE worker_slot_sessions OWNER TO worker_enrollment_slot_owner;
+GRANT USAGE ON SCHEMA public TO worker_enrollment_slot_owner;
+GRANT SELECT ON worker_slots TO worker_enrollment_slot_owner;
+GRANT SELECT, INSERT, UPDATE ON worker_slot_sessions TO worker_enrollment_slot_owner;
+ALTER TABLE worker_slots ENABLE ROW LEVEL SECURITY;
+ALTER TABLE worker_slot_sessions ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS worker_enrollment_slot_owner_slots ON worker_slots;
+CREATE POLICY worker_enrollment_slot_owner_slots ON worker_slots
+    FOR SELECT TO worker_enrollment_slot_owner USING (true);
+DROP POLICY IF EXISTS worker_enrollment_slot_owner_sessions ON worker_slot_sessions;
+CREATE POLICY worker_enrollment_slot_owner_sessions ON worker_slot_sessions
+    FOR ALL TO worker_enrollment_slot_owner USING (true) WITH CHECK (true);
+REVOKE ALL ON TABLE worker_slots, worker_slot_sessions FROM PUBLIC, worker_enrollment;
+GRANT SELECT ON TABLE worker_slots TO agentteams_runtime;
+DROP POLICY IF EXISTS worker_enrollment_runtime_read_slots ON worker_slots;
+CREATE POLICY worker_enrollment_runtime_read_slots ON worker_slots
+    FOR SELECT TO agentteams_runtime USING (true);
+
+CREATE OR REPLACE FUNCTION public.worker_enrollment_worker_slot_is_active(p_slot_id UUID)
+RETURNS BOOLEAN
+LANGUAGE SQL
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+    SELECT EXISTS (SELECT 1 FROM public.worker_slots WHERE id = p_slot_id AND status = 'ACTIVE')
+$$;
+ALTER FUNCTION public.worker_enrollment_worker_slot_is_active(UUID)
+    OWNER TO worker_enrollment_slot_owner;
+REVOKE ALL ON FUNCTION public.worker_enrollment_worker_slot_is_active(UUID) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.worker_enrollment_worker_slot_is_active(UUID) TO worker_enrollment;
+
+CREATE OR REPLACE FUNCTION public.worker_enrollment_create_worker_slot_session(
+    p_session_id UUID, p_slot_id UUID, p_subject TEXT, p_token_sha256 TEXT,
+    p_expires_at TIMESTAMPTZ, p_created_at TIMESTAMPTZ)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+    INSERT INTO public.worker_slot_sessions(id, slot_id, subject, token_sha256, expires_at, created_at)
+    SELECT p_session_id, p_slot_id, p_subject, p_token_sha256, p_expires_at, p_created_at
+     WHERE EXISTS (SELECT 1 FROM public.worker_slots WHERE id = p_slot_id AND status = 'ACTIVE');
+    RETURN FOUND;
+END;
+$$;
+ALTER FUNCTION public.worker_enrollment_create_worker_slot_session(UUID, UUID, TEXT, TEXT, TIMESTAMPTZ, TIMESTAMPTZ)
+    OWNER TO worker_enrollment_slot_owner;
+REVOKE ALL ON FUNCTION public.worker_enrollment_create_worker_slot_session(
+    UUID, UUID, TEXT, TEXT, TIMESTAMPTZ, TIMESTAMPTZ) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.worker_enrollment_create_worker_slot_session(
+    UUID, UUID, TEXT, TEXT, TIMESTAMPTZ, TIMESTAMPTZ) TO worker_enrollment;
+
+CREATE OR REPLACE FUNCTION public.worker_enrollment_worker_slot_session_for_update(
+    p_slot_id UUID, p_session_id UUID)
+RETURNS TABLE (slot_id UUID, revoked BOOLEAN)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+    RETURN QUERY
+    SELECT session.slot_id, session.revoked_at IS NOT NULL
+      FROM public.worker_slot_sessions AS session
+     WHERE session.slot_id = p_slot_id AND session.id = p_session_id
+     FOR UPDATE OF session;
+END;
+$$;
+ALTER FUNCTION public.worker_enrollment_worker_slot_session_for_update(UUID, UUID)
+    OWNER TO worker_enrollment_slot_owner;
+REVOKE ALL ON FUNCTION public.worker_enrollment_worker_slot_session_for_update(UUID, UUID) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.worker_enrollment_worker_slot_session_for_update(UUID, UUID)
+    TO worker_enrollment;
+
+CREATE OR REPLACE FUNCTION public.worker_enrollment_revoke_worker_slot_session(
+    p_slot_id UUID, p_session_id UUID, p_revoked_at TIMESTAMPTZ)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+    UPDATE public.worker_slot_sessions
+       SET revoked_at = COALESCE(revoked_at, p_revoked_at)
+     WHERE slot_id = p_slot_id AND id = p_session_id;
+    RETURN FOUND;
+END;
+$$;
+ALTER FUNCTION public.worker_enrollment_revoke_worker_slot_session(UUID, UUID, TIMESTAMPTZ)
+    OWNER TO worker_enrollment_slot_owner;
+REVOKE ALL ON FUNCTION public.worker_enrollment_revoke_worker_slot_session(UUID, UUID, TIMESTAMPTZ)
+    FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.worker_enrollment_revoke_worker_slot_session(UUID, UUID, TIMESTAMPTZ)
+    TO worker_enrollment;
+
+-- The Gateway may verify a slot's long-lived workload identity but must never
+-- read the session table or learn its secret hash. Only active slots are
+-- discoverable, while revoked/expired sessions remain visible so the Gateway can
+-- reject them using the same response path.
+CREATE OR REPLACE FUNCTION public.worker_enrollment_worker_slot_session_by_token_sha256(
+    p_token_sha256 CHAR(64))
+RETURNS TABLE (slot_id UUID, expires_at TIMESTAMPTZ, revoked_at TIMESTAMPTZ)
+LANGUAGE SQL
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+    SELECT session.slot_id, session.expires_at, session.revoked_at
+      FROM public.worker_slot_sessions AS session
+      JOIN public.worker_slots AS slot ON slot.id = session.slot_id
+     WHERE session.token_sha256 = p_token_sha256 AND slot.status = 'ACTIVE'
+$$;
+ALTER FUNCTION public.worker_enrollment_worker_slot_session_by_token_sha256(CHAR(64))
+    OWNER TO worker_enrollment_slot_owner;
+REVOKE ALL ON FUNCTION public.worker_enrollment_worker_slot_session_by_token_sha256(CHAR(64)) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.worker_enrollment_worker_slot_session_by_token_sha256(CHAR(64))
+    TO agentteams_runtime;
+
+-- Credential Proxy needs a session ID to bind an Attempt capability so that
+-- revoking or expiring the long-lived slot session can invalidate renewals.
+-- It receives no token hash or subject and cannot read the session table.
+CREATE OR REPLACE FUNCTION public.worker_enrollment_worker_slot_session_context_by_token_sha256(
+    p_token_sha256 CHAR(64))
+RETURNS TABLE (session_id UUID, slot_id UUID, expires_at TIMESTAMPTZ, revoked_at TIMESTAMPTZ)
+LANGUAGE SQL
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+    SELECT session.id, session.slot_id, session.expires_at, session.revoked_at
+      FROM public.worker_slot_sessions AS session
+      JOIN public.worker_slots AS slot ON slot.id = session.slot_id
+     WHERE session.token_sha256 = p_token_sha256 AND slot.status = 'ACTIVE'
+$$;
+ALTER FUNCTION public.worker_enrollment_worker_slot_session_context_by_token_sha256(CHAR(64))
+    OWNER TO worker_enrollment_slot_owner;
+REVOKE ALL ON FUNCTION public.worker_enrollment_worker_slot_session_context_by_token_sha256(CHAR(64))
+    FROM PUBLIC;

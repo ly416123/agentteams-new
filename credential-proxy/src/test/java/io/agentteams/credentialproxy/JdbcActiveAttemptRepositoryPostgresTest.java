@@ -47,7 +47,11 @@ class JdbcActiveAttemptRepositoryPostgresTest {
     private static final UUID LEASE = id("88000000-0000-0000-0000-000000000004");
     private static final UUID PROXY_CREDENTIAL_ID = id("88000000-0000-0000-0000-000000000005");
     private static final UUID SESSION_ID = id("88000000-0000-0000-0000-000000000006");
+    private static final UUID SLOT_ID = id("88000000-0000-0000-0000-000000000007");
+    private static final UUID SLOT_SESSION_ID = id("88000000-0000-0000-0000-000000000008");
+    private static final UUID ASSIGNMENT_ID = id("88000000-0000-0000-0000-000000000009");
     private static final String PROXY_TOKEN = "atp_" + "A".repeat(43);
+    private static final String SLOT_SESSION_TOKEN = "wslot_" + "S".repeat(43);
 
     @Container
     static final PostgreSQLContainer<?> POSTGRES = new PostgreSQLContainer<>("postgres:16-alpine")
@@ -88,27 +92,44 @@ class JdbcActiveAttemptRepositoryPostgresTest {
         jdbc.execute("DROP FUNCTION IF EXISTS credential_proxy_authenticate_v2(TEXT) CASCADE");
         jdbc.execute("DROP FUNCTION IF EXISTS credential_proxy_active_attempts(UUID) CASCADE");
         jdbc.execute("DROP FUNCTION IF EXISTS credential_proxy_active_attempts(UUID, TEXT, TEXT, TEXT) CASCADE");
+        jdbc.execute("DROP FUNCTION IF EXISTS credential_proxy_issue_attempt_capability(TEXT, UUID, UUID, UUID, UUID, TEXT, UUID, INTEGER) CASCADE");
+        jdbc.execute("DROP FUNCTION IF EXISTS worker_enrollment_worker_slot_session_context_by_token_sha256(CHAR(64)) CASCADE");
+        jdbc.execute("DROP TABLE IF EXISTS attempt_execution_capabilities CASCADE");
+        jdbc.execute("DROP TABLE IF EXISTS worker_slot_sessions CASCADE");
+        jdbc.execute("DROP TABLE IF EXISTS worker_slots CASCADE");
         jdbc.execute("DROP ROLE IF EXISTS credential_proxy_test");
+        jdbc.execute("DROP ROLE IF EXISTS credential_proxy_capability_test");
         jdbc.execute("DROP TABLE IF EXISTS attempt_model_proxy_credentials, tenant_model_proxy_credential_refs, worker_model_proxy_credentials, agent_sessions, worker_enrollment_agent_scopes CASCADE");
         jdbc.execute("DROP TABLE IF EXISTS task_assignments, task_attempts, agent_leases, resource_scopes CASCADE");
         jdbc.execute("DO $$ BEGIN "
                 + "IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'credential_proxy_runtime') THEN EXECUTE 'DROP OWNED BY credential_proxy_runtime'; END IF; "
                 + "IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'worker_enrollment') THEN EXECUTE 'DROP OWNED BY worker_enrollment'; END IF; "
                 + "IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'agentteams_runtime') THEN EXECUTE 'DROP OWNED BY agentteams_runtime'; END IF; "
+                + "IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'agentteams') THEN EXECUTE 'DROP OWNED BY agentteams'; END IF; "
                 + "IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'credential_proxy_query') THEN EXECUTE 'DROP OWNED BY credential_proxy_query'; END IF; "
                 + "IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'credential_proxy_query_owner') THEN EXECUTE 'DROP OWNED BY credential_proxy_query_owner'; END IF; "
                 + "IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'credential_proxy_query') AND EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'credential_proxy_runtime') THEN EXECUTE 'REVOKE credential_proxy_query FROM credential_proxy_runtime'; END IF; END $$");
         jdbc.execute("DROP ROLE IF EXISTS credential_proxy_runtime");
         jdbc.execute("DROP ROLE IF EXISTS worker_enrollment");
         jdbc.execute("DROP ROLE IF EXISTS agentteams_runtime");
+        jdbc.execute("DROP ROLE IF EXISTS agentteams");
         jdbc.execute("DROP ROLE IF EXISTS credential_proxy_query");
         jdbc.execute("DROP ROLE IF EXISTS credential_proxy_query_owner");
         jdbc.execute("CREATE TABLE task_attempts (id UUID PRIMARY KEY, task_id UUID NOT NULL, lease_id UUID NOT NULL, phase TEXT NOT NULL, lease_expires_at TIMESTAMPTZ NOT NULL)");
-        jdbc.execute("CREATE TABLE task_assignments (id UUID PRIMARY KEY, task_id UUID NOT NULL, attempt_id UUID NOT NULL, agent_id UUID NOT NULL, phase TEXT NOT NULL, released_at TIMESTAMPTZ)");
+        jdbc.execute("CREATE TABLE task_assignments (id UUID PRIMARY KEY, task_id UUID NOT NULL, attempt_id UUID NOT NULL, agent_id UUID NOT NULL, worker_slot_id UUID, phase TEXT NOT NULL, released_at TIMESTAMPTZ)");
         jdbc.execute("CREATE TABLE agent_leases (id UUID PRIMARY KEY, agent_id UUID NOT NULL, task_attempt_id UUID NOT NULL, expires_at TIMESTAMPTZ NOT NULL, released_at TIMESTAMPTZ, status TEXT NOT NULL)");
         jdbc.execute("CREATE TABLE resource_scopes (resource_type TEXT NOT NULL, resource_id UUID NOT NULL, tenant_id TEXT NOT NULL, project_id TEXT NOT NULL, team TEXT NOT NULL, PRIMARY KEY(resource_type, resource_id))");
         jdbc.execute("CREATE TABLE agent_sessions (id UUID PRIMARY KEY, agent_id UUID NOT NULL, token_sha256 CHAR(64), expires_at TIMESTAMPTZ NOT NULL, revoked_at TIMESTAMPTZ)");
         jdbc.execute("CREATE TABLE worker_enrollment_agent_scopes (agent_id UUID PRIMARY KEY, tenant_id TEXT NOT NULL, project_id TEXT NOT NULL, team_id TEXT NOT NULL)");
+        jdbc.execute("CREATE TABLE worker_slots (id UUID PRIMARY KEY, status TEXT NOT NULL)");
+        jdbc.execute("CREATE TABLE worker_slot_sessions (id UUID PRIMARY KEY, slot_id UUID NOT NULL, token_sha256 CHAR(64) NOT NULL UNIQUE, expires_at TIMESTAMPTZ NOT NULL, revoked_at TIMESTAMPTZ)");
+        jdbc.execute("CREATE FUNCTION public.worker_enrollment_worker_slot_session_context_by_token_sha256(CHAR(64)) "
+                + "RETURNS TABLE(session_id UUID, slot_id UUID, expires_at TIMESTAMPTZ, revoked_at TIMESTAMPTZ) "
+                + "LANGUAGE SQL STABLE SECURITY DEFINER AS $$ SELECT session.id, session.slot_id, "
+                + "session.expires_at, session.revoked_at FROM public.worker_slot_sessions session "
+                + "JOIN public.worker_slots slot ON slot.id = session.slot_id "
+                + "WHERE session.token_sha256 = $1 AND slot.status = 'ACTIVE' $$");
+        jdbc.execute("REVOKE ALL ON FUNCTION public.worker_enrollment_worker_slot_session_context_by_token_sha256(CHAR(64)) FROM PUBLIC");
         jdbc.execute("CREATE TABLE worker_model_proxy_credentials (id UUID PRIMARY KEY, session_id UUID NOT NULL, agent_id UUID NOT NULL, tenant_id TEXT NOT NULL, project_id TEXT NOT NULL, team_id TEXT NOT NULL, token_sha256 CHAR(64) NOT NULL UNIQUE, model_credential_ref TEXT NOT NULL, expires_at TIMESTAMPTZ NOT NULL, revoked_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL)");
         jdbc.execute("ALTER TABLE agent_sessions ENABLE ROW LEVEL SECURITY");
         jdbc.execute("ALTER TABLE worker_enrollment_agent_scopes ENABLE ROW LEVEL SECURITY");
@@ -117,6 +138,7 @@ class JdbcActiveAttemptRepositoryPostgresTest {
         jdbc.execute("CREATE ROLE credential_proxy_runtime NOLOGIN NOSUPERUSER NOBYPASSRLS");
         jdbc.execute("CREATE ROLE worker_enrollment NOLOGIN NOSUPERUSER NOBYPASSRLS");
         jdbc.execute("CREATE ROLE agentteams_runtime NOLOGIN NOSUPERUSER NOBYPASSRLS");
+        jdbc.execute("CREATE ROLE agentteams LOGIN PASSWORD 'gateway-test-password' NOSUPERUSER NOBYPASSRLS");
         jdbc.execute("CREATE FUNCTION public.credential_proxy_active_attempts(UUID, TEXT, TEXT, TEXT) "
                 + "RETURNS INTEGER LANGUAGE SQL STABLE SECURITY DEFINER AS 'SELECT 1'");
         jdbc.execute("GRANT EXECUTE ON FUNCTION public.credential_proxy_active_attempts(UUID, TEXT, TEXT, TEXT) "
@@ -212,6 +234,120 @@ class JdbcActiveAttemptRepositoryPostgresTest {
                 .isInstanceOf(AttemptCredentialDeniedException.class);
         assertThat(jdbc.queryForObject("SELECT count(*) FROM attempt_model_proxy_credentials", Long.class))
                 .isZero();
+    }
+
+    @Test
+    void issuesAttemptCapabilityForTheActiveSlotAssignmentAndStoresOnlyItsHash() throws Exception {
+        insertSlotSession(SLOT_ID, SLOT_SESSION_ID, SLOT_SESSION_TOKEN, "now() + interval '10 minutes'");
+        insertActiveOnSlot(AGENT, TASK, ATTEMPT, LEASE, SLOT_ID, ASSIGNMENT_ID);
+        insertScope("TASK", TASK, "tenant-a", "project-a", "team-a");
+        jdbc.execute("INSERT INTO tenant_model_proxy_credential_refs VALUES "
+                + "('tenant-a', 'project-a', 'team-a', 'file:tenant-a/project-a/team-a/default', TRUE)");
+        jdbc.execute("CREATE ROLE credential_proxy_capability_test LOGIN PASSWORD 'proxy-cap-password'");
+        jdbc.execute("GRANT credential_proxy_query TO credential_proxy_capability_test");
+        var restricted = new JdbcTemplate(new DriverManagerDataSource(
+                POSTGRES.getJdbcUrl(), "credential_proxy_capability_test", "proxy-cap-password"));
+
+        IssuedAttemptCapability issued = new JdbcAttemptExecutionCapabilityIssuer(restricted, 120)
+                .issue(SLOT_SESSION_TOKEN, TASK, ASSIGNMENT_ID, ATTEMPT, LEASE);
+
+        assertThat(issued.token()).startsWith("cap_").hasSize(47);
+        assertThat(issued.expiresAt()).isBefore(Instant.now().plusSeconds(121));
+        assertThat(jdbc.queryForObject("SELECT token_sha256 FROM attempt_execution_capabilities",
+                String.class)).isEqualTo(sha256(issued.token()));
+        assertThat(jdbc.queryForObject("SELECT token_sha256 FROM attempt_execution_capabilities",
+                String.class)).doesNotContain(issued.token());
+        assertThat(jdbc.queryForObject("SELECT worker_slot_id FROM attempt_execution_capabilities",
+                UUID.class)).isEqualTo(SLOT_ID);
+        assertThat(jdbc.queryForObject("SELECT assignment_id FROM attempt_execution_capabilities",
+                UUID.class)).isEqualTo(ASSIGNMENT_ID);
+        assertThat(jdbc.queryForObject("SELECT worker_slot_session_id FROM attempt_execution_capabilities",
+                UUID.class)).isEqualTo(SLOT_SESSION_ID);
+        var authenticator = new JdbcModelProxyCredentialAuthenticator(restricted);
+        AuthenticatedWorker worker = authenticator.authenticate(issued.token()).orElseThrow();
+        assertThat(worker.credentialKind()).isEqualTo(AuthenticatedWorker.CredentialKind.EXECUTION_CAPABILITY);
+        assertThat(worker.agentId()).isEqualTo(AGENT);
+        assertThat(worker.tenantId()).isEqualTo("tenant-a");
+        assertThat(worker.projectId()).isEqualTo("project-a");
+        assertThat(worker.teamId()).isEqualTo("team-a");
+        assertThat(worker.attemptId()).isEqualTo(ATTEMPT);
+        assertThat(worker.leaseId()).isEqualTo(LEASE);
+        assertThat(authenticator.revalidate(worker)).contains(worker);
+        jdbc.update("UPDATE tenant_model_proxy_credential_refs SET enabled = FALSE");
+        assertThat(authenticator.authenticate(issued.token())).isEmpty();
+        assertThat(authenticator.revalidate(worker)).isEmpty();
+        jdbc.update("UPDATE tenant_model_proxy_credential_refs SET enabled = TRUE");
+        jdbc.update("UPDATE worker_slot_sessions SET revoked_at = now() WHERE id = ?", SLOT_SESSION_ID);
+        assertThat(authenticator.authenticate(issued.token())).isEmpty();
+        assertThat(authenticator.revalidate(worker)).isEmpty();
+        jdbc.update("UPDATE worker_slot_sessions SET revoked_at = NULL WHERE id = ?", SLOT_SESSION_ID);
+        jdbc.update("UPDATE attempt_execution_capabilities SET revoked_at = now() WHERE id = ?",
+                jdbc.queryForObject("SELECT id FROM attempt_execution_capabilities", UUID.class));
+        assertThat(authenticator.authenticate(issued.token())).isEmpty();
+        assertThat(authenticator.revalidate(worker)).isEmpty();
+        assertThatThrownBy(() -> restricted.queryForObject(
+                "SELECT token_sha256 FROM attempt_execution_capabilities", String.class))
+                .isInstanceOf(org.springframework.dao.DataAccessException.class);
+    }
+
+    @Test
+    void invalidatesExecutionCapabilityWhenItsLeaseIsReleased() throws Exception {
+        insertSlotSession(SLOT_ID, SLOT_SESSION_ID, SLOT_SESSION_TOKEN, "now() + interval '10 minutes'");
+        insertActiveOnSlot(AGENT, TASK, ATTEMPT, LEASE, SLOT_ID, ASSIGNMENT_ID);
+        insertScope("TASK", TASK, "tenant-a", "project-a", "team-a");
+        jdbc.execute("INSERT INTO tenant_model_proxy_credential_refs VALUES "
+                + "('tenant-a', 'project-a', 'team-a', 'file:tenant-a/project-a/team-a/default', TRUE)");
+        var issued = new JdbcAttemptExecutionCapabilityIssuer(jdbc, 120)
+                .issue(SLOT_SESSION_TOKEN, TASK, ASSIGNMENT_ID, ATTEMPT, LEASE);
+        var authenticator = new JdbcModelProxyCredentialAuthenticator(jdbc);
+        AuthenticatedWorker worker = authenticator.authenticate(issued.token()).orElseThrow();
+
+        jdbc.update("UPDATE agent_leases SET status = 'RELEASED', released_at = now() WHERE id = ?", LEASE);
+
+        assertThat(authenticator.authenticate(issued.token())).isEmpty();
+        assertThat(authenticator.revalidate(worker)).isEmpty();
+    }
+
+    @Test
+    void deniesCapabilityWhenSlotDoesNotOwnTheActiveAssignment() throws Exception {
+        UUID otherSlot = id("88000000-0000-0000-0000-000000000010");
+        UUID otherSlotSession = id("88000000-0000-0000-0000-000000000011");
+        String otherToken = "wslot_" + "O".repeat(43);
+        insertSlotSession(otherSlot, otherSlotSession, otherToken, "now() + interval '10 minutes'");
+        insertActiveOnSlot(AGENT, TASK, ATTEMPT, LEASE, SLOT_ID, ASSIGNMENT_ID);
+        insertScope("TASK", TASK, "tenant-a", "project-a", "team-a");
+
+        assertThatThrownBy(() -> new JdbcAttemptExecutionCapabilityIssuer(jdbc, 120)
+                .issue(otherToken, TASK, ASSIGNMENT_ID, ATTEMPT, LEASE))
+                .isInstanceOf(AttemptCredentialDeniedException.class);
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM attempt_execution_capabilities", Long.class)).isZero();
+    }
+
+    @Test
+    void deniesCapabilityForExpiredSlotSession() throws Exception {
+        insertSlotSession(SLOT_ID, SLOT_SESSION_ID, SLOT_SESSION_TOKEN, "now() - interval '1 second'");
+        insertActiveOnSlot(AGENT, TASK, ATTEMPT, LEASE, SLOT_ID, ASSIGNMENT_ID);
+        insertScope("TASK", TASK, "tenant-a", "project-a", "team-a");
+
+        assertThatThrownBy(() -> new JdbcAttemptExecutionCapabilityIssuer(jdbc, 120)
+                .issue(SLOT_SESSION_TOKEN, TASK, ASSIGNMENT_ID, ATTEMPT, LEASE))
+                .isInstanceOf(AttemptCredentialDeniedException.class);
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM attempt_execution_capabilities", Long.class)).isZero();
+    }
+
+    @Test
+    void deniesCapabilityForMismatchedAttemptOrLease() throws Exception {
+        insertSlotSession(SLOT_ID, SLOT_SESSION_ID, SLOT_SESSION_TOKEN, "now() + interval '10 minutes'");
+        insertActiveOnSlot(AGENT, TASK, ATTEMPT, LEASE, SLOT_ID, ASSIGNMENT_ID);
+        insertScope("TASK", TASK, "tenant-a", "project-a", "team-a");
+
+        assertThatThrownBy(() -> new JdbcAttemptExecutionCapabilityIssuer(jdbc, 120)
+                .issue(SLOT_SESSION_TOKEN, TASK, ASSIGNMENT_ID, id("88000000-0000-0000-0000-000000000099"), LEASE))
+                .isInstanceOf(AttemptCredentialDeniedException.class);
+        assertThatThrownBy(() -> new JdbcAttemptExecutionCapabilityIssuer(jdbc, 120)
+                .issue(SLOT_SESSION_TOKEN, TASK, ASSIGNMENT_ID, ATTEMPT, id("88000000-0000-0000-0000-000000000098")))
+                .isInstanceOf(AttemptCredentialDeniedException.class);
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM attempt_execution_capabilities", Long.class)).isZero();
     }
 
     @Test
@@ -412,6 +548,68 @@ class JdbcActiveAttemptRepositoryPostgresTest {
     }
 
     @Test
+    void modelProxyAcceptsSlotAttemptCapabilityAndSelectsProviderFromTaskScope() throws Exception {
+        insertSlotSession(SLOT_ID, SLOT_SESSION_ID, SLOT_SESSION_TOKEN, "now() + interval '10 minutes'");
+        insertActiveOnSlot(AGENT, TASK, ATTEMPT, LEASE, SLOT_ID, ASSIGNMENT_ID);
+        insertScope("TASK", TASK, "tenant-a", "project-a", "team-a");
+        jdbc.execute("INSERT INTO tenant_model_proxy_credential_refs VALUES "
+                + "('tenant-a', 'project-a', 'team-a', 'file:tenant-a/project-a/team-a/provider-token', TRUE)");
+        Path providerToken = createProviderCredential("tenant-a", "project-a", "team-a", "provider-token-a");
+        IssuedAttemptCapability issued = new JdbcAttemptExecutionCapabilityIssuer(jdbc, 120)
+                .issue(SLOT_SESSION_TOKEN, TASK, ASSIGNMENT_ID, ATTEMPT, LEASE);
+        HttpProxyFixture fixture = startHttpProxy(providerToken);
+
+        MvcResult result = fixture.mvc().perform(post("/v1/responses")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .header("Authorization", "Bearer " + issued.token())
+                        .content("{\"model\":\"gpt-5.6-luna\",\"input\":[]}"))
+                .andReturn();
+        assertThat(result.getResponse().getStatus())
+                .as("model proxy response body: %s", result.getResponse().getContentAsString())
+                .isEqualTo(200);
+        assertThat(result.getRequest().isAsyncStarted()).isTrue();
+
+        fixture.mvc().perform(asyncDispatch(result))
+                .andExpect(status().isOk())
+                .andExpect(content().string("data: forwarded\n\n"));
+        assertThat(fixture.upstreamCalls().get()).isEqualTo(1);
+        assertThat(fixture.upstreamAuthorization().get()).isEqualTo("Bearer provider-token-a");
+    }
+
+    @Test
+    void gatewayValidatesOnlyMatchingLiveAttemptCapabilityWithoutTableAccess() throws Exception {
+        insertSlotSession(SLOT_ID, SLOT_SESSION_ID, SLOT_SESSION_TOKEN, "now() + interval '10 minutes'");
+        insertActiveOnSlot(AGENT, TASK, ATTEMPT, LEASE, SLOT_ID, ASSIGNMENT_ID);
+        insertScope("TASK", TASK, "tenant-a", "project-a", "team-a");
+        jdbc.execute("INSERT INTO tenant_model_proxy_credential_refs VALUES "
+                + "('tenant-a', 'project-a', 'team-a', 'file:tenant-a/project-a/team-a/provider-token', TRUE)");
+        IssuedAttemptCapability issued = new JdbcAttemptExecutionCapabilityIssuer(jdbc, 120)
+                .issue(SLOT_SESSION_TOKEN, TASK, ASSIGNMENT_ID, ATTEMPT, LEASE);
+        JdbcTemplate gatewayJdbc = new JdbcTemplate(new DriverManagerDataSource(
+                POSTGRES.getJdbcUrl(), "agentteams", "gateway-test-password"));
+
+        Boolean exactAttempt = gatewayJdbc.queryForObject("""
+                SELECT public.credential_proxy_gateway_validate_attempt_capability(?, ?, ?, ?, ?, ?)
+                """, Boolean.class, sha256(issued.token()), SLOT_ID, AGENT, TASK, ATTEMPT, LEASE);
+        Boolean differentAttempt = gatewayJdbc.queryForObject("""
+                SELECT public.credential_proxy_gateway_validate_attempt_capability(?, ?, ?, ?, ?, ?)
+                """, Boolean.class, sha256(issued.token()), SLOT_ID, AGENT,
+                id("88000000-0000-0000-0000-000000000052"), ATTEMPT, LEASE);
+
+        assertThat(exactAttempt).isTrue();
+        assertThat(differentAttempt).isFalse();
+        assertThatThrownBy(() -> gatewayJdbc.queryForObject(
+                "SELECT count(*) FROM attempt_execution_capabilities", Long.class))
+                .isInstanceOf(org.springframework.dao.DataAccessException.class);
+
+        jdbc.update("UPDATE agent_leases SET released_at = now(), status = 'RELEASED' WHERE id = ?", LEASE);
+        Boolean afterLeaseRelease = gatewayJdbc.queryForObject("""
+                SELECT public.credential_proxy_gateway_validate_attempt_capability(?, ?, ?, ?, ?, ?)
+                """, Boolean.class, sha256(issued.token()), SLOT_ID, AGENT, TASK, ATTEMPT, LEASE);
+        assertThat(afterLeaseRelease).isFalse();
+    }
+
+    @Test
     void httpRequestCannotUseAttemptFromAnotherTenantAndNeverCallsProvider() throws Exception {
         insertScope("WORKER", AGENT, "tenant-a", "project-a", "team-a");
         insertScope("TASK", TASK, "tenant-b", "project-a", "team-a");
@@ -525,12 +723,32 @@ class JdbcActiveAttemptRepositoryPostgresTest {
                 credential, SESSION_ID, agent, task, attempt, lease, sha256(token), modelCredentialRef);
     }
 
+    private void insertSlotSession(UUID slotId, UUID sessionId, String token, String expiresExpression)
+            throws Exception {
+        jdbc.update("INSERT INTO worker_slots(id, status) VALUES (?, 'ACTIVE')", slotId);
+        jdbc.update("INSERT INTO worker_slot_sessions(id, slot_id, token_sha256, expires_at, revoked_at) "
+                        + "VALUES (?, ?, ?, " + expiresExpression + ", NULL)",
+                sessionId, slotId, sha256(token));
+    }
+
+    private void insertActiveOnSlot(UUID agent, UUID task, UUID attempt, UUID lease,
+            UUID slotId, UUID assignmentId) {
+        jdbc.update("INSERT INTO agent_leases VALUES (?, ?, ?, now() + interval '10 minutes', NULL, 'ACTIVE')",
+                lease, agent, attempt);
+        jdbc.update("INSERT INTO task_attempts VALUES (?, ?, ?, 'RUNNING', now() + interval '10 minutes')",
+                attempt, task, lease);
+        jdbc.update("INSERT INTO task_assignments(id, task_id, attempt_id, agent_id, worker_slot_id, phase, released_at) "
+                        + "VALUES (?, ?, ?, ?, ?, 'RUNNING', NULL)",
+                assignmentId, task, attempt, agent, slotId);
+    }
+
     private void insertActive(UUID agent, UUID task, UUID attempt, UUID lease) {
         jdbc.update("INSERT INTO agent_leases VALUES (?, ?, ?, now() + interval '10 minutes', NULL, 'ACTIVE')",
                 lease, agent, attempt);
         jdbc.update("INSERT INTO task_attempts VALUES (?, ?, ?, 'RUNNING', now() + interval '10 minutes')",
                 attempt, task, lease);
-        jdbc.update("INSERT INTO task_assignments VALUES (?, ?, ?, ?, 'RUNNING', NULL)",
+        jdbc.update("INSERT INTO task_assignments(id, task_id, attempt_id, agent_id, worker_slot_id, phase, released_at) "
+                        + "VALUES (?, ?, ?, ?, NULL, 'RUNNING', NULL)",
                 id("99000000-0000-0000-0000-" + String.format("%012d", Math.abs(task.hashCode()))), task, attempt, agent);
     }
 
@@ -540,7 +758,8 @@ class JdbcActiveAttemptRepositoryPostgresTest {
                 lease, agent, attempt);
         jdbc.update("INSERT INTO task_attempts VALUES (?, ?, ?, 'SUCCEEDED', now() - interval '1 minute')",
                 attempt, task, lease);
-        jdbc.update("INSERT INTO task_assignments VALUES (?, ?, ?, ?, 'SUCCEEDED', now() - interval '1 minute')",
+        jdbc.update("INSERT INTO task_assignments(id, task_id, attempt_id, agent_id, worker_slot_id, phase, released_at) "
+                        + "VALUES (?, ?, ?, ?, NULL, 'SUCCEEDED', now() - interval '1 minute')",
                 id("99000000-0000-0000-0000-000000000022"), task, attempt, agent);
     }
 

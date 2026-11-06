@@ -1642,3 +1642,304 @@ index 0000000..62da7a1
 +        return new TenantFairQueue.TenantQueue(id, weight, active, maximum, tasks);
 +    }
 +}
+diff --git a/control-plane/src/main/java/io/agentteams/controlplane/artifact/InternalArtifactUploadController.java b/control-plane/src/main/java/io/agentteams/controlplane/artifact/InternalArtifactUploadController.java
+--- a/control-plane/src/main/java/io/agentteams/controlplane/artifact/InternalArtifactUploadController.java
++++ b/control-plane/src/main/java/io/agentteams/controlplane/artifact/InternalArtifactUploadController.java
+@@ -8,0 +9 @@
++import java.time.Clock;
+@@ -43,0 +45 @@
++    private final Clock clock;
+@@ -47 +49 @@
+-            @Value("${agentteams.quota.internal-token:}") String internalToken) {
++            @Value("${agentteams.quota.internal-token:}") String internalToken, Clock clock) {
+@@ -51,0 +54 @@
++        this.clock = Objects.requireNonNull(clock, "clock");
+@@ -111,0 +115,4 @@
++        if (record.phase() != io.agentteams.domain.task.TaskPhase.RUNNING
++                || record.leaseExpiresAt() == null || !record.leaseExpiresAt().isAfter(clock.instant())) {
++            throw new ResponseStatusException(HttpStatus.CONFLICT, "attempt lease is no longer active");
++        }
+diff --git a/control-plane/src/test/java/io/agentteams/controlplane/artifact/InternalArtifactUploadControllerTest.java b/control-plane/src/test/java/io/agentteams/controlplane/artifact/InternalArtifactUploadControllerTest.java
+--- a/control-plane/src/test/java/io/agentteams/controlplane/artifact/InternalArtifactUploadControllerTest.java
++++ b/control-plane/src/test/java/io/agentteams/controlplane/artifact/InternalArtifactUploadControllerTest.java
+@@ -57 +57,2 @@
+-                        new InternalArtifactUploadController(artifacts, completion, persistence, "secret"))
++                        new InternalArtifactUploadController(artifacts, completion, persistence, "secret",
++                                Clock.fixed(Instant.parse("2026-11-06T00:00:00Z"), java.time.ZoneOffset.UTC)))
+@@ -110,0 +112,12 @@
++    }
++
++    @Test
++    void rejectsPrepareForExpiredAttemptLease() throws Exception {
++        when(persistence.findTaskAttempt(ATTEMPT_ID)).thenReturn(Optional.of(attempt("scheduler",
++                Instant.parse("2026-11-05T23:59:59Z"))));
++
++        mockMvc.perform(post("/internal/v1/artifacts/uploads")
++                        .header(InternalArtifactUploadController.TOKEN_HEADER, "secret")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(prepareBody(AGENT_ID)))
++                .andExpect(status().isConflict());
+@@ -179,0 +193,4 @@
++        return attempt(actor, Instant.parse("2026-11-07T00:00:00Z"));
++    }
++
++    private static TaskAttemptRecord attempt(String actor, Instant leaseExpiresAt) {
+@@ -181 +198 @@
+-                Instant.EPOCH.plusSeconds(3600), null, actor, "leader", "", "",
++                leaseExpiresAt, null, actor, "leader", "", "",
+
+diff --git a/control-plane/src/test/java/io/agentteams/controlplane/persistence/FoundationRepositoryIT.java b/control-plane/src/test/java/io/agentteams/controlplane/persistence/FoundationRepositoryIT.java
+--- a/control-plane/src/test/java/io/agentteams/controlplane/persistence/FoundationRepositoryIT.java
++++ b/control-plane/src/test/java/io/agentteams/controlplane/persistence/FoundationRepositoryIT.java
+@@ -79,0 +79,6 @@
++    @Test
++    void createsTenantNeutralWorkerSlotsAndAssignmentBindingSchema() {
++        assertThat(jdbc.queryForList("SELECT id FROM worker_slots WHERE false")).isEmpty();
++        assertThat(jdbc.queryForList("SELECT worker_slot_id FROM task_assignments WHERE false")).isEmpty();
++    }
++
+
+diff --git a/control-plane/src/main/resources/db/migration/V123__worker_slot_assignment_binding.sql b/control-plane/src/main/resources/db/migration/V123__worker_slot_assignment_binding.sql
+new file mode 100644
+--- /dev/null
++++ b/control-plane/src/main/resources/db/migration/V123__worker_slot_assignment_binding.sql
+@@ -0,0 +1,17 @@
++-- Tenant-neutral fixed execution slots are distinct from tenant-scoped Agents.
++CREATE TABLE IF NOT EXISTS worker_slots (
++    id UUID PRIMARY KEY,
++    status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'DRAINING', 'DISABLED')),
++    created_at TIMESTAMPTZ NOT NULL DEFAULT statement_timestamp(),
++    updated_at TIMESTAMPTZ NOT NULL DEFAULT statement_timestamp()
++);
++
++ALTER TABLE task_assignments
++    ADD COLUMN worker_slot_id UUID REFERENCES worker_slots(id) ON DELETE RESTRICT;
++
++CREATE INDEX task_assignments_worker_slot_idx ON task_assignments(worker_slot_id);
++CREATE UNIQUE INDEX task_assignments_active_worker_slot_unique
++    ON task_assignments(worker_slot_id)
++    WHERE worker_slot_id IS NOT NULL
++      AND phase IN ('ASSIGNED', 'ACCEPTED', 'RUNNING')
++      AND released_at IS NULL;
+diff --git a/control-plane/src/main/java/io/agentteams/controlplane/ControlPlaneConfiguration.java b/control-plane/src/main/java/io/agentteams/controlplane/ControlPlaneConfiguration.java
+index 693a19f..d906a4a 100644
+--- a/control-plane/src/main/java/io/agentteams/controlplane/ControlPlaneConfiguration.java
++++ b/control-plane/src/main/java/io/agentteams/controlplane/ControlPlaneConfiguration.java
+@@ -308 +308,2 @@ public class ControlPlaneConfiguration {
+-            @Value("${agentteams.scheduler.lease-duration:30s}") java.time.Duration leaseDuration) {
++            @Value("${agentteams.scheduler.lease-duration:30s}") java.time.Duration leaseDuration,
++            @Value("${agentteams.scheduler.worker-slots.enabled:false}") boolean workerSlotSchedulingEnabled) {
+@@ -312 +313 @@ public class ControlPlaneConfiguration {
+-                contextResolver.getIfAvailable(), contextAssembly.getIfAvailable());
++                contextResolver.getIfAvailable(), contextAssembly.getIfAvailable(), workerSlotSchedulingEnabled);
+diff --git a/control-plane/src/main/java/io/agentteams/controlplane/persistence/FoundationTransaction.java b/control-plane/src/main/java/io/agentteams/controlplane/persistence/FoundationTransaction.java
+index 4cd465f..6c8b270 100644
+--- a/control-plane/src/main/java/io/agentteams/controlplane/persistence/FoundationTransaction.java
++++ b/control-plane/src/main/java/io/agentteams/controlplane/persistence/FoundationTransaction.java
+@@ -168 +168 @@ public final class FoundationTransaction {
+-                SELECT id, task_id, attempt_id, agent_id, phase, assigned_at, accepted_at, released_at,
++                SELECT id, task_id, attempt_id, agent_id, worker_slot_id, phase, assigned_at, accepted_at, released_at,
+@@ -178,0 +179 @@ public final class FoundationTransaction {
++                            rs.getObject("worker_slot_id", java.util.UUID.class),
+@@ -338 +339 @@ public final class FoundationTransaction {
+-                SELECT id, task_id, attempt_id, agent_id, phase, assigned_at, accepted_at, released_at,
++                SELECT id, task_id, attempt_id, agent_id, worker_slot_id, phase, assigned_at, accepted_at, released_at,
+@@ -347,0 +349 @@ public final class FoundationTransaction {
++                            rs.getObject("worker_slot_id", java.util.UUID.class),
+diff --git a/control-plane/src/main/java/io/agentteams/controlplane/persistence/TaskAssignmentRecord.java b/control-plane/src/main/java/io/agentteams/controlplane/persistence/TaskAssignmentRecord.java
+index 492e715..1d1eb7b 100644
+--- a/control-plane/src/main/java/io/agentteams/controlplane/persistence/TaskAssignmentRecord.java
++++ b/control-plane/src/main/java/io/agentteams/controlplane/persistence/TaskAssignmentRecord.java
+@@ -12,0 +13 @@ public record TaskAssignmentRecord(
++        UUID workerSlotId,
+@@ -35,0 +37,7 @@ public record TaskAssignmentRecord(
++
++    public TaskAssignmentRecord(UUID id, UUID taskId, UUID attemptId, UUID agentId, TaskPhase phase,
++            Instant assignedAt, Instant acceptedAt, Instant releasedAt, String detailsJson,
++            Instant createdAt, Instant updatedAt, long version) {
++        this(id, taskId, attemptId, agentId, null, phase, assignedAt, acceptedAt, releasedAt,
++                detailsJson, createdAt, updatedAt, version);
++    }
+diff --git a/control-plane/src/main/java/io/agentteams/controlplane/persistence/TaskAssignmentRepository.java b/control-plane/src/main/java/io/agentteams/controlplane/persistence/TaskAssignmentRepository.java
+index 64933a4..357b297 100644
+--- a/control-plane/src/main/java/io/agentteams/controlplane/persistence/TaskAssignmentRepository.java
++++ b/control-plane/src/main/java/io/agentteams/controlplane/persistence/TaskAssignmentRepository.java
+@@ -21 +21 @@ public final class TaskAssignmentRepository {
+-                    (id, task_id, attempt_id, agent_id, phase, assigned_at, accepted_at, released_at,
++                    (id, task_id, attempt_id, agent_id, worker_slot_id, phase, assigned_at, accepted_at, released_at,
+@@ -23 +23 @@ public final class TaskAssignmentRepository {
+-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
++                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+@@ -24,0 +25 @@ public final class TaskAssignmentRepository {
++                assignment.workerSlotId(),
+@@ -33 +34 @@ public final class TaskAssignmentRepository {
+-                SELECT id, task_id, attempt_id, agent_id, phase, assigned_at, accepted_at, released_at,
++                SELECT id, task_id, attempt_id, agent_id, worker_slot_id, phase, assigned_at, accepted_at, released_at,
+@@ -41 +42 @@ public final class TaskAssignmentRepository {
+-                SELECT id, task_id, attempt_id, agent_id, phase, assigned_at, accepted_at, released_at,
++                SELECT id, task_id, attempt_id, agent_id, worker_slot_id, phase, assigned_at, accepted_at, released_at,
+@@ -46,0 +48,17 @@ public final class TaskAssignmentRepository {
++    public Optional<UUID> lockNextAvailableWorkerSlot() {
++        return jdbc.query("""
++                SELECT slot.id
++                  FROM worker_slots slot
++                 WHERE slot.status = 'ACTIVE'
++                   AND NOT EXISTS (
++                       SELECT 1 FROM task_assignments assignment
++                        WHERE assignment.worker_slot_id = slot.id
++                          AND assignment.phase IN ('ASSIGNED', 'ACCEPTED', 'RUNNING')
++                          AND assignment.released_at IS NULL
++                   )
++                 ORDER BY slot.created_at, slot.id
++                 FOR UPDATE OF slot SKIP LOCKED
++                 LIMIT 1
++                """, (rs, row) -> rs.getObject(1, UUID.class)).stream().findFirst();
++    }
++
+@@ -77,0 +96 @@ public final class TaskAssignmentRepository {
++                rs.getObject("worker_slot_id", UUID.class),
+diff --git a/control-plane/src/main/java/io/agentteams/controlplane/service/TaskAssignmentService.java b/control-plane/src/main/java/io/agentteams/controlplane/service/TaskAssignmentService.java
+index 1d09b4a..eaddfd7 100644
+--- a/control-plane/src/main/java/io/agentteams/controlplane/service/TaskAssignmentService.java
++++ b/control-plane/src/main/java/io/agentteams/controlplane/service/TaskAssignmentService.java
+@@ -41,0 +42 @@ public final class TaskAssignmentService {
++    private final boolean workerSlotSchedulingEnabled;
+@@ -44 +45 @@ public final class TaskAssignmentService {
+-        this(persistence, leaseDuration, TaskMetricsPort.noop());
++        this(persistence, leaseDuration, TaskMetricsPort.noop(), false);
+@@ -49 +50,11 @@ public final class TaskAssignmentService {
+-        this(persistence, leaseDuration, metrics, null, null);
++        this(persistence, leaseDuration, metrics, false);
++    }
++
++    public TaskAssignmentService(FoundationPersistenceService persistence, Duration leaseDuration,
++            boolean workerSlotSchedulingEnabled) {
++        this(persistence, leaseDuration, TaskMetricsPort.noop(), workerSlotSchedulingEnabled);
++    }
++
++    private TaskAssignmentService(FoundationPersistenceService persistence, Duration leaseDuration,
++            TaskMetricsPort metrics, boolean workerSlotSchedulingEnabled) {
++        this(persistence, leaseDuration, metrics, null, null, workerSlotSchedulingEnabled);
+@@ -54,0 +66,6 @@ public final class TaskAssignmentService {
++        this(persistence, leaseDuration, metrics, contextResolver, contextAssembly, false);
++    }
++
++    public TaskAssignmentService(FoundationPersistenceService persistence, Duration leaseDuration,
++            TaskMetricsPort metrics, ExecutionContextResolver contextResolver,
++            ContextAssemblyService contextAssembly, boolean workerSlotSchedulingEnabled) {
+@@ -57,0 +75 @@ public final class TaskAssignmentService {
++        this.workerSlotSchedulingEnabled = workerSlotSchedulingEnabled;
+@@ -87,0 +106,4 @@ public final class TaskAssignmentService {
++            UUID workerSlotId = workerSlotSchedulingEnabled
++                    ? tx.taskAssignments().lockNextAvailableWorkerSlot()
++                            .orElseThrow(() -> new IllegalStateException("no ACTIVE worker slot is available"))
++                    : null;
+@@ -100 +122 @@ public final class TaskAssignmentService {
+-                    TaskPhase.ASSIGNED, now, null, null, "{}", now, now, 0);
++                    workerSlotId, TaskPhase.ASSIGNED, now, null, null, "{}", now, now, 0);
+@@ -272,0 +295,3 @@ public final class TaskAssignmentService {
++            if (assignment.workerSlotId() != null) {
++                payload.put("workerSlotId", assignment.workerSlotId().toString());
++            }
+diff --git a/control-plane/src/test/java/io/agentteams/controlplane/service/TaskAssignmentServiceTest.java b/control-plane/src/test/java/io/agentteams/controlplane/service/TaskAssignmentServiceTest.java
+index 2b0e1df..2d03a0f 100644
+--- a/control-plane/src/test/java/io/agentteams/controlplane/service/TaskAssignmentServiceTest.java
++++ b/control-plane/src/test/java/io/agentteams/controlplane/service/TaskAssignmentServiceTest.java
+@@ -15,0 +16 @@ import java.util.UUID;
++import org.springframework.jdbc.core.JdbcTemplate;
+@@ -116,0 +118,86 @@ class TaskAssignmentServiceTest {
++    @Test
++    void atomicallyBindsAnAvailableWorkerSlotAndRoutesItInTaskAssignedOutbox() {
++        UUID taskId = UUID.randomUUID();
++        UUID slotId = UUID.fromString("00000000-0000-0000-0000-000000000010");
++        AgentRecord ready = agent(UUID.randomUUID(), "tenant-agent", AgentPhase.READY, "{}");
++        TaskRecord queued = queuedTask(taskId, "{}");
++        insert(ready, queued);
++        new JdbcTemplate(dataSource).update("INSERT INTO worker_slots(id, status) VALUES (?, 'ACTIVE')", slotId);
++
++        TaskAssignmentService.AssignmentResult result = new TaskAssignmentService(
++                persistence, LEASE_DURATION, true).queueReadyTask(taskId, START);
++
++        assertThat(new JdbcTemplate(dataSource).queryForObject(
++                "SELECT worker_slot_id FROM task_assignments WHERE id = ?", UUID.class, result.assignment().id()))
++                .isEqualTo(slotId);
++        var outboxEvent = persistence.inTransaction(tx -> tx.outboxEvents().findByEventId(result.eventId()));
++        assertThat(outboxEvent)
++                .get().satisfies(event -> assertThat(event.payloadJson())
++                        .contains("\"workerSlotId\": \"" + slotId + "\""));
++    }
++
++    @Test
++    void leavesTaskQueuedWhenFixedWorkerCapacityIsExhausted() {
++        UUID taskId = UUID.randomUUID();
++        AgentRecord ready = agent(UUID.randomUUID(), "tenant-agent", AgentPhase.READY, "{}");
++        insert(ready, queuedTask(taskId, "{}"));
++
++        org.assertj.core.api.Assertions.assertThatThrownBy(() -> new TaskAssignmentService(
++                persistence, LEASE_DURATION, true).queueReadyTask(taskId, START))
++                .isInstanceOf(IllegalStateException.class)
++                .hasMessageContaining("worker slot");
++
++        assertThat(persistence.findTask(taskId)).get().extracting(TaskRecord::phase).isEqualTo(TaskPhase.QUEUED);
++        persistence.inTransaction(tx -> {
++            assertThat(tx.taskAttempts().count()).isZero();
++            assertThat(tx.taskAssignments().count()).isZero();
++            assertThat(tx.agentLeases().count()).isZero();
++            return null;
++        });
++    }
++
++    @Test
++    void concurrentTasksCannotReserveTheSameWorkerSlot() throws Exception {
++        UUID taskA = UUID.randomUUID();
++        UUID taskB = UUID.randomUUID();
++        AgentRecord firstAgent = agent(UUID.randomUUID(), "slot-agent-a", AgentPhase.READY, "{}");
++        AgentRecord secondAgent = agent(UUID.randomUUID(), "slot-agent-b", AgentPhase.READY, "{}");
++        insert(firstAgent, queuedTask(taskA, "{}"));
++        insert(secondAgent, queuedTask(taskB, "{}"));
++        UUID slotId = UUID.randomUUID();
++        new JdbcTemplate(dataSource).update("INSERT INTO worker_slots(id, status) VALUES (?, 'ACTIVE')", slotId);
++
++        var pool = java.util.concurrent.Executors.newFixedThreadPool(2);
++        var start = new java.util.concurrent.CountDownLatch(1);
++        try {
++            var first = pool.submit(() -> {
++                start.await();
++                return new TaskAssignmentService(persistence, LEASE_DURATION, true).queueReadyTask(taskA, START);
++            });
++            var second = pool.submit(() -> {
++                start.await();
++                return new TaskAssignmentService(persistence, LEASE_DURATION, true).queueReadyTask(taskB, START);
++            });
++            start.countDown();
++            int assigned = 0;
++            int exhausted = 0;
++            for (var future : java.util.List.of(first, second)) {
++                try {
++                    assertThat(future.get().assignment().workerSlotId()).isEqualTo(slotId);
++                    assigned++;
++                } catch (java.util.concurrent.ExecutionException failure) {
++                    assertThat(failure.getCause()).isInstanceOf(IllegalStateException.class)
++                            .hasMessageContaining("worker slot");
++                    exhausted++;
++                }
++            }
++            assertThat(assigned).isEqualTo(1);
++            assertThat(exhausted).isEqualTo(1);
++        } finally {
++            pool.shutdownNow();
++        }
++        assertThat(new JdbcTemplate(dataSource).queryForObject(
++                "SELECT count(*) FROM task_assignments WHERE worker_slot_id = ? AND phase IN ('ASSIGNED','ACCEPTED','RUNNING') AND released_at IS NULL",
++                Integer.class, slotId)).isEqualTo(1);
++    }
++
+@@ -227 +314,3 @@ class TaskAssignmentServiceTest {
+-        AgentRecord agent = agent(UUID.randomUUID(), "fault-tolerant-agent", AgentPhase.READY,
++        AgentRecord agent = agent(UUID.randomUUID(), "fault-tolerant-agent-a", AgentPhase.READY,
++                "{\"python\":true}");
++        AgentRecord secondAgent = agent(UUID.randomUUID(), "fault-tolerant-agent-b", AgentPhase.READY,
+@@ -232,0 +322 @@ class TaskAssignmentServiceTest {
++            tx.agents().insert(secondAgent);
+@@ -235,0 +326 @@ class TaskAssignmentServiceTest {
++            tx.insertResourceScope("WORKER", secondAgent.id(), "tenant-test", "project-test", "team-test", START);

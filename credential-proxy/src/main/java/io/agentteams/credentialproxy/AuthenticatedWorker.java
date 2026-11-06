@@ -12,10 +12,12 @@ public record AuthenticatedWorker(
         String teamId,
         String modelCredentialRef,
         UUID attemptId,
-        UUID leaseId) {
+        UUID leaseId,
+        CredentialKind credentialKind) {
     public AuthenticatedWorker {
         Objects.requireNonNull(proxyCredentialId, "proxyCredentialId");
         Objects.requireNonNull(agentId, "agentId");
+        Objects.requireNonNull(credentialKind, "credentialKind");
         requireText(modelCredentialRef, "modelCredentialRef");
         boolean allTenantFields = tenantId != null && projectId != null && teamId != null
                 && !tenantId.isBlank() && !projectId.isBlank() && !teamId.isBlank();
@@ -29,6 +31,15 @@ public record AuthenticatedWorker(
         if (attemptId == null && !allTenantFields) {
             throw new IllegalArgumentException("tenant-bound credential scope is required");
         }
+        if ((credentialKind == CredentialKind.TENANT) != (attemptId == null)) {
+            throw new IllegalArgumentException("credential kind and Attempt scope must agree");
+        }
+    }
+
+    public AuthenticatedWorker(UUID proxyCredentialId, UUID agentId, String tenantId, String projectId,
+            String teamId, String modelCredentialRef, UUID attemptId, UUID leaseId) {
+        this(proxyCredentialId, agentId, tenantId, projectId, teamId, modelCredentialRef,
+                attemptId, leaseId, attemptId == null ? CredentialKind.TENANT : CredentialKind.ATTEMPT);
     }
 
     /** Existing enrollment credentials stay bound to one tenant/project/team scope. */
@@ -39,6 +50,12 @@ public record AuthenticatedWorker(
 
     public boolean isAttemptBound() {
         return attemptId != null;
+    }
+
+    public enum CredentialKind {
+        TENANT,
+        ATTEMPT,
+        EXECUTION_CAPABILITY
     }
 
     private static void requireText(String value, String field) {

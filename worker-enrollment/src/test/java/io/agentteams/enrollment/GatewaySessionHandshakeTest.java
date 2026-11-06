@@ -34,11 +34,12 @@ import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
 
-/** Exercises the published Gateway image's real gRPC session-authentication boundary. */
+/** Exercises a pinned or locally built Gateway image's real gRPC session boundary. */
 @Testcontainers(disabledWithoutDocker = true)
 class GatewaySessionHandshakeTest {
-    private static final String GATEWAY_IMAGE = "ghcr.io/ly416123/agentteams-agent-gateway"
-            + "@sha256:40c919d31b0fe7bdf876237c36fff405a16c2208420ad42374f6dd67491e055f";
+    private static final String GATEWAY_IMAGE = System.getProperty("agentteams.gateway.test-image",
+            "ghcr.io/ly416123/agentteams-agent-gateway"
+                    + "@sha256:40c919d31b0fe7bdf876237c36fff405a16c2208420ad42374f6dd67491e055f");
     private static final String SERVICE = "io.agentteams.contracts.v1.AgentChannel/Connect";
     private static final Metadata.Key<String> TOKEN_HEADER = Metadata.Key.of("x-agent-token", Metadata.ASCII_STRING_MARSHALLER);
     private static final MethodDescriptor.Marshaller<byte[]> BYTE_ARRAY = new MethodDescriptor.Marshaller<>() {
@@ -116,6 +117,31 @@ class GatewaySessionHandshakeTest {
                     .isEqualTo("ONLINE");
             assertThat(jdbc.queryForObject("SELECT phase FROM agents WHERE id = ?", String.class, agentId))
                     .isEqualTo("READY");
+        } finally {
+            handshake.call().cancel("test complete", null);
+            handshake.channel().shutdownNow();
+        }
+    }
+
+    @Test
+    void activeTenantNeutralSlotSessionAuthenticatesWithoutCreatingATenantAgent() throws Exception {
+        UUID slotId = UUID.randomUUID();
+        String token = "slot-session-" + UUID.randomUUID();
+        insertWorkerSlotSession(slotId, token, Instant.now().plusSeconds(3600), null);
+
+        Handshake handshake = connect(slotId, token);
+        try {
+            byte[] ready = handshake.responses().poll(10, TimeUnit.SECONDS);
+            assertThat(ready).as("Gateway never sent Ready for the Worker slot; status=%s, logs:\n%s",
+                    handshake.status().peek(), gateway.getLogs()).isNotNull();
+            assertThat(readyAccepted(ready)).isTrue();
+            assertThat(handshake.status().poll(10, TimeUnit.SECONDS)).isNull();
+            assertThat(jdbc.queryForObject(
+                    "SELECT presence FROM gateway_agent_state WHERE agent_id = ?", String.class,
+                    "worker-slot:" + slotId))
+                    .isEqualTo("ONLINE");
+            assertThat(jdbc.queryForObject("SELECT count(*) FROM agents WHERE id = ?", Integer.class, slotId))
+                    .isZero();
         } finally {
             handshake.call().cancel("test complete", null);
             handshake.channel().shutdownNow();
@@ -268,6 +294,17 @@ class GatewaySessionHandshakeTest {
                 revokedAt == null ? null : java.sql.Timestamp.from(revokedAt));
     }
 
+    private static void insertWorkerSlotSession(UUID slotId, String token, Instant expiresAt, Instant revokedAt)
+            throws Exception {
+        String hash = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
+                .digest(token.getBytes(StandardCharsets.UTF_8)));
+        jdbc.update("INSERT INTO worker_slots(id, status) VALUES (?, 'ACTIVE')", slotId);
+        jdbc.update("INSERT INTO worker_slot_sessions(id, slot_id, token_sha256, expires_at, revoked_at, created_at) "
+                        + "VALUES (?, ?, ?, ?, ?, now())",
+                UUID.randomUUID(), slotId, hash, java.sql.Timestamp.from(expiresAt),
+                revokedAt == null ? null : java.sql.Timestamp.from(revokedAt));
+    }
+
     private static void createSchema() {
         jdbc.execute("CREATE TABLE agents (id UUID PRIMARY KEY, name TEXT NOT NULL UNIQUE, phase TEXT NOT NULL, "
                 + "runtime TEXT NOT NULL DEFAULT '', capabilities JSONB NOT NULL DEFAULT '{}'::jsonb, "
@@ -275,6 +312,20 @@ class GatewaySessionHandshakeTest {
         jdbc.execute("CREATE TABLE agent_sessions (id UUID PRIMARY KEY, agent_id UUID NOT NULL REFERENCES agents(id), "
                 + "token_sha256 CHAR(64) NOT NULL UNIQUE, expires_at TIMESTAMPTZ NOT NULL, revoked_at TIMESTAMPTZ, "
                 + "created_at TIMESTAMPTZ NOT NULL)");
+        jdbc.execute("CREATE TABLE worker_slots (id UUID PRIMARY KEY, status TEXT NOT NULL)");
+        jdbc.execute("CREATE TABLE worker_slot_sessions (id UUID PRIMARY KEY, slot_id UUID NOT NULL "
+                + "REFERENCES worker_slots(id), token_sha256 CHAR(64) NOT NULL UNIQUE, expires_at TIMESTAMPTZ NOT NULL, "
+                + "revoked_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL)");
+        jdbc.execute("""
+                CREATE FUNCTION public.worker_enrollment_worker_slot_session_by_token_sha256(p_token_sha256 CHAR(64))
+                RETURNS TABLE(slot_id UUID, token_sha256 CHAR(64), expires_at TIMESTAMPTZ, revoked_at TIMESTAMPTZ)
+                LANGUAGE SQL STABLE AS $$
+                    SELECT session.slot_id, session.token_sha256, session.expires_at, session.revoked_at
+                      FROM worker_slot_sessions session
+                      JOIN worker_slots slot ON slot.id = session.slot_id
+                     WHERE session.token_sha256 = p_token_sha256 AND slot.status = 'ACTIVE'
+                $$
+                """);
         jdbc.execute("CREATE TABLE gateway_agent_state (agent_id TEXT PRIMARY KEY, connection_id UUID NOT NULL, "
                 + "presence TEXT NOT NULL, phase TEXT NOT NULL, runtime TEXT NOT NULL, runtime_version TEXT NOT NULL, "
                 + "capabilities JSONB NOT NULL DEFAULT '{}'::jsonb, spec_digest TEXT, config_revision TEXT, "

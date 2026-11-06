@@ -13,8 +13,17 @@ final class PostgresScriptRunner {
                     new ClassPathResource(classpathResource).getInputStream().readAllBytes(), StandardCharsets.UTF_8);
             StringBuilder statement = new StringBuilder();
             boolean inDollarQuote = false;
+            boolean inLineComment = false;
             for (int i = 0; i < script.length(); i++) {
-                if (script.startsWith("$$", i)) {
+                if (inLineComment) {
+                    if (script.charAt(i) == '\n') {
+                        inLineComment = false;
+                        statement.append('\n');
+                    }
+                } else if (!inDollarQuote && script.startsWith("--", i)) {
+                    inLineComment = true;
+                    i++;
+                } else if (script.startsWith("$$", i)) {
                     inDollarQuote = !inDollarQuote;
                     statement.append("$$");
                     i++;

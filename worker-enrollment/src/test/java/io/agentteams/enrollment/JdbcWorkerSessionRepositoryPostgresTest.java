@@ -23,6 +23,8 @@ class JdbcWorkerSessionRepositoryPostgresTest {
     private static final UUID SESSION_ID = UUID.fromString("66000000-0000-0000-0000-000000000002");
     private static final UUID OTHER_AGENT_ID = UUID.fromString("66000000-0000-0000-0000-000000000007");
     private static final UUID OTHER_SESSION_ID = UUID.fromString("66000000-0000-0000-0000-000000000008");
+    private static final UUID SLOT_ID = UUID.fromString("66000000-0000-0000-0000-000000000030");
+    private static final UUID SLOT_SESSION_ID = UUID.fromString("66000000-0000-0000-0000-000000000031");
     private static final UUID MEMBERSHIP_TENANT_ID = UUID.fromString("66000000-0000-0000-0000-000000000020");
     private static final UUID MEMBERSHIP_PROJECT_ID = UUID.fromString("66000000-0000-0000-0000-000000000021");
     private static final String TOKEN_HASH = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -42,6 +44,8 @@ class JdbcWorkerSessionRepositoryPostgresTest {
         jdbc = new JdbcTemplate(dataSource);
         removeTestRoleIfPresent();
         jdbc.execute("DROP TABLE IF EXISTS worker_model_proxy_credentials CASCADE");
+        jdbc.execute("DROP TABLE IF EXISTS worker_slot_sessions CASCADE");
+        jdbc.execute("DROP TABLE IF EXISTS worker_slots CASCADE");
         jdbc.execute("DROP TABLE IF EXISTS agent_sessions");
         jdbc.execute("DROP TABLE IF EXISTS project_memberships CASCADE");
         jdbc.execute("DROP TABLE IF EXISTS projects CASCADE");
@@ -76,9 +80,12 @@ class JdbcWorkerSessionRepositoryPostgresTest {
                     PRIMARY KEY (tenant_id, project_id, subject))
                 """);
         jdbc.execute("CREATE ROLE worker_enrollment LOGIN PASSWORD 'enrollment-test-password' NOSUPERUSER NOBYPASSRLS");
-        jdbc.execute("CREATE ROLE agentteams_runtime NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS");
+        jdbc.execute("CREATE ROLE agentteams_runtime LOGIN PASSWORD 'runtime-test-password' "
+                + "NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS");
         jdbc.execute("GRANT CONNECT ON DATABASE enrollment_test TO worker_enrollment");
+        jdbc.execute("GRANT CONNECT ON DATABASE enrollment_test TO agentteams_runtime");
         jdbc.execute("GRANT USAGE ON SCHEMA public TO worker_enrollment");
+        jdbc.execute("GRANT USAGE ON SCHEMA public TO agentteams_runtime");
         applyEnrollmentRls();
         repository = new JdbcWorkerSessionRepository(jdbc);
     }
@@ -98,6 +105,61 @@ class JdbcWorkerSessionRepositoryPostgresTest {
                 .contains(new WorkerSessionRepository.WorkerRegistration(
                         new WorkerScope("tenant-a", "project-a", "team-a"), "READY"));
         assertThat(repository.findAgent(incompleteId)).isEmpty();
+    }
+
+    @Test
+    void persistsTenantNeutralSlotSessionsThroughRestrictedFunctionsOnly() {
+        jdbc.update("INSERT INTO worker_slots(id, status) VALUES (?, 'ACTIVE')", SLOT_ID);
+        JdbcWorkerSlotSessionRepository slotSessions = new JdbcWorkerSlotSessionRepository(jdbc);
+        Instant createdAt = Instant.parse("2026-11-01T00:00:00Z");
+        String hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        var session = new WorkerSlotSessionRepository.WorkerSlotSessionRecord(SLOT_SESSION_ID, SLOT_ID,
+                "platform-operator", hash, createdAt.plusSeconds(3600), createdAt);
+
+        assertThat(slotSessions.findSlot(SLOT_ID))
+                .contains(new WorkerSlotSessionRepository.WorkerSlotRecord(SLOT_ID, "ACTIVE"));
+        slotSessions.insertSession(session);
+        assertThat(jdbc.queryForObject("SELECT token_sha256 FROM worker_slot_sessions WHERE id = ?",
+                String.class, SLOT_SESSION_ID)).isEqualTo(hash);
+        assertThat(slotSessions.findSessionForUpdate(SLOT_ID, SLOT_SESSION_ID))
+                .contains(new WorkerSlotSessionRepository.WorkerSlotSessionOwnership(SLOT_ID, false));
+        JdbcTemplate runtimeJdbc = new JdbcTemplate(new DriverManagerDataSource(
+                POSTGRES.getJdbcUrl(), "agentteams_runtime", "runtime-test-password"));
+        assertThat(runtimeJdbc.queryForObject("SELECT count(*) FROM worker_slots WHERE id = ?",
+                Long.class, SLOT_ID)).isEqualTo(1L);
+        assertThatThrownBy(() -> runtimeJdbc.update(
+                "UPDATE worker_slots SET status = 'DISABLED' WHERE id = ?", SLOT_ID))
+                .isInstanceOf(org.springframework.dao.DataAccessException.class);
+        assertThatThrownBy(() -> runtimeJdbc.queryForObject(
+                "SELECT count(*) FROM worker_slot_sessions", Long.class))
+                .isInstanceOf(org.springframework.dao.DataAccessException.class);
+        assertThat(runtimeJdbc.queryForObject("SELECT slot_id FROM "
+                        + "public.worker_enrollment_worker_slot_session_by_token_sha256(?::char(64))",
+                UUID.class, hash)).isEqualTo(SLOT_ID);
+        assertThat(jdbc.queryForObject("SELECT session_id FROM "
+                        + "public.worker_enrollment_worker_slot_session_context_by_token_sha256(?::char(64))",
+                UUID.class, hash)).isEqualTo(SLOT_SESSION_ID);
+        assertThatThrownBy(() -> runtimeJdbc.queryForObject("SELECT session_id FROM "
+                        + "public.worker_enrollment_worker_slot_session_context_by_token_sha256(?::char(64))",
+                UUID.class, hash)).isInstanceOf(org.springframework.dao.DataAccessException.class);
+        assertThat(slotSessions.revoke(SLOT_ID, SLOT_SESSION_ID, createdAt.plusSeconds(10))).isTrue();
+        assertThat(slotSessions.findSessionForUpdate(SLOT_ID, SLOT_SESSION_ID))
+                .contains(new WorkerSlotSessionRepository.WorkerSlotSessionOwnership(SLOT_ID, true));
+        assertThat(runtimeJdbc.queryForObject("SELECT revoked_at IS NOT NULL FROM "
+                        + "public.worker_enrollment_worker_slot_session_by_token_sha256(?::char(64))",
+                Boolean.class, hash)).isTrue();
+
+        var restrictedDataSource = new DriverManagerDataSource(
+                POSTGRES.getJdbcUrl(), "worker_enrollment", "enrollment-test-password");
+        JdbcTemplate restrictedJdbc = new JdbcTemplate(restrictedDataSource);
+        JdbcWorkerSlotSessionRepository restrictedRepository = new JdbcWorkerSlotSessionRepository(restrictedJdbc);
+        assertThat(restrictedRepository.findSlot(SLOT_ID))
+                .contains(new WorkerSlotSessionRepository.WorkerSlotRecord(SLOT_ID, "ACTIVE"));
+        assertThatThrownBy(() -> restrictedJdbc.queryForObject(
+                "SELECT count(*) FROM worker_slot_sessions", Long.class))
+                .isInstanceOf(org.springframework.dao.DataAccessException.class);
+        assertThat(jdbc.queryForObject("SELECT rolcanlogin OR rolsuper OR rolbypassrls "
+                + "FROM pg_roles WHERE rolname = 'worker_enrollment_slot_owner'", Boolean.class)).isFalse();
     }
 
     @Test
