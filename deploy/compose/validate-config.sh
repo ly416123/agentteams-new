@@ -1,0 +1,271 @@
+#!/usr/bin/env sh
+set -eu
+
+env_file=${1:-"$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/.env"}
+if [ ! -r "$env_file" ]; then
+  echo "Cannot read environment file: $env_file" >&2
+  exit 2
+fi
+
+value() {
+  awk -F= -v key="$1" '$1 == key { value=substr($0, index($0, "=") + 1) } END { print value }' "$env_file" | sed 's/^"//; s/"$//; s/^'"'"'//; s/'"'"'$//'
+}
+
+replicas=$(value WORKER_REPLICAS)
+case "$replicas" in
+  ''|*[!0-9]*) echo "WORKER_REPLICAS must be an integer from 0 through 8" >&2; exit 2 ;;
+esac
+if [ "$replicas" -lt 0 ] || [ "$replicas" -gt 8 ]; then
+  echo "WORKER_REPLICAS must be between 0 and 8" >&2
+  exit 2
+fi
+
+deployment_mode=$(value DEPLOYMENT_MODE)
+case "$deployment_mode" in
+  local-dev|self-hosted-small) ;;
+  *) echo "DEPLOYMENT_MODE must be local-dev or self-hosted-small" >&2; exit 2 ;;
+esac
+
+api_auth_enabled=$(value API_AUTH_ENABLED)
+api_auth_enabled=${api_auth_enabled:-false}
+case "$api_auth_enabled" in
+  true|false) ;;
+  *) echo "API_AUTH_ENABLED must be true or false" >&2; exit 2 ;;
+esac
+if [ "$replicas" -gt 0 ] && [ "$api_auth_enabled" != "true" ]; then
+  echo "API_AUTH_ENABLED=true is required before starting Workers" >&2
+  exit 2
+fi
+if [ "$deployment_mode" != "local-dev" ] && [ "$api_auth_enabled" != "true" ]; then
+  echo "API_AUTH_ENABLED=true is required outside local-dev" >&2
+  exit 2
+fi
+if [ "$deployment_mode" = "self-hosted-small" ] || [ "$replicas" -gt 0 ]; then
+  control_plane_source_build=$(value CONTROL_PLANE_BUILD_FROM_SOURCE)
+  control_plane_image=$(value CONTROL_PLANE_IMAGE)
+  if [ "$control_plane_source_build" != "true" ] \
+      || [ "$control_plane_image" != "agentteams-new/control-plane:v0.1.5-task-event-scope-guard-0156f2c" ]; then
+    echo "self-hosted-small or Workers require the pinned TASK_EVENT-hardened Control Plane source build" >&2
+    exit 2
+  fi
+fi
+if [ "$replicas" -gt 0 ]; then
+  worker_source_build=$(value WORKER_BUILD_FROM_SOURCE)
+  worker_image=$(value WORKER_IMAGE)
+  if [ "$worker_source_build" != "true" ] \
+      || [ "$worker_image" != "ghcr.io/ly416123/agentteams-agent-worker@sha256:0aec65e942a9ecfa726032e560066d91266905dc878fd4a610d533db0118b86d" ]; then
+    echo "Workers require WORKER_BUILD_FROM_SOURCE=true and the pinned base Worker digest; startup builds the Attempt-isolated derivative" >&2
+    exit 2
+  fi
+  enrollment_port=$(value ENROLLMENT_PORT)
+  enrollment_port=${enrollment_port:-8090}
+  case "$enrollment_port" in *[!0-9]*|'') echo "ENROLLMENT_PORT must be a TCP port number" >&2; exit 2 ;; esac
+  if [ "$enrollment_port" -lt 1 ] || [ "$enrollment_port" -gt 65535 ]; then
+    echo "ENROLLMENT_PORT must be between 1 and 65535" >&2
+    exit 2
+  fi
+fi
+if [ "$api_auth_enabled" = "true" ]; then
+  for key in OIDC_ISSUER_URI OIDC_JWK_SET_URI; do
+    oidc_value=$(value "$key")
+    case "$oidc_value" in
+      https://*) ;;
+      http://*) echo "$key must use HTTPS when API_AUTH_ENABLED=true" >&2; exit 2 ;;
+      *) echo "$key must be an absolute HTTPS URL when API_AUTH_ENABLED=true" >&2; exit 2 ;;
+    esac
+  done
+  audience=$(value OIDC_AUDIENCE)
+  if [ -z "$audience" ]; then echo "OIDC_AUDIENCE is required when API_AUTH_ENABLED=true" >&2; exit 2; fi
+  enrollment_db_password=$(value WORKER_ENROLLMENT_DB_PASSWORD)
+  if [ "${#enrollment_db_password}" -lt 24 ] \
+      || [ "$enrollment_db_password" = "replace-with-a-unique-enrollment-db-password" ]; then
+    echo "Set a unique WORKER_ENROLLMENT_DB_PASSWORD of at least 24 characters" >&2
+    exit 2
+  fi
+  credential_proxy_db_password=$(value CREDENTIAL_PROXY_DB_PASSWORD)
+  if [ "${#credential_proxy_db_password}" -lt 24 ] \
+      || [ "$credential_proxy_db_password" = "replace-with-a-unique-credential-proxy-db-password" ]; then
+    echo "Set a unique CREDENTIAL_PROXY_DB_PASSWORD of at least 24 characters" >&2
+    exit 2
+  fi
+fi
+
+control_plane_db_password=$(value CONTROL_PLANE_DB_PASSWORD)
+if [ "${#control_plane_db_password}" -lt 24 ] \
+    || [ "$control_plane_db_password" = "replace-with-a-unique-control-plane-db-password" ]; then
+  echo "Set a unique CONTROL_PLANE_DB_PASSWORD of at least 24 characters" >&2
+  exit 2
+fi
+
+password=$(value POSTGRES_PASSWORD)
+if [ "${#password}" -lt 24 ] || [ "$password" = "replace-with-a-long-random-password" ]; then
+  echo "Set POSTGRES_PASSWORD to a unique value of at least 24 characters in $env_file" >&2
+  exit 2
+fi
+
+storage_enabled=$(value AGENTTEAMS_STORAGE_ENABLED)
+case "$storage_enabled" in
+  true|false) ;;
+  *) echo "AGENTTEAMS_STORAGE_ENABLED must be true or false" >&2; exit 2 ;;
+esac
+if [ "$storage_enabled" = "true" ]; then
+  object_store_access_key=$(value OBJECT_STORE_ACCESS_KEY)
+  object_store_secret_key=$(value OBJECT_STORE_SECRET_KEY)
+  if [ "${#object_store_access_key}" -lt 3 ] || [ "${#object_store_secret_key}" -lt 24 ] \
+      || [ "$object_store_secret_key" = "replace-with-a-32-character-object-store-secret" ]; then
+    echo "Set OBJECT_STORE_ACCESS_KEY (3+ chars) and OBJECT_STORE_SECRET_KEY (24+ chars) before enabling storage" >&2
+    exit 2
+  fi
+fi
+
+for key in CONTROL_PLANE_IMAGE GATEWAY_IMAGE WORKER_IMAGE; do
+  image=$(value "$key")
+  if [ "$key" = "CONTROL_PLANE_IMAGE" ] \
+      && { [ "$deployment_mode" = "self-hosted-small" ] || [ "$replicas" -gt 0 ]; } \
+      && [ "$(value CONTROL_PLANE_BUILD_FROM_SOURCE)" = "true" ] \
+      && [ "$image" = "agentteams-new/control-plane:v0.1.5-task-event-scope-guard-0156f2c" ]; then
+    continue
+  fi
+  case "$image" in ghcr.io/ly416123/*@sha256:*) ;; *) echo "$key must reference ghcr.io/ly416123 by digest" >&2; exit 2 ;; esac
+  digest=${image##*@sha256:}
+  if [ "$image" = "$digest" ] || [ "${#digest}" -ne 64 ]; then
+    echo "$key must be an immutable GHCR image reference ending in @sha256:<64 hex chars>" >&2
+    exit 2
+  fi
+  case "$digest" in *[!0123456789abcdefABCDEF]*) echo "$key has an invalid sha256 digest" >&2; exit 2 ;; esac
+done
+
+if [ "$replicas" -gt 0 ]; then
+  slot=1
+  seen_ids=" "
+  proxy_uid=$(value CREDENTIAL_PROXY_UID)
+  proxy_uid=${proxy_uid:-10001}
+  proxy_gid=$(value CREDENTIAL_PROXY_GID)
+  proxy_gid=${proxy_gid:-10001}
+  case "$proxy_uid" in ''|*[!0-9]*) echo "CREDENTIAL_PROXY_UID must be a numeric user ID" >&2; exit 2 ;; esac
+  case "$proxy_gid" in ''|*[!0-9]*) echo "CREDENTIAL_PROXY_GID must be a numeric group ID" >&2; exit 2 ;; esac
+  provider_root=$(value PROVIDER_CREDENTIALS_DIR)
+  if [ -z "$provider_root" ]; then echo "PROVIDER_CREDENTIALS_DIR is required when Workers are enabled" >&2; exit 2; fi
+  case "$provider_root" in
+    /*) ;;
+    *) provider_root="$(CDPATH= cd -- "$(dirname -- "$env_file")" && pwd)/$provider_root" ;;
+  esac
+  if [ ! -d "$provider_root" ] || [ -L "$provider_root" ]; then
+    echo "PROVIDER_CREDENTIALS_DIR must be an existing non-symlink directory" >&2
+    exit 2
+  fi
+  if provider_root_mode=$(stat -f '%Lp' "$provider_root" 2>/dev/null); then :; else provider_root_mode=$(stat -c '%a' "$provider_root"); fi
+  if [ "$((0$provider_root_mode & 077))" -ne 0 ]; then
+    echo "Provider credential directory must not be accessible by group or other users" >&2
+    exit 2
+  fi
+  if provider_root_owner=$(stat -f '%u' "$provider_root" 2>/dev/null); then :; else provider_root_owner=$(stat -c '%u' "$provider_root"); fi
+  if [ "$provider_root_owner" != "$proxy_uid" ]; then
+    echo "Provider credential directory owner must match CREDENTIAL_PROXY_UID" >&2
+    exit 2
+  fi
+  provider_bindings_json=$(value AGENTTEAMS_TENANT_CREDENTIAL_REFS_JSON)
+  if [ -z "$provider_bindings_json" ] || ! python3 - "$provider_root" "$proxy_uid" "$provider_bindings_json" <<'PYBINDINGS'
+import json
+import re
+import stat
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve(strict=True)
+expected_uid = int(sys.argv[2])
+rows = json.loads(sys.argv[3])
+if not isinstance(rows, list) or not rows:
+    raise SystemExit(1)
+seen = set()
+for row in rows:
+    if not isinstance(row, dict):
+        raise SystemExit(1)
+    tenant, project, team = (row.get(key) for key in ("tenant_id", "project_id", "team_id"))
+    reference = row.get("model_credential_ref")
+    if any(not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", value)
+           for value in (tenant, project, team)):
+        raise SystemExit(1)
+    key = (tenant, project, team)
+    if key in seen:
+        raise SystemExit(1)
+    seen.add(key)
+    if not isinstance(reference, str) or not reference.startswith("file:"):
+        raise SystemExit(1)
+    parts = reference[5:].split("/")
+    if len(parts) < 4 or parts[:3] != [tenant, project, team] or any(
+            not re.fullmatch(r"[A-Za-z0-9_-]+", part) for part in parts):
+        raise SystemExit(1)
+    target = root.joinpath(*parts)
+    cursor = root
+    for part in parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise SystemExit(1)
+    if not target.is_file() or not target.resolve(strict=True).is_relative_to(root):
+        raise SystemExit(1)
+    for directory in target.parents:
+        if directory == root.parent:
+            break
+        if not directory.is_relative_to(root):
+            continue
+        directory_stat = directory.stat()
+        if directory_stat.st_uid != expected_uid or stat.S_IMODE(directory_stat.st_mode) & 0o077:
+            raise SystemExit(1)
+    target_stat = target.stat()
+    if target_stat.st_uid != expected_uid or stat.S_IMODE(target_stat.st_mode) & 0o077:
+        raise SystemExit(1)
+    if not 0 < target_stat.st_size <= 64 * 1024:
+        raise SystemExit(1)
+PYBINDINGS
+  then
+    echo "AGENTTEAMS_TENANT_CREDENTIAL_REFS_JSON must define valid Tenant/Project/Team file bindings" >&2
+    exit 2
+  fi
+  while [ "$slot" -le "$replicas" ]; do
+    id=$(value "WORKER_${slot}_SLOT_ID")
+    if ! printf '%s\n' "$id" | awk '/^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$/ { ok=1 } END { exit !ok }'; then
+      echo "WORKER_${slot}_SLOT_ID must be a provisioned Worker slot UUID" >&2
+      exit 2
+    fi
+    if ! python3 - "$id" "$slot" "$(value WORKER_SLOT_IDS_JSON)" <<'PYSLOTS'
+import json
+import sys
+import uuid
+
+slot_id, index, raw_slots = sys.argv[1], int(sys.argv[2]) - 1, sys.argv[3]
+try:
+    slots = [str(uuid.UUID(item)) for item in json.loads(raw_slots)]
+except (ValueError, TypeError, json.JSONDecodeError):
+    raise SystemExit(1)
+if index >= len(slots) or slots[index] != str(uuid.UUID(slot_id)) or len(set(slots)) != len(slots):
+    raise SystemExit(1)
+PYSLOTS
+    then
+      echo "WORKER_${slot}_SLOT_ID must match the same position in WORKER_SLOT_IDS_JSON" >&2
+      exit 2
+    fi
+    normalized_id=$(printf '%s' "$id" | tr '[:upper:]' '[:lower:]')
+    case "$seen_ids" in
+      *" $normalized_id "*) echo "Worker slot UUIDs must be unique" >&2; exit 2 ;;
+    esac
+    seen_ids="$seen_ids$normalized_id "
+    credential_file=$(value "WORKER_${slot}_CREDENTIALS_FILE")
+    case "$credential_file" in
+      /*) ;;
+      *) credential_file="$(CDPATH= cd -- "$(dirname -- "$env_file")" && pwd)/$credential_file" ;;
+    esac
+    if [ ! -r "$credential_file" ] || ! grep -Eq '^AGENTTEAMS_GATEWAY_AUTH_TOKEN=wslot_[A-Za-z0-9_-]{40,}$' "$credential_file"; then
+      echo "WORKER_${slot}_CREDENTIALS_FILE must contain a Worker slot session token" >&2
+      exit 2
+    fi
+    if mode=$(stat -f '%Lp' "$credential_file" 2>/dev/null); then :; else mode=$(stat -c '%a' "$credential_file"); fi
+    if [ "$((0$mode & 077))" -ne 0 ]; then
+      echo "Worker credential file must not be readable by group or other users: $credential_file" >&2
+      exit 2
+    fi
+    slot=$((slot + 1))
+  done
+fi
+
+echo "Compose configuration prerequisites are valid (Workers: $replicas)"

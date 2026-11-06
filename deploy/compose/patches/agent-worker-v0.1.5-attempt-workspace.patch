@@ -1,0 +1,1666 @@
+diff --git a/agent-worker/src/main/java/io/agentteams/worker/AgentTeamsWorker.java b/agent-worker/src/main/java/io/agentteams/worker/AgentTeamsWorker.java
+index 995d821..9cc8200 100644
+--- a/agent-worker/src/main/java/io/agentteams/worker/AgentTeamsWorker.java
++++ b/agent-worker/src/main/java/io/agentteams/worker/AgentTeamsWorker.java
+@@ -121,8 +121,8 @@ public final class AgentTeamsWorker implements AutoCloseable {
+                 this::onDisconnected);
+         this.channelClient = new AgentChannelClient(configuration.agentId(), channelPort, clock,
+                 configuration.reconnectDelay());
+-        this.runtime = new WorkerRuntimeFactory(sandboxStateProbe)
+-                .create(configuration, gatewayChannel, clock, quotaPort);
++        WorkerRuntimeFactory runtimeFactory = new WorkerRuntimeFactory(sandboxStateProbe);
++        this.runtime = runtimeFactory.create(configuration, gatewayChannel, clock, quotaPort);
+         this.manifestFetcher = new ConfigManifestFetcher(configuration.configManifestBaseUrl(),
+                 configuration.configFetchTimeout(), configuration.maxConfigManifestBytes());
+         this.bootstrapFetcher = configuration.configManifestBaseUrl() == null ? null
+@@ -135,7 +135,8 @@ public final class AgentTeamsWorker implements AutoCloseable {
+                 configuration.maxArtifactBytes());
+         this.configDirectory = configuration.configDirectory();
+         this.runtimeAdapter = new GatewayRuntimeAdapter(configuration.agentId(), channelPort, runtime, clock,
+-                artifactUploadPort(configuration, gatewayChannel, clock), configuration.eventRateLimit());
++                artifactUploadPort(configuration, gatewayChannel, clock), configuration.eventRateLimit(),
++                runtimeFactory.attemptCapabilityPort());
+         // runtime SSE 中间事件 → 适配器出口（限速与白名单在两侧兜底）。
+         this.runtime.setEventSink(event -> {
+             boolean handedOff = runtimeAdapter.reportEvent(event.taskId(), event.eventType(), event.payloadJson());
+@@ -552,24 +553,15 @@ public final class AgentTeamsWorker implements AutoCloseable {
+     }
+
+     private void rejectAssignment(TaskAssigned assignment, Throwable error) {
+-        EventMetadata input = assignment.getMetadata();
+-        EventMetadata metadata = input.toBuilder()
+-                .setEventId(UUID.randomUUID().toString())
+-                .setOccurredAt(timestamp(clock.instant()))
+-                .build();
+         String reason = truncate(rootMessage(error));
+         if (reason.isBlank()) {
+             reason = "unable to process task assignment";
+         }
+         try {
+-            channelPort.send(AgentMessage.newBuilder().setTaskAccepted(TaskAccepted.newBuilder()
+-                    .setMetadata(metadata)
+-                    .setAccepted(false)
+-                    .setRejectionReason(reason)
+-                    .build()).build());
++            runtimeAdapter.rejectAssignment(assignment, reason);
+         } catch (RuntimeException sendError) {
+             System.err.printf("Unable to report task assignment rejection task=%s: %s%n",
+-                    input.getTaskId(), rootMessage(sendError));
++                    assignment.getMetadata().getTaskId(), rootMessage(sendError));
+         }
+     }
+
+@@ -701,6 +693,8 @@ public final class AgentTeamsWorker implements AutoCloseable {
+             String gatewayHost,
+             int gatewayPort,
+             String gatewayAuthToken,
++            URI attemptCredentialIssueUrl,
++            URI attemptCapabilityIssueUrl,
+             boolean gatewayTlsEnabled,
+             String gatewayTlsCaCertPath,
+             String gatewayTlsClientCertPath,
+@@ -743,6 +737,15 @@ public final class AgentTeamsWorker implements AutoCloseable {
+             boolean quotaRemoteEnabled = booleanValue(environment, "AGENTTEAMS_QUOTA_REMOTE_ENABLED", false);
+             boolean artifactUploadEnabled = booleanValue(environment, "AGENTTEAMS_ARTIFACT_UPLOAD_ENABLED", false);
+             String gatewayAuthToken = optional(environment, "AGENTTEAMS_GATEWAY_AUTH_TOKEN");
++            URI attemptCredentialIssueUrl = optionalUri(environment, "AGENTTEAMS_ATTEMPT_CREDENTIAL_ISSUE_URL");
++            URI attemptCapabilityIssueUrl = optionalUri(environment, "AGENTTEAMS_ATTEMPT_CAPABILITY_ISSUE_URL");
++            if (attemptCredentialIssueUrl != null && attemptCapabilityIssueUrl != null) {
++                throw new IllegalArgumentException("Only one Attempt credential issuance endpoint may be configured");
++            }
++            if ((attemptCredentialIssueUrl != null || attemptCapabilityIssueUrl != null) && gatewayAuthToken == null) {
++                throw new IllegalArgumentException(
++                        "AGENTTEAMS_GATEWAY_AUTH_TOKEN must be set when Attempt credentials are enabled");
++            }
+             if (artifactUploadEnabled && gatewayAuthToken == null) {
+                 throw new IllegalArgumentException("AGENTTEAMS_GATEWAY_AUTH_TOKEN must be set when artifact uploads are enabled");
+             }
+@@ -758,6 +761,8 @@ public final class AgentTeamsWorker implements AutoCloseable {
+                     value(environment, "AGENTTEAMS_GATEWAY_HOST", "agentteams-agentteams-java-gateway"),
+                     integer(environment, "AGENTTEAMS_GATEWAY_PORT", 9090),
+                     gatewayAuthToken,
++                    attemptCredentialIssueUrl,
++                    attemptCapabilityIssueUrl,
+                     booleanValue(environment, "AGENTTEAMS_GATEWAY_TLS_ENABLED", false),
+                     requiredWhenEnabled(environment, "AGENTTEAMS_GATEWAY_TLS_CA_CERT_PATH",
+                             "AGENTTEAMS_GATEWAY_TLS_ENABLED"),
+diff --git a/agent-worker/src/main/java/io/agentteams/worker/WorkerRuntimeFactory.java b/agent-worker/src/main/java/io/agentteams/worker/WorkerRuntimeFactory.java
+index b57069c..6b0614b 100644
+--- a/agent-worker/src/main/java/io/agentteams/worker/WorkerRuntimeFactory.java
++++ b/agent-worker/src/main/java/io/agentteams/worker/WorkerRuntimeFactory.java
+@@ -11,11 +11,17 @@ import io.agentteams.worker.agentscope.ConfiguredAgentScopeHarnessFactory;
+ import io.agentteams.worker.agentscope.AgentScopeWorkspaceFactory;
+ import io.agentteams.worker.agentscope.SandboxWorkspaceOwnershipPort;
+ import io.agentteams.worker.chatgpt.ChatGptPlanModelProvider;
++import io.agentteams.worker.chatgpt.AttemptCredentialTokenSource;
++import io.agentteams.worker.chatgpt.AttemptCapabilityTokenRegistry;
++import io.agentteams.worker.chatgpt.ChatGptPlanModel;
++import io.agentteams.runtime.RuntimeTask;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
+ import java.time.Clock;
+ import java.util.Map;
+ import java.util.Objects;
++import java.util.UUID;
++import java.util.function.Function;
+
+ /** Composition root for the single AgentScope Harness execution runtime. */
+ public final class WorkerRuntimeFactory {
+@@ -26,6 +32,7 @@ public final class WorkerRuntimeFactory {
+     private final AgentScopeHarnessFactory configuredHarness;
+     private final SandboxStateProbePort sandboxStateProbe;
+     private final SandboxWorkspaceOwnershipPort workspaceOwnership;
++    private AttemptCapabilityTokenRegistry attemptCapabilityTokens;
+
+     public WorkerRuntimeFactory() {
+         this(null, (sandboxId, taskId, attemptId) -> {
+@@ -68,6 +75,11 @@ public final class WorkerRuntimeFactory {
+         Objects.requireNonNull(gatewayChannel, "gatewayChannel");
+         Objects.requireNonNull(clock, "clock");
+         validate(configuration);
++        attemptCapabilityTokens = configuration.attemptCapabilityIssueUrl() == null ? null
++                : new AttemptCapabilityTokenRegistry(configuration.attemptCapabilityIssueUrl(),
++                        Objects.requireNonNull(configuration.gatewayAuthToken(),
++                                "Worker slot session is required for Attempt capabilities"),
++                        java.net.http.HttpClient.newHttpClient(), clock);
+         AgentRuntime agentScope = agentScope(configuration, clock);
+         if (agentScope == null) {
+             throw new IllegalStateException("AgentScope Harness is unavailable");
+@@ -75,6 +87,10 @@ public final class WorkerRuntimeFactory {
+         return agentScope;
+     }
+
++    io.agentteams.runtime.RuntimeAttemptCapabilityPort attemptCapabilityPort() {
++        return attemptCapabilityTokens;
++    }
++
+     private AgentRuntime agentScope(AgentTeamsWorker.WorkerConfiguration configuration, Clock clock) {
+         AgentScopeHarnessFactory harness = configuredHarness;
+         ConfiguredAgentScopeHarnessFactory configured = null;
+@@ -88,9 +104,31 @@ public final class WorkerRuntimeFactory {
+             }
+             AgentScopeWorkspaceFactory workspaceFactory = new AgentScopeWorkspaceFactory(
+                     sandboxStateProbe, clock, root, workspaceOwnership);
+-            configured = new ConfiguredAgentScopeHarnessFactory(
+-                    ModelRegistry.resolve(configuration.model(), modelCreationContext(System.getenv())),
+-                    workspaceFactory, root);
++            var baseModel = ModelRegistry.resolve(configuration.model(), modelCreationContext(System.getenv()));
++            Function<RuntimeTask, io.agentscope.core.model.Model> modelForTask = task -> {
++                if (!(baseModel instanceof ChatGptPlanModel chatGpt)) {
++                    return baseModel;
++                }
++                if (configuration.gatewayAuthToken() == null) {
++                    throw new IllegalStateException("Worker session is required for Attempt credentials");
++                }
++                if (configuration.attemptCapabilityIssueUrl() != null) {
++                    if (attemptCapabilityTokens == null) {
++                        throw new IllegalStateException("Attempt capability provider is unavailable");
++                    }
++                    return chatGpt.withTokenSource(attemptCapabilityTokens.source(
++                            requiredUuid(task, "taskId", task.id()), requiredUuid(task, "assignmentId"),
++                            requiredUuid(task, "attemptId"), requiredUuid(task, "leaseId")));
++                }
++                if (configuration.attemptCredentialIssueUrl() == null) {
++                    return baseModel;
++                }
++                return chatGpt.withTokenSource(new AttemptCredentialTokenSource(configuration.attemptCredentialIssueUrl(),
++                        configuration.gatewayAuthToken(), requiredUuid(task, "taskId", task.id()),
++                        requiredUuid(task, "attemptId"), requiredUuid(task, "leaseId"),
++                        java.net.http.HttpClient.newHttpClient()));
++            };
++            configured = new ConfiguredAgentScopeHarnessFactory(baseModel, workspaceFactory, root, modelForTask);
+             harness = configured;
+         }
+         if (harness == null) {
+@@ -105,6 +143,20 @@ public final class WorkerRuntimeFactory {
+                 && !"unknown".equalsIgnoreCase(configuration.model().trim());
+     }
+
++    private static UUID requiredUuid(RuntimeTask task, String key) {
++        return requiredUuid(task, key, null);
++    }
++
++    private static UUID requiredUuid(RuntimeTask task, String key, UUID fallback) {
++        String value = key.equals("taskId") ? task.id().toString() : task.metadata().get(key);
++        if ((value == null || value.isBlank()) && fallback != null) return fallback;
++        try {
++            return UUID.fromString(value);
++        } catch (RuntimeException invalid) {
++            throw new IllegalArgumentException("Attempt metadata is missing or invalid: " + key);
++        }
++    }
++
+     static ModelCreationContext modelCreationContext(Map<String, String> environment) {
+         String baseUrl = environment.get("AGENTTEAMS_MODEL_BASE_URL");
+         ModelCreationContext.Builder builder = ModelCreationContext.builder();
+diff --git a/agent-worker/src/main/java/io/agentteams/worker/agentscope/ConfiguredAgentScopeHarnessFactory.java b/agent-worker/src/main/java/io/agentteams/worker/agentscope/ConfiguredAgentScopeHarnessFactory.java
+index e680244..78b7018 100644
+--- a/agent-worker/src/main/java/io/agentteams/worker/agentscope/ConfiguredAgentScopeHarnessFactory.java
++++ b/agent-worker/src/main/java/io/agentteams/worker/agentscope/ConfiguredAgentScopeHarnessFactory.java
+@@ -18,6 +18,9 @@ import io.agentteams.runtime.RuntimeTask;
+ import java.io.IOException;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
++import java.nio.file.FileVisitResult;
++import java.nio.file.SimpleFileVisitor;
++import java.nio.file.attribute.BasicFileAttributes;
+ import java.time.Instant;
+ import java.util.Objects;
+ import java.util.Map;
+@@ -25,6 +28,7 @@ import java.util.List;
+ import java.util.Optional;
+ import java.util.Set;
+ import java.util.UUID;
++import java.util.function.Function;
+ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.atomic.AtomicReference;
+ import io.agentscope.core.tool.Toolkit;
+@@ -46,6 +50,7 @@ public final class ConfiguredAgentScopeHarnessFactory implements AgentScopeHarne
+     private final AtomicReference<Map<String, SkillCapabilityPolicy>> activeSkillCapabilities =
+             new AtomicReference<>(Map.of());
+     private final McpRuntimePort mcpRuntime;
++    private final Function<RuntimeTask, Model> taskModelProvider;
+
+     public ConfiguredAgentScopeHarnessFactory(String modelId, Path workspaceRoot) {
+         this(resolveModel(modelId), workspaceRoot, unavailableProbe());
+@@ -74,16 +79,27 @@ public final class ConfiguredAgentScopeHarnessFactory implements AgentScopeHarne
+
+     public ConfiguredAgentScopeHarnessFactory(Model model, AgentScopeWorkspaceFactory workspaceFactory,
+             Path workspaceRoot) {
++        this(model, workspaceFactory, workspaceRoot, ignored -> model);
++    }
++
++    public ConfiguredAgentScopeHarnessFactory(Model model, AgentScopeWorkspaceFactory workspaceFactory,
++            Path workspaceRoot, Function<RuntimeTask, Model> taskModelProvider) {
+         this(model, workspaceFactory, workspaceRoot,
+-                new AgentScopeMcpRuntimePort(new EnvironmentMcpCredentialProvider()));
++                new AgentScopeMcpRuntimePort(new EnvironmentMcpCredentialProvider()), taskModelProvider);
+     }
+
+     ConfiguredAgentScopeHarnessFactory(Model model, AgentScopeWorkspaceFactory workspaceFactory,
+             Path workspaceRoot, McpRuntimePort mcpRuntime) {
++        this(model, workspaceFactory, workspaceRoot, mcpRuntime, ignored -> model);
++    }
++
++    private ConfiguredAgentScopeHarnessFactory(Model model, AgentScopeWorkspaceFactory workspaceFactory,
++            Path workspaceRoot, McpRuntimePort mcpRuntime, Function<RuntimeTask, Model> taskModelProvider) {
+         this.model = Objects.requireNonNull(model, "model");
+         this.workspaceFactory = Objects.requireNonNull(workspaceFactory, "workspaceFactory");
+         this.workspaceRoot = normalizeRoot(workspaceRoot);
+         this.mcpRuntime = Objects.requireNonNull(mcpRuntime, "mcpRuntime");
++        this.taskModelProvider = Objects.requireNonNull(taskModelProvider, "taskModelProvider");
+     }
+
+     public WorkspaceActiveGuard activeGuard() {
+@@ -97,12 +113,17 @@ public final class ConfiguredAgentScopeHarnessFactory implements AgentScopeHarne
+
+     @Override
+     public void release(UUID taskId) {
+-        bindings.remove(Objects.requireNonNull(taskId, "taskId"));
++        AgentScopeWorkspaceFactory.WorkspaceBinding binding = bindings.remove(
++                Objects.requireNonNull(taskId, "taskId"));
++        if (binding == null || binding.profile() != SandboxProfile.NONE) return;
++        deleteLocalWorkspace(workspaceFor(binding));
+     }
+
+     @Override
+     public void releaseAll() {
+-        bindings.clear();
++        for (UUID taskId : List.copyOf(bindings.keySet())) {
++            release(taskId);
++        }
+     }
+
+     @Override
+@@ -144,22 +165,26 @@ public final class ConfiguredAgentScopeHarnessFactory implements AgentScopeHarne
+             throw new IllegalArgumentException("sandbox workspace must expose a verified local workspace");
+         }
+         bindings.put(task.id(), binding);
+-        Path workspace = binding.workspacePath().orElseGet(() -> workspaceRoot.resolve(task.id().toString()));
++        Path workspace = workspaceFor(binding);
+         workspace = workspace.toAbsolutePath().normalize();
+         if (!workspace.startsWith(workspaceRoot)) {
+             throw new IllegalArgumentException("resolved workspace is outside the configured root");
+         }
+         try {
+             Files.createDirectories(workspace);
++            workspace = workspace.toRealPath();
++            if (!workspace.startsWith(workspaceRoot)) {
++                throw new IllegalArgumentException("resolved workspace is outside the configured root");
++            }
+             String agentId = context.configuration().getOrDefault("worker_id",
+                     task.metadata().getOrDefault("agentId", "agent-worker"));
+             HarnessAgent.Builder builder = HarnessAgent.builder()
+                     .name("agentteams-worker")
+                     .agentId(agentId)
+                     .defaultSessionId(required(task, "attemptId"))
+-                    .model(model)
++                    .model(Objects.requireNonNull(taskModelProvider.apply(task), "task model provider returned null"))
+                     .workspace(workspace)
+-                    .stateStore(new JsonFileAgentStateStore(workspaceRoot.resolve(".agentscope-state")))
++                    .stateStore(new JsonFileAgentStateStore(workspace.resolve(".agentscope-state")))
+                     .disableShellTool()
+                     .disableSubagents()
+                     .disableSessionPersistence()
+@@ -203,6 +228,36 @@ public final class ConfiguredAgentScopeHarnessFactory implements AgentScopeHarne
+         }
+     }
+
++    private Path workspaceFor(AgentScopeWorkspaceFactory.WorkspaceBinding binding) {
++        return binding.workspacePath().orElseGet(() -> workspaceRoot.resolve(binding.scopeId()));
++    }
++
++    private void deleteLocalWorkspace(Path workspace) {
++        Path normalized = workspace.toAbsolutePath().normalize();
++        if (!normalized.startsWith(workspaceRoot) || normalized.equals(workspaceRoot)) {
++            LOG.log(System.Logger.Level.ERROR, "Refusing to remove workspace outside its root");
++            return;
++        }
++        try {
++            Files.walkFileTree(normalized, new SimpleFileVisitor<>() {
++                @Override
++                public FileVisitResult visitFile(Path file, BasicFileAttributes attributes) throws IOException {
++                    Files.deleteIfExists(file);
++                    return FileVisitResult.CONTINUE;
++                }
++
++                @Override
++                public FileVisitResult postVisitDirectory(Path directory, IOException failure) throws IOException {
++                    if (failure != null) throw failure;
++                    Files.deleteIfExists(directory);
++                    return FileVisitResult.CONTINUE;
++                }
++            });
++        } catch (IOException | RuntimeException error) {
++            LOG.log(System.Logger.Level.WARNING, "Unable to remove terminal local workspace");
++        }
++    }
++
+     private static Set<String> requiredTaskTools(String inputJson) {
+         try {
+             var root = new com.fasterxml.jackson.databind.ObjectMapper().readTree(inputJson);
+diff --git a/agent-worker/src/main/java/io/agentteams/worker/chatgpt/AttemptCapabilityTokenRegistry.java b/agent-worker/src/main/java/io/agentteams/worker/chatgpt/AttemptCapabilityTokenRegistry.java
+new file mode 100644
+index 0000000..d87202a
+--- /dev/null
++++ b/agent-worker/src/main/java/io/agentteams/worker/chatgpt/AttemptCapabilityTokenRegistry.java
+@@ -0,0 +1,66 @@
++package io.agentteams.worker.chatgpt;
++
++import io.agentteams.runtime.RuntimeAttemptCapabilityPort;
++import java.net.URI;
++import java.net.http.HttpClient;
++import java.time.Clock;
++import java.util.Objects;
++import java.util.UUID;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ConcurrentMap;
++
++/** Shares one cached capability source between model calls and Gateway execution events. */
++public final class AttemptCapabilityTokenRegistry implements RuntimeAttemptCapabilityPort {
++    private final URI endpoint;
++    private final String workerSlotSessionToken;
++    private final HttpClient http;
++    private final Clock clock;
++    private final ConcurrentMap<UUID, BoundSource> sources = new ConcurrentHashMap<>();
++
++    public AttemptCapabilityTokenRegistry(URI endpoint, String workerSlotSessionToken, HttpClient http, Clock clock) {
++        this.endpoint = Objects.requireNonNull(endpoint, "endpoint");
++        this.workerSlotSessionToken = Objects.requireNonNull(workerSlotSessionToken, "workerSlotSessionToken");
++        this.http = Objects.requireNonNull(http, "http");
++        this.clock = Objects.requireNonNull(clock, "clock");
++    }
++
++    public AttemptCapabilityTokenSource source(UUID taskId, UUID assignmentId, UUID attemptId, UUID leaseId) {
++        Objects.requireNonNull(taskId, "taskId");
++        Objects.requireNonNull(assignmentId, "assignmentId");
++        Objects.requireNonNull(attemptId, "attemptId");
++        Objects.requireNonNull(leaseId, "leaseId");
++        BoundSource bound = sources.compute(taskId, (ignored, current) -> {
++            if (current != null && current.matches(assignmentId, attemptId, leaseId)) return current;
++            return new BoundSource(assignmentId, attemptId, leaseId,
++                    new AttemptCapabilityTokenSource(endpoint, workerSlotSessionToken, taskId,
++                            assignmentId, attemptId, leaseId, http, clock));
++        });
++        return bound.source();
++    }
++
++    @Override
++    public String accessToken(UUID taskId, String assignmentId, String attemptId, String leaseId) {
++        return source(taskId, uuid(assignmentId, "assignmentId"), uuid(attemptId, "attemptId"),
++                uuid(leaseId, "leaseId")).accessToken();
++    }
++
++    @Override
++    public void release(UUID taskId) {
++        if (taskId != null) sources.remove(taskId);
++    }
++
++    private static UUID uuid(String value, String field) {
++        try {
++            return UUID.fromString(value);
++        } catch (RuntimeException malformed) {
++            throw new IllegalArgumentException("Attempt capability " + field + " is invalid", malformed);
++        }
++    }
++
++    private record BoundSource(UUID assignmentId, UUID attemptId, UUID leaseId,
++            AttemptCapabilityTokenSource source) {
++        private boolean matches(UUID assignment, UUID attempt, UUID lease) {
++            return assignmentId.equals(assignment) && attemptId.equals(attempt) && leaseId.equals(lease);
++        }
++    }
++}
+diff --git a/agent-worker/src/main/java/io/agentteams/worker/chatgpt/AttemptCapabilityTokenSource.java b/agent-worker/src/main/java/io/agentteams/worker/chatgpt/AttemptCapabilityTokenSource.java
+new file mode 100644
+index 0000000..84f3b98
+--- /dev/null
++++ b/agent-worker/src/main/java/io/agentteams/worker/chatgpt/AttemptCapabilityTokenSource.java
+@@ -0,0 +1,107 @@
++package io.agentteams.worker.chatgpt;
++
++import com.fasterxml.jackson.databind.JsonNode;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import java.io.IOException;
++import java.io.InputStream;
++import java.net.URI;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
++import java.time.Duration;
++import java.time.Clock;
++import java.time.Instant;
++import java.util.Objects;
++import java.util.UUID;
++
++/** Obtains a short-lived, Assignment-bound execution capability for one Worker slot. */
++public final class AttemptCapabilityTokenSource implements ChatGptPlanTokenSource {
++    private static final ObjectMapper JSON = new ObjectMapper();
++    private static final int MAX_RESPONSE_BYTES = 16 * 1024;
++    private final URI endpoint;
++    private final String workerSlotSessionToken;
++    private final UUID taskId;
++    private final UUID assignmentId;
++    private final UUID attemptId;
++    private final UUID leaseId;
++    private final HttpClient http;
++    private final Clock clock;
++    private String cachedToken;
++    private Instant cachedExpiresAt;
++
++    public AttemptCapabilityTokenSource(URI endpoint, String workerSlotSessionToken, UUID taskId,
++            UUID assignmentId, UUID attemptId, UUID leaseId, HttpClient http) {
++        this(endpoint, workerSlotSessionToken, taskId, assignmentId, attemptId, leaseId, http, Clock.systemUTC());
++    }
++
++    public AttemptCapabilityTokenSource(URI endpoint, String workerSlotSessionToken, UUID taskId,
++            UUID assignmentId, UUID attemptId, UUID leaseId, HttpClient http, Clock clock) {
++        this.endpoint = validateEndpoint(endpoint);
++        this.workerSlotSessionToken = requireText(workerSlotSessionToken, "Worker slot session token");
++        this.taskId = Objects.requireNonNull(taskId, "taskId");
++        this.assignmentId = Objects.requireNonNull(assignmentId, "assignmentId");
++        this.attemptId = Objects.requireNonNull(attemptId, "attemptId");
++        this.leaseId = Objects.requireNonNull(leaseId, "leaseId");
++        this.http = Objects.requireNonNull(http, "http");
++        this.clock = Objects.requireNonNull(clock, "clock");
++    }
++
++    @Override
++    public synchronized String accessToken() {
++        Instant now = clock.instant();
++        if (cachedToken != null && cachedExpiresAt.isAfter(now.plusSeconds(30))) return cachedToken;
++        try {
++            String body = JSON.createObjectNode().put("taskId", taskId.toString())
++                    .put("assignmentId", assignmentId.toString()).put("attemptId", attemptId.toString())
++                    .put("leaseId", leaseId.toString()).toString();
++            HttpRequest request = HttpRequest.newBuilder(endpoint).timeout(Duration.ofSeconds(10))
++                    .header("Authorization", "Bearer " + workerSlotSessionToken)
++                    .header("Content-Type", "application/json")
++                    .header("Accept", "application/json")
++                    .header("Cache-Control", "no-store")
++                    .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8)).build();
++            HttpResponse<InputStream> response = http.send(request, HttpResponse.BodyHandlers.ofInputStream());
++            try (InputStream stream = response.body()) {
++                if (response.statusCode() != 201) throw denied();
++                byte[] bytes = stream.readNBytes(MAX_RESPONSE_BYTES + 1);
++                if (bytes.length > MAX_RESPONSE_BYTES) throw denied();
++                JsonNode result = JSON.readTree(bytes);
++                String token = result.path("token").asText("");
++                Instant expiresAt = Instant.parse(result.path("expiresAt").asText(""));
++                if (!token.matches("cap_[A-Za-z0-9_-]{43}") || !expiresAt.isAfter(now)
++                        || expiresAt.isAfter(now.plusSeconds(305))) {
++                    throw denied();
++                }
++                cachedToken = token;
++                cachedExpiresAt = expiresAt;
++                return cachedToken;
++            }
++        } catch (IOException | InterruptedException | RuntimeException error) {
++            if (error instanceof InterruptedException) Thread.currentThread().interrupt();
++            throw denied();
++        }
++    }
++
++    private static URI validateEndpoint(URI endpoint) {
++        Objects.requireNonNull(endpoint, "endpoint");
++        String scheme = endpoint.getScheme();
++        if (endpoint.getHost() == null || endpoint.getRawUserInfo() != null
++                || !("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme))
++                || endpoint.getFragment() != null) {
++            throw new IllegalArgumentException("Attempt capability endpoint is invalid");
++        }
++        return endpoint;
++    }
++
++    private static String requireText(String value, String field) {
++        if (value == null || value.isBlank() || value.chars().anyMatch(Character::isWhitespace)) {
++            throw new IllegalArgumentException(field + " is required");
++        }
++        return value;
++    }
++
++    private static IllegalStateException denied() {
++        return new IllegalStateException("Attempt capability could not be issued");
++    }
++}
+diff --git a/agent-worker/src/main/java/io/agentteams/worker/chatgpt/AttemptCredentialTokenSource.java b/agent-worker/src/main/java/io/agentteams/worker/chatgpt/AttemptCredentialTokenSource.java
+new file mode 100644
+index 0000000..74ef7af
+--- /dev/null
++++ b/agent-worker/src/main/java/io/agentteams/worker/chatgpt/AttemptCredentialTokenSource.java
+@@ -0,0 +1,91 @@
++package io.agentteams.worker.chatgpt;
++
++import com.fasterxml.jackson.databind.JsonNode;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import java.io.IOException;
++import java.io.InputStream;
++import java.net.URI;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
++import java.time.Duration;
++import java.time.Instant;
++import java.util.Objects;
++import java.util.UUID;
++
++/** Obtains a fresh, short-lived model capability for one active Attempt. */
++public final class AttemptCredentialTokenSource implements ChatGptPlanTokenSource {
++    private static final ObjectMapper JSON = new ObjectMapper();
++    private static final int MAX_RESPONSE_BYTES = 16 * 1024;
++    private final URI endpoint;
++    private final String workerSessionToken;
++    private final UUID taskId;
++    private final UUID attemptId;
++    private final UUID leaseId;
++    private final HttpClient http;
++
++    public AttemptCredentialTokenSource(URI endpoint, String workerSessionToken, UUID taskId,
++            UUID attemptId, UUID leaseId, HttpClient http) {
++        this.endpoint = validateEndpoint(endpoint);
++        this.workerSessionToken = requireText(workerSessionToken, "worker session token");
++        this.taskId = Objects.requireNonNull(taskId, "taskId");
++        this.attemptId = Objects.requireNonNull(attemptId, "attemptId");
++        this.leaseId = Objects.requireNonNull(leaseId, "leaseId");
++        this.http = Objects.requireNonNull(http, "http");
++    }
++
++    @Override
++    public String accessToken() {
++        try {
++            String body = JSON.createObjectNode().put("taskId", taskId.toString())
++                    .put("attemptId", attemptId.toString()).put("leaseId", leaseId.toString()).toString();
++            HttpRequest request = HttpRequest.newBuilder(endpoint).timeout(Duration.ofSeconds(10))
++                    .header("Authorization", "Bearer " + workerSessionToken)
++                    .header("Content-Type", "application/json")
++                    .header("Accept", "application/json")
++                    .header("Cache-Control", "no-store")
++                    .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8)).build();
++            HttpResponse<InputStream> response = http.send(request, HttpResponse.BodyHandlers.ofInputStream());
++            try (InputStream stream = response.body()) {
++                if (response.statusCode() != 201) throw denied();
++                byte[] bytes = stream.readNBytes(MAX_RESPONSE_BYTES + 1);
++                if (bytes.length > MAX_RESPONSE_BYTES) throw denied();
++                JsonNode result = JSON.readTree(bytes);
++                String token = result.path("token").asText("");
++                Instant expiresAt = Instant.parse(result.path("expiresAt").asText(""));
++                Instant now = Instant.now();
++                if (!token.matches("atp_[A-Za-z0-9_-]{43}") || !expiresAt.isAfter(now)
++                        || expiresAt.isAfter(now.plusSeconds(305))) {
++                    throw denied();
++                }
++                return token;
++            }
++        } catch (IOException | InterruptedException | RuntimeException error) {
++            if (error instanceof InterruptedException) Thread.currentThread().interrupt();
++            throw denied();
++        }
++    }
++
++    private static URI validateEndpoint(URI endpoint) {
++        Objects.requireNonNull(endpoint, "endpoint");
++        String scheme = endpoint.getScheme();
++        if (endpoint.getHost() == null || endpoint.getRawUserInfo() != null
++                || !("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme))
++                || endpoint.getFragment() != null) {
++            throw new IllegalArgumentException("Attempt credential endpoint is invalid");
++        }
++        return endpoint;
++    }
++
++    private static String requireText(String value, String name) {
++        if (value == null || value.isBlank() || value.chars().anyMatch(Character::isWhitespace)) {
++            throw new IllegalArgumentException(name + " is required");
++        }
++        return value;
++    }
++
++    private static IllegalStateException denied() {
++        return new IllegalStateException("Attempt credential could not be issued");
++    }
++}
+diff --git a/agent-worker/src/main/java/io/agentteams/worker/chatgpt/ChatGptPlanModel.java b/agent-worker/src/main/java/io/agentteams/worker/chatgpt/ChatGptPlanModel.java
+index d819f0c..445c369 100644
+--- a/agent-worker/src/main/java/io/agentteams/worker/chatgpt/ChatGptPlanModel.java
++++ b/agent-worker/src/main/java/io/agentteams/worker/chatgpt/ChatGptPlanModel.java
+@@ -102,6 +102,10 @@ public final class ChatGptPlanModel implements Model {
+         String model = modelId.substring(modelId.indexOf(':') + 1).trim();
+         String tokenPath = System.getenv(TOKEN_FILE_ENV);
+         if (tokenPath == null || tokenPath.isBlank()) {
++            if (System.getenv("AGENTTEAMS_ATTEMPT_CREDENTIAL_ISSUE_URL") != null) {
++                return new ChatGptPlanModel(model,
++                        () -> { throw new IllegalStateException("Attempt-scoped model credential is required"); });
++            }
+             throw new IllegalStateException(TOKEN_FILE_ENV + " must be configured for chatgpt-plan models");
+         }
+         return new ChatGptPlanModel(model, ChatGptPlanTokenSource.fromPath(Path.of(tokenPath)));
+@@ -112,6 +116,11 @@ public final class ChatGptPlanModel implements Model {
+         return modelName;
+     }
+
++    /** Returns a task-local model adapter whose credential is resolved for each request. */
++    public ChatGptPlanModel withTokenSource(ChatGptPlanTokenSource tokenSource) {
++        return new ChatGptPlanModel(modelName, endpoint, tokenSource, http);
++    }
++
+     @Override
+     public Flux<ChatResponse> stream(List<Msg> messages, List<ToolSchema> tools, GenerateOptions options) {
+         return Flux.create(sink -> {
+diff --git a/agent-worker/src/test/java/io/agentteams/worker/WorkerRuntimeFactoryTest.java b/agent-worker/src/test/java/io/agentteams/worker/WorkerRuntimeFactoryTest.java
+index 26abdd9..624c628 100644
+--- a/agent-worker/src/test/java/io/agentteams/worker/WorkerRuntimeFactoryTest.java
++++ b/agent-worker/src/test/java/io/agentteams/worker/WorkerRuntimeFactoryTest.java
+@@ -20,6 +20,52 @@ class WorkerRuntimeFactoryTest {
+         assertThat(configuration.model()).isEqualTo("chatgpt-plan:gpt-5.6-luna");
+     }
+
++    @Test
++    void requiresGatewaySessionWhenAttemptCredentialIssuanceIsEnabled() {
++        assertThatThrownBy(() -> AgentTeamsWorker.WorkerConfiguration.from(Map.of(
++                "AGENTTEAMS_AGENT_ID", "agent-a",
++                "AGENTTEAMS_ATTEMPT_CREDENTIAL_ISSUE_URL",
++                "http://credential-proxy:8085/internal/v1/attempt-credentials")))
++                .isInstanceOf(IllegalArgumentException.class)
++                .hasMessage("AGENTTEAMS_GATEWAY_AUTH_TOKEN must be set when Attempt credentials are enabled");
++    }
++
++    @Test
++    void configuresAttemptCredentialIssueEndpointWithoutTenantIdentity() {
++        var configuration = AgentTeamsWorker.WorkerConfiguration.from(Map.of(
++                "AGENTTEAMS_AGENT_ID", "agent-a",
++                "AGENTTEAMS_GATEWAY_AUTH_TOKEN", "ats_worker_session",
++                "AGENTTEAMS_ATTEMPT_CREDENTIAL_ISSUE_URL",
++                "http://credential-proxy:8085/internal/v1/attempt-credentials"));
++
++        assertThat(configuration.attemptCredentialIssueUrl()).hasToString(
++                "http://credential-proxy:8085/internal/v1/attempt-credentials");
++        assertThat(configuration.runtimeConfiguration()).doesNotContainKeys("tenant_id", "project_id");
++    }
++
++    @Test
++    void requiresWorkerSlotSessionWhenAttemptCapabilityIssuanceIsEnabled() {
++        assertThatThrownBy(() -> AgentTeamsWorker.WorkerConfiguration.from(Map.of(
++                "AGENTTEAMS_AGENT_ID", "worker-slot-a",
++                "AGENTTEAMS_ATTEMPT_CAPABILITY_ISSUE_URL",
++                "http://credential-proxy:8085/internal/v1/attempt-capabilities")))
++                .isInstanceOf(IllegalArgumentException.class)
++                .hasMessage("AGENTTEAMS_GATEWAY_AUTH_TOKEN must be set when Attempt credentials are enabled");
++    }
++
++    @Test
++    void configuresAttemptCapabilityEndpointWithoutTenantIdentity() {
++        var configuration = AgentTeamsWorker.WorkerConfiguration.from(Map.of(
++                "AGENTTEAMS_AGENT_ID", "worker-slot-a",
++                "AGENTTEAMS_GATEWAY_AUTH_TOKEN", "wslot_worker_session",
++                "AGENTTEAMS_ATTEMPT_CAPABILITY_ISSUE_URL",
++                "http://credential-proxy:8085/internal/v1/attempt-capabilities"));
++
++        assertThat(configuration.attemptCapabilityIssueUrl()).hasToString(
++                "http://credential-proxy:8085/internal/v1/attempt-capabilities");
++        assertThat(configuration.runtimeConfiguration()).doesNotContainKeys("tenant_id", "project_id");
++    }
++
+     @Test
+     void productionClasspathProvidesDashScopeModelResolution() {
+         assertThat(ModelRegistry.canResolve("dashscope:qwen-plus")).isTrue();
+diff --git a/agent-worker/src/test/java/io/agentteams/worker/agentscope/ConfiguredAgentScopeHarnessFactoryTest.java b/agent-worker/src/test/java/io/agentteams/worker/agentscope/ConfiguredAgentScopeHarnessFactoryTest.java
+index 2b48c68..532e6c4 100644
+--- a/agent-worker/src/test/java/io/agentteams/worker/agentscope/ConfiguredAgentScopeHarnessFactoryTest.java
++++ b/agent-worker/src/test/java/io/agentteams/worker/agentscope/ConfiguredAgentScopeHarnessFactoryTest.java
+@@ -25,6 +25,8 @@ import java.time.Instant;
+ import java.time.ZoneOffset;
+ import java.util.List;
+ import java.util.Map;
++import java.util.HashSet;
++import java.util.Set;
+ import java.util.UUID;
+ import java.util.concurrent.atomic.AtomicReference;
+ import reactor.core.publisher.Flux;
+@@ -59,6 +61,24 @@ class ConfiguredAgentScopeHarnessFactoryTest {
+                 .hasMessage("AgentScope model must be configured");
+     }
+
++    @Test
++    void selectsModelForTheExactRuntimeTaskBeforeStartingItsHarness() {
++        AtomicReference<RuntimeTask> selectedTask = new AtomicReference<>();
++        RuntimeTask task = task("attempt-model-scope", "lease-model-scope");
++        ConfiguredAgentScopeHarnessFactory factory = new ConfiguredAgentScopeHarnessFactory(
++                new TestModel(), AgentScopeWorkspaceFactory.testOnly(new ReadySandboxRuntime(),
++                        Clock.systemUTC(), root), root, runtimeTask -> {
++                            selectedTask.set(runtimeTask);
++                            return new TestModel();
++                        });
++
++        var harness = factory.create(task, context());
++
++        assertThat(selectedTask.get()).isSameAs(task);
++        harness.close();
++        factory.release(task.id());
++    }
++
+     @Test
+     void ignoresUntrustedWorkspacePathAndUsesWorkspaceBindingFactory() throws Exception {
+         AgentScopeWorkspaceFactory workspaceFactory = AgentScopeWorkspaceFactory.testOnly(
+@@ -77,6 +97,75 @@ class ConfiguredAgentScopeHarnessFactoryTest {
+         harness.close();
+     }
+
++    @Test
++    void givesEachAttemptOfOneTaskAnIsolatedLocalWorkspace() throws Exception {
++        UUID taskId = UUID.randomUUID();
++        ConfiguredAgentScopeHarnessFactory factory = new ConfiguredAgentScopeHarnessFactory(
++                new TestModel(), AgentScopeWorkspaceFactory.testOnly(new ReadySandboxRuntime(),
++                        Clock.fixed(Instant.parse("2026-08-26T00:00:00Z"), ZoneOffset.UTC), root), root);
++        RuntimeTask firstTask = task(taskId, "attempt-a", "lease-a");
++        var firstHarness = factory.create(firstTask, context());
++        Path firstWorkspace = localWorkspace();
++        Files.writeString(firstWorkspace.resolve("tenant-data.txt"), "attempt A private data");
++        firstHarness.close();
++        factory.release(taskId);
++
++        RuntimeTask retryTask = task(taskId, "attempt-b", "lease-b");
++        var retryHarness = factory.create(retryTask, context());
++        Path retryWorkspace = localWorkspace();
++
++        assertThat(retryWorkspace).isNotEqualTo(firstWorkspace);
++        assertThat(retryWorkspace.resolve("tenant-data.txt")).doesNotExist();
++
++        retryHarness.close();
++        factory.release(taskId);
++    }
++
++    @Test
++    void isolatesLocalWorkspacesAcrossTenantsInOneWorkerProcess() throws Exception {
++        ConfiguredAgentScopeHarnessFactory factory = new ConfiguredAgentScopeHarnessFactory(
++                new TestModel(), AgentScopeWorkspaceFactory.testOnly(new ReadySandboxRuntime(),
++                        Clock.fixed(Instant.parse("2026-08-26T00:00:00Z"), ZoneOffset.UTC), root), root);
++        RuntimeTask tenantATask = scopedTask("tenant-a", "project-a", "team-a", "attempt-shared", "lease-a");
++        RuntimeTask tenantBTask = scopedTask("tenant-b", "project-b", "team-b", "attempt-shared", "lease-b");
++        Set<Path> before = localWorkspaces();
++
++        var tenantAHarness = factory.create(tenantATask, context());
++        Set<Path> afterTenantA = localWorkspaces();
++        Path tenantAWorkspace = afterTenantA.stream().filter(path -> !before.contains(path))
++                .findFirst().orElseThrow();
++        Files.writeString(tenantAWorkspace.resolve("private-tenant-data.txt"), "tenant A only");
++
++        var tenantBHarness = factory.create(tenantBTask, context());
++        Set<Path> afterTenantB = localWorkspaces();
++        Path tenantBWorkspace = afterTenantB.stream().filter(path -> !afterTenantA.contains(path))
++                .findFirst().orElseThrow();
++
++        assertThat(tenantBWorkspace).isNotEqualTo(tenantAWorkspace);
++        assertThat(tenantBWorkspace.resolve("private-tenant-data.txt")).doesNotExist();
++
++        tenantAHarness.close();
++        factory.release(tenantATask.id());
++        tenantBHarness.close();
++        factory.release(tenantBTask.id());
++    }
++
++    @Test
++    void removesAttemptLocalWorkspaceWhenRuntimeReleasesIt() throws Exception {
++        UUID taskId = UUID.randomUUID();
++        ConfiguredAgentScopeHarnessFactory factory = new ConfiguredAgentScopeHarnessFactory(
++                new TestModel(), AgentScopeWorkspaceFactory.testOnly(new ReadySandboxRuntime(),
++                        Clock.fixed(Instant.parse("2026-08-26T00:00:00Z"), ZoneOffset.UTC), root), root);
++        var harness = factory.create(task(taskId, "attempt-cleanup", "lease-cleanup"), context());
++        Path workspace = localWorkspace();
++        Files.writeString(workspace.resolve("private-data.txt"), "remove on terminal release");
++
++        harness.close();
++        factory.release(taskId);
++
++        assertThat(workspace).doesNotExist();
++    }
++
+     @Test
+     void opaqueSandboxBindingMustNotFallBackToLocalWorkspace() {
+         AgentScopeWorkspaceFactory workspaceFactory = AgentScopeWorkspaceFactory.testOnly(
+@@ -355,11 +444,40 @@ class ConfiguredAgentScopeHarnessFactoryTest {
+     }
+
+     private RuntimeTask task(String attemptId, String leaseId) {
+-        return new RuntimeTask(UUID.randomUUID(), "chat", "hello", Map.of(
++        return task(UUID.randomUUID(), attemptId, leaseId);
++    }
++
++    private RuntimeTask task(UUID taskId, String attemptId, String leaseId) {
++        return new RuntimeTask(taskId, "chat", "hello", Map.of(
+                 "tenantId", "tenant-a", "projectId", "project-a", "teamId", "team-a",
+                 "agentId", "agent-a", "attemptId", attemptId, "leaseId", leaseId));
+     }
+
++    private Path localWorkspace() throws Exception {
++        try (var paths = Files.list(root)) {
++            return paths.filter(Files::isDirectory)
++                    .filter(path -> !path.getFileName().toString().equals(".agentscope-state"))
++                    .findFirst().orElseThrow();
++        }
++    }
++
++    private Set<Path> localWorkspaces() throws Exception {
++        Set<Path> workspaces = new HashSet<>();
++        try (var paths = Files.list(root)) {
++            paths.filter(Files::isDirectory)
++                    .filter(path -> !path.getFileName().toString().equals(".agentscope-state"))
++                    .forEach(workspaces::add);
++        }
++        return workspaces;
++    }
++
++    private RuntimeTask scopedTask(String tenant, String project, String team,
++            String attempt, String lease) {
++        return new RuntimeTask(UUID.randomUUID(), "chat", "hello", Map.of(
++                "tenantId", tenant, "projectId", project, "teamId", team,
++                "agentId", "agent-a", "attemptId", attempt, "leaseId", lease));
++    }
++
+     private RuntimeTask sandboxTask(String attemptId) {
+         return new RuntimeTask(UUID.randomUUID(), "chat", "hello", Map.ofEntries(
+                 Map.entry("tenantId", "tenant-a"), Map.entry("projectId", "project-a"),
+diff --git a/agent-worker/src/test/java/io/agentteams/worker/chatgpt/AttemptCapabilityTokenSourceTest.java b/agent-worker/src/test/java/io/agentteams/worker/chatgpt/AttemptCapabilityTokenSourceTest.java
+new file mode 100644
+index 0000000..4be9483
+--- /dev/null
++++ b/agent-worker/src/test/java/io/agentteams/worker/chatgpt/AttemptCapabilityTokenSourceTest.java
+@@ -0,0 +1,109 @@
++package io.agentteams.worker.chatgpt;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++
++import com.sun.net.httpserver.HttpServer;
++import java.net.InetSocketAddress;
++import java.net.URI;
++import java.net.http.HttpClient;
++import java.nio.charset.StandardCharsets;
++import java.time.Instant;
++import java.util.UUID;
++import java.util.concurrent.atomic.AtomicInteger;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++
++class AttemptCapabilityTokenSourceTest {
++    private HttpServer server;
++    private AtomicInteger requests;
++    private String requestBody;
++    private String authorization;
++
++    @BeforeEach
++    void startServer() throws Exception {
++        requests = new AtomicInteger();
++        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
++        server.createContext("/internal/v1/attempt-capabilities", exchange -> {
++            authorization = exchange.getRequestHeaders().getFirst("Authorization");
++            requestBody = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
++            int request = requests.incrementAndGet();
++            String response = "{\"token\":\"cap_" + "a".repeat(42) + request
++                    + "\",\"expiresAt\":\"" + Instant.now().plusSeconds(60) + "\"}";
++            byte[] bytes = response.getBytes(StandardCharsets.UTF_8);
++            exchange.getResponseHeaders().add("Content-Type", "application/json");
++            exchange.getResponseHeaders().add("Cache-Control", "no-store");
++            exchange.sendResponseHeaders(201, bytes.length);
++            exchange.getResponseBody().write(bytes);
++            exchange.close();
++        });
++        server.start();
++    }
++
++    @AfterEach
++    void stopServer() {
++        if (server != null) server.stop(0);
++    }
++
++    @Test
++    void reusesOneLiveCapabilityForTheExactSlotAssignmentAcrossRequests() {
++        UUID taskId = UUID.randomUUID();
++        UUID assignmentId = UUID.randomUUID();
++        UUID attemptId = UUID.randomUUID();
++        UUID leaseId = UUID.randomUUID();
++        AttemptCapabilityTokenSource source = new AttemptCapabilityTokenSource(
++                URI.create("http://127.0.0.1:" + server.getAddress().getPort()
++                        + "/internal/v1/attempt-capabilities"),
++                "wslot_worker_session", taskId, assignmentId, attemptId, leaseId, HttpClient.newHttpClient());
++
++        String first = source.accessToken();
++        String second = source.accessToken();
++
++        assertThat(first).startsWith("cap_");
++        assertThat(second).isEqualTo(first).startsWith("cap_");
++        assertThat(requests).hasValue(1);
++        assertThat(authorization).isEqualTo("Bearer wslot_worker_session");
++        assertThat(requestBody).contains(taskId.toString(), assignmentId.toString(), attemptId.toString(), leaseId.toString());
++        assertThat(requestBody).doesNotContain("tenant", "credentialRef", "modelCredentialRef");
++    }
++
++    @Test
++    void rejectsAResponseWithoutAValidShortLivedCapability() {
++        server.removeContext("/internal/v1/attempt-capabilities");
++        server.createContext("/internal/v1/attempt-capabilities", exchange -> {
++            byte[] bytes = "{\"token\":\"provider-secret\",\"expiresAt\":\"2999-01-01T00:00:00Z\"}"
++                    .getBytes(StandardCharsets.UTF_8);
++            exchange.sendResponseHeaders(201, bytes.length);
++            exchange.getResponseBody().write(bytes);
++            exchange.close();
++        });
++        AttemptCapabilityTokenSource source = new AttemptCapabilityTokenSource(
++                URI.create("http://127.0.0.1:" + server.getAddress().getPort()
++                        + "/internal/v1/attempt-capabilities"),
++                "wslot_worker_session", UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID(),
++                UUID.randomUUID(), HttpClient.newHttpClient());
++
++        assertThatThrownBy(source::accessToken).isInstanceOf(IllegalStateException.class)
++                .hasMessage("Attempt capability could not be issued");
++    }
++
++    @Test
++    void sharesTheModelCapabilityWithGatewayExecutionEvents() {
++        UUID taskId = UUID.randomUUID();
++        UUID assignmentId = UUID.randomUUID();
++        UUID attemptId = UUID.randomUUID();
++        UUID leaseId = UUID.randomUUID();
++        AttemptCapabilityTokenRegistry registry = new AttemptCapabilityTokenRegistry(
++                URI.create("http://127.0.0.1:" + server.getAddress().getPort()
++                        + "/internal/v1/attempt-capabilities"),
++                "wslot_worker_session", HttpClient.newHttpClient(), java.time.Clock.systemUTC());
++
++        String modelRequestToken = registry.source(taskId, assignmentId, attemptId, leaseId).accessToken();
++        String gatewayEventToken = registry.accessToken(taskId, assignmentId.toString(), attemptId.toString(),
++                leaseId.toString());
++
++        assertThat(gatewayEventToken).isEqualTo(modelRequestToken);
++        assertThat(requests).hasValue(1);
++    }
++}
+diff --git a/agent-worker/src/test/java/io/agentteams/worker/chatgpt/AttemptCredentialTokenSourceTest.java b/agent-worker/src/test/java/io/agentteams/worker/chatgpt/AttemptCredentialTokenSourceTest.java
+new file mode 100644
+index 0000000..1864317
+--- /dev/null
++++ b/agent-worker/src/test/java/io/agentteams/worker/chatgpt/AttemptCredentialTokenSourceTest.java
+@@ -0,0 +1,89 @@
++package io.agentteams.worker.chatgpt;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++
++import com.sun.net.httpserver.HttpServer;
++import java.net.InetSocketAddress;
++import java.net.URI;
++import java.net.http.HttpClient;
++import java.nio.charset.StandardCharsets;
++import java.time.Instant;
++import java.util.UUID;
++import java.util.concurrent.atomic.AtomicInteger;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++
++class AttemptCredentialTokenSourceTest {
++    private HttpServer server;
++    private AtomicInteger requests;
++    private String requestBody;
++    private String authorization;
++
++    @BeforeEach
++    void startServer() throws Exception {
++        requests = new AtomicInteger();
++        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
++        server.createContext("/internal/v1/attempt-credentials", exchange -> {
++            authorization = exchange.getRequestHeaders().getFirst("Authorization");
++            requestBody = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
++            int request = requests.incrementAndGet();
++            String response = "{\"token\":\"atp_" + "a".repeat(42) + request
++                    + "\",\"expiresAt\":\"" + Instant.now().plusSeconds(60) + "\"}";
++            byte[] bytes = response.getBytes(StandardCharsets.UTF_8);
++            exchange.getResponseHeaders().add("Content-Type", "application/json");
++            exchange.getResponseHeaders().add("Cache-Control", "no-store");
++            exchange.sendResponseHeaders(201, bytes.length);
++            exchange.getResponseBody().write(bytes);
++            exchange.close();
++        });
++        server.start();
++    }
++
++    @AfterEach
++    void stopServer() {
++        if (server != null) server.stop(0);
++    }
++
++    @Test
++    void reissuesAttemptScopedTokenOnEveryModelRequest() {
++        UUID taskId = UUID.randomUUID();
++        UUID attemptId = UUID.randomUUID();
++        UUID leaseId = UUID.randomUUID();
++        AttemptCredentialTokenSource source = new AttemptCredentialTokenSource(
++                URI.create("http://127.0.0.1:" + server.getAddress().getPort()
++                        + "/internal/v1/attempt-credentials"),
++                "ats_worker_session", taskId, attemptId, leaseId, HttpClient.newHttpClient());
++
++        String first = source.accessToken();
++        String second = source.accessToken();
++
++        assertThat(first).startsWith("atp_");
++        assertThat(second).startsWith("atp_").isNotEqualTo(first);
++        assertThat(requests).hasValue(2);
++        assertThat(authorization).isEqualTo("Bearer ats_worker_session");
++        assertThat(requestBody).contains(taskId.toString(), attemptId.toString(), leaseId.toString());
++        assertThat(requestBody).doesNotContain("tenant", "credentialRef", "modelCredentialRef");
++    }
++
++    @Test
++    void rejectsAResponseWithoutAValidShortLivedAttemptToken() {
++        server.removeContext("/internal/v1/attempt-credentials");
++        server.createContext("/internal/v1/attempt-credentials", exchange -> {
++            byte[] bytes = "{\"token\":\"provider-secret\",\"expiresAt\":\"2999-01-01T00:00:00Z\"}"
++                    .getBytes(StandardCharsets.UTF_8);
++            exchange.sendResponseHeaders(201, bytes.length);
++            exchange.getResponseBody().write(bytes);
++            exchange.close();
++        });
++        AttemptCredentialTokenSource source = new AttemptCredentialTokenSource(
++                URI.create("http://127.0.0.1:" + server.getAddress().getPort()
++                        + "/internal/v1/attempt-credentials"),
++                "ats_worker_session", UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID(),
++                HttpClient.newHttpClient());
++
++        assertThatThrownBy(source::accessToken).isInstanceOf(IllegalStateException.class)
++                .hasMessage("Attempt credential could not be issued");
++    }
++}
+diff --git a/contracts/src/main/proto/agent_channel.proto b/contracts/src/main/proto/agent_channel.proto
+index 5d0cad4..07241ef 100644
+--- a/contracts/src/main/proto/agent_channel.proto
++++ b/contracts/src/main/proto/agent_channel.proto
+@@ -39,6 +39,7 @@ message EventMetadata {
+   string correlation_id = 9;
+   string traceparent = 10;
+   string tracestate = 11;
++  string attempt_capability = 12;
+ }
+
+ message AgentHello {
+@@ -104,6 +105,7 @@ message TaskAssigned {
+   SandboxAssignment sandbox = 12;
+   // Minimal summary-only memory context assembled by the Control Plane.
+   bytes memory_context_json = 13;
++  string assignment_id = 14;
+ }
+
+ message TaskAccepted {
+diff --git a/runtime/src/main/java/io/agentteams/runtime/GatewayRuntimeAdapter.java b/runtime/src/main/java/io/agentteams/runtime/GatewayRuntimeAdapter.java
+index 585137a..0b8df08 100644
+--- a/runtime/src/main/java/io/agentteams/runtime/GatewayRuntimeAdapter.java
++++ b/runtime/src/main/java/io/agentteams/runtime/GatewayRuntimeAdapter.java
+@@ -47,6 +47,7 @@ public final class GatewayRuntimeAdapter {
+     private final AgentRuntime runtime;
+     private final Clock clock;
+     private final RuntimeArtifactUploadPort uploads;
++    private final RuntimeAttemptCapabilityPort attemptCapabilities;
+     private final Map<UUID, AssignmentContext> assignments = new ConcurrentHashMap<>();
+     /** <= 0 表示不限速；每个任务赋值各自持有一个滑动窗口限速器（默认 30/s）。 */
+     private final int eventRateLimit;
+@@ -64,6 +65,12 @@ public final class GatewayRuntimeAdapter {
+     /** eventRateLimit <= 0 表示不限速；否则为每滑动秒允许的事件数。 */
+     public GatewayRuntimeAdapter(String agentId, AgentChannelPort channel, AgentRuntime runtime, Clock clock,
+             RuntimeArtifactUploadPort uploads, int eventRateLimit) {
++        this(agentId, channel, runtime, clock, uploads, eventRateLimit, null);
++    }
++
++    public GatewayRuntimeAdapter(String agentId, AgentChannelPort channel, AgentRuntime runtime, Clock clock,
++            RuntimeArtifactUploadPort uploads, int eventRateLimit,
++            RuntimeAttemptCapabilityPort attemptCapabilities) {
+         if (agentId == null || agentId.isBlank()) throw new IllegalArgumentException("agentId must not be blank");
+         this.agentId = agentId;
+         this.channel = Objects.requireNonNull(channel, "channel");
+@@ -71,6 +78,7 @@ public final class GatewayRuntimeAdapter {
+         this.clock = Objects.requireNonNull(clock, "clock");
+         this.uploads = uploads;
+         this.eventRateLimit = eventRateLimit;
++        this.attemptCapabilities = attemptCapabilities;
+     }
+
+     public RuntimeSubmission acceptAssignment(TaskAssigned assignment) {
+@@ -78,9 +86,12 @@ public final class GatewayRuntimeAdapter {
+         EventMetadata input = assignment.getMetadata();
+         UUID taskId = uuid(input.getTaskId(), "task_id");
+         Map<String, String> metadata = new java.util.LinkedHashMap<>();
+-        metadata.put("agentId", agentId);
++        metadata.put("agentId", input.getAgentId());
+         metadata.put("attemptId", input.getAttemptId());
+         metadata.put("leaseId", input.getLeaseId());
++        if (!assignment.getAssignmentId().isBlank()) {
++            metadata.put("assignmentId", assignment.getAssignmentId());
++        }
+         metadata.put("leaseExpiresAt", Instant.ofEpochSecond(
+                 assignment.getLeaseExpiresAt().getSeconds(), assignment.getLeaseExpiresAt().getNanos()).toString());
+         putIfPresent(metadata, "tenantId", assignment.getTenantId());
+@@ -97,13 +108,14 @@ public final class GatewayRuntimeAdapter {
+         }
+         RuntimeTask task = new RuntimeTask(taskId, assignment.getTaskType(),
+                 assignment.getInputJson().toStringUtf8(), metadata);
+-        AssignmentContext assignmentContext = new AssignmentContext(input, assignment.getLeaseExpiresAt(),
++        AssignmentContext assignmentContext = new AssignmentContext(input, assignment.getAssignmentId(),
++                assignment.getLeaseExpiresAt(),
+                 assignment.getTenantId(), assignment.getProjectId(), assignment.getTeamId(),
+                 assignment.getToolId(), assignment.getQuotaId(), assignment.getQuotaDimension(),
+                 eventRateLimit, clock);
+         AssignmentContext existing = assignments.putIfAbsent(taskId, assignmentContext);
+         boolean registered = existing == null;
+-        if (existing != null && existing.matches(input)) {
++        if (existing != null && existing.matches(input, assignment.getAssignmentId())) {
+             channel.send(AgentMessage.newBuilder().setTaskAccepted(TaskAccepted.newBuilder()
+                     .setMetadata(metadata(taskId, existing)).setAccepted(true)
+                     .setRejectionReason("").build()).build());
+@@ -134,6 +146,23 @@ public final class GatewayRuntimeAdapter {
+         return submission;
+     }
+
++    /** Sends a slot-authenticated rejection for an Assignment that could not start. */
++    public void rejectAssignment(TaskAssigned assignment, String reason) {
++        Objects.requireNonNull(assignment, "assignment");
++        EventMetadata input = assignment.getMetadata();
++        UUID taskId = uuid(input.getTaskId(), "task_id");
++        EventMetadata.Builder metadata = input.toBuilder().setEventId(UUID.randomUUID().toString())
++                .setOccurredAt(timestamp(clock.instant()));
++        if (attemptCapabilities != null) {
++            metadata.setAttemptCapability(attemptCapabilities.accessToken(taskId, assignment.getAssignmentId(),
++                    input.getAttemptId(), input.getLeaseId()));
++        }
++        channel.send(AgentMessage.newBuilder().setTaskAccepted(TaskAccepted.newBuilder()
++                .setMetadata(metadata).setAccepted(false).setRejectionReason(reason == null ? "" : reason).build())
++                .build());
++        releaseCapability(taskId);
++    }
++
+     public void progress(UUID taskId, int percent, String status, String message) {
+         AssignmentContext context = context(taskId);
+         if (percent < 0 || percent > 100) throw new IllegalArgumentException("percent must be 0..100");
+@@ -229,6 +258,7 @@ public final class GatewayRuntimeAdapter {
+             AgentMessage outbound = message.build();
+             channel.send(outbound);
+             assignments.remove(result.taskId());
++            releaseCapability(result.taskId());
+         }
+         return status;
+     }
+@@ -242,6 +272,7 @@ public final class GatewayRuntimeAdapter {
+                     .setMetadata(metadata(taskId, context)).setCode(code == null ? "RUNTIME_FAILURE" : code)
+                     .setMessage(message == null ? "" : message).setRetryable(retryable).build()).build());
+             assignments.remove(taskId);
++            releaseCapability(taskId);
+         }
+         return status;
+     }
+@@ -401,8 +432,11 @@ public final class GatewayRuntimeAdapter {
+             return memoryUri;
+         }
+         try {
++            String capability = attemptCapabilities == null ? "" : attemptCapabilities.accessToken(taskId,
++                    context.assignmentId(), context.metadata().getAttemptId(), context.metadata().getLeaseId());
+             RuntimeArtifactUploadPort.UploadedArtifact stored = uploads.upload(taskId.toString(),
+-                    context.metadata().getAttemptId(), name, contentType(name), payload);
++                    context.assignmentId(), context.metadata().getAttemptId(), context.metadata().getLeaseId(),
++                    context.metadata().getAgentId(), capability, name, contentType(name), payload);
+             return stored.storageKey();
+         } catch (RuntimeException error) {
+             System.getLogger(GatewayRuntimeAdapter.class.getName()).log(System.Logger.Level.WARNING,
+@@ -441,9 +475,18 @@ public final class GatewayRuntimeAdapter {
+     }
+
+     private EventMetadata metadata(UUID taskId, AssignmentContext context) {
+-        return context.metadata().toBuilder().setEventId(UUID.randomUUID().toString()).setAgentId(agentId)
++        EventMetadata.Builder metadata = context.metadata().toBuilder().setEventId(UUID.randomUUID().toString())
+                 .setTaskId(taskId.toString()).setExpectedVersion(context.expectedVersion())
+-                .setOccurredAt(timestamp(clock.instant())).build();
++                .setOccurredAt(timestamp(clock.instant()));
++        if (attemptCapabilities != null) {
++            metadata.setAttemptCapability(attemptCapabilities.accessToken(taskId, context.assignmentId(),
++                    context.metadata().getAttemptId(), context.metadata().getLeaseId()));
++        }
++        return metadata.build();
++    }
++
++    private void releaseCapability(UUID taskId) {
++        if (attemptCapabilities != null) attemptCapabilities.release(taskId);
+     }
+
+     private static UUID uuid(String value, String field) {
+@@ -457,6 +500,7 @@ public final class GatewayRuntimeAdapter {
+
+     private static final class AssignmentContext {
+         private final EventMetadata metadata;
++        private final String assignmentId;
+         private final Timestamp leaseExpiresAt;
+         private final String tenantId;
+         private final String projectId;
+@@ -468,10 +512,11 @@ public final class GatewayRuntimeAdapter {
+         private long expectedVersion;
+         private long eventSequence;
+
+-        private AssignmentContext(EventMetadata metadata, Timestamp leaseExpiresAt, String tenantId,
++        private AssignmentContext(EventMetadata metadata, String assignmentId, Timestamp leaseExpiresAt, String tenantId,
+                 String projectId, String teamId, String toolId, String quotaId, String quotaDimension,
+                 int eventRateLimit, Clock clock) {
+             this.metadata = metadata;
++            this.assignmentId = assignmentId;
+             this.leaseExpiresAt = leaseExpiresAt;
+             this.tenantId = tenantId;
+             this.projectId = projectId;
+@@ -493,6 +538,10 @@ public final class GatewayRuntimeAdapter {
+             return metadata;
+         }
+
++        private String assignmentId() {
++            return assignmentId;
++        }
++
+         private synchronized Timestamp leaseExpiresAt() {
+             return leaseExpiresAt;
+         }
+@@ -510,9 +559,10 @@ public final class GatewayRuntimeAdapter {
+             return eventSequence;
+         }
+
+-        private boolean matches(EventMetadata input) {
++        private boolean matches(EventMetadata input, String nextAssignmentId) {
+             return metadata.getAttemptId().equals(input.getAttemptId())
+-                    && metadata.getLeaseId().equals(input.getLeaseId());
++                    && metadata.getLeaseId().equals(input.getLeaseId())
++                    && assignmentId.equals(nextAssignmentId);
+         }
+     }
+
+diff --git a/runtime/src/main/java/io/agentteams/runtime/GrpcRuntimeArtifactUploadPort.java b/runtime/src/main/java/io/agentteams/runtime/GrpcRuntimeArtifactUploadPort.java
+index d3963f4..7ad23a3 100644
+--- a/runtime/src/main/java/io/agentteams/runtime/GrpcRuntimeArtifactUploadPort.java
++++ b/runtime/src/main/java/io/agentteams/runtime/GrpcRuntimeArtifactUploadPort.java
+@@ -77,10 +77,23 @@ public final class GrpcRuntimeArtifactUploadPort implements RuntimeArtifactUploa
+     @Override
+     public UploadedArtifact upload(String taskId, String attemptId, String name, String contentType,
+             byte[] payload) {
++        return upload(taskId, "", attemptId, "", agentId, "", name, contentType, payload);
++    }
++
++    @Override
++    public UploadedArtifact upload(String taskId, String assignmentId, String attemptId, String leaseId,
++            String logicalAgentId, String attemptCapability, String name, String contentType, byte[] payload) {
+         requireText(taskId, "taskId");
+         requireText(attemptId, "attemptId");
++        requireText(logicalAgentId, "logicalAgentId");
+         requireText(name, "name");
+         requireText(contentType, "contentType");
++        String workerSession = gatewayToken.get();
++        if (workerSession != null && workerSession.startsWith("wslot_")
++                && (assignmentId == null || assignmentId.isBlank() || leaseId == null || leaseId.isBlank()
++                        || attemptCapability == null || !attemptCapability.matches("cap_[A-Za-z0-9_-]{43}"))) {
++            throw new IllegalStateException("slot artifact upload requires a live Attempt capability context");
++        }
+         Objects.requireNonNull(payload, "payload");
+         if (payload.length == 0) {
+             throw new IllegalArgumentException("payload must not be empty");
+@@ -91,9 +104,9 @@ public final class GrpcRuntimeArtifactUploadPort implements RuntimeArtifactUploa
+         PrepareArtifactUploadResponse prepared = authenticatedStub
+                 .withDeadlineAfter(timeout.toMillis(), TimeUnit.MILLISECONDS)
+                 .prepareTaskArtifactUpload(PrepareArtifactUploadRequest.newBuilder()
+-                        .setMetadata(metadata(taskId, attemptId, deadline))
++                        .setMetadata(metadata(logicalAgentId, taskId, attemptId, leaseId, attemptCapability))
+                         .setProtocolVersion(VERSION)
+-                        .setTaskId(taskId).setAttemptId(attemptId).setAgentId(agentId)
++                        .setTaskId(taskId).setAttemptId(attemptId).setAgentId(logicalAgentId)
+                         .setName(name).setContentType(contentType)
+                         .setSizeBytes(payload.length)
+                         .setDeadline(timestamp(deadline))
+@@ -105,9 +118,9 @@ public final class GrpcRuntimeArtifactUploadPort implements RuntimeArtifactUploa
+         CompleteArtifactUploadResponse completed = authenticatedStub
+                 .withDeadlineAfter(timeout.toMillis(), TimeUnit.MILLISECONDS)
+                 .completeTaskArtifactUpload(CompleteArtifactUploadRequest.newBuilder()
+-                        .setMetadata(metadata(taskId, attemptId, clock.instant().plus(timeout.multipliedBy(4))))
++                        .setMetadata(metadata(logicalAgentId, taskId, attemptId, leaseId, attemptCapability))
+                         .setProtocolVersion(VERSION)
+-                        .setTaskId(taskId).setAttemptId(attemptId).setAgentId(agentId)
++                        .setTaskId(taskId).setAttemptId(attemptId).setAgentId(logicalAgentId)
+                         .setName(name).setStorageKey(prepared.getStorageKey())
+                         .setContentType(contentType)
+                         .setSizeBytes(payload.length).setSha256(sha256)
+@@ -148,14 +161,19 @@ public final class GrpcRuntimeArtifactUploadPort implements RuntimeArtifactUploa
+         }
+     }
+
+-    private EventMetadata metadata(String taskId, String attemptId, Instant deadline) {
++    private EventMetadata metadata(String logicalAgentId, String taskId, String attemptId, String leaseId,
++            String attemptCapability) {
+         EventMetadata.Builder builder = EventMetadata.newBuilder()
+                 .setEventId(UUID.randomUUID().toString())
+-                .setAgentId(agentId)
++                .setAgentId(logicalAgentId)
+                 .setTaskId(taskId)
+                 .setAttemptId(attemptId)
++                .setLeaseId(leaseId == null ? "" : leaseId)
+                 .setExpectedVersion(0)
+                 .setOccurredAt(timestamp(clock.instant()));
++        if (attemptCapability != null && !attemptCapability.isBlank()) {
++            builder.setAttemptCapability(attemptCapability);
++        }
+         String trace = traceparent.get();
+         if (trace != null && !trace.isBlank()) {
+             builder.setTraceparent(trace);
+diff --git a/runtime/src/main/java/io/agentteams/runtime/RuntimeArtifactUploadPort.java b/runtime/src/main/java/io/agentteams/runtime/RuntimeArtifactUploadPort.java
+index 03d882f..f489bad 100644
+--- a/runtime/src/main/java/io/agentteams/runtime/RuntimeArtifactUploadPort.java
++++ b/runtime/src/main/java/io/agentteams/runtime/RuntimeArtifactUploadPort.java
+@@ -14,6 +14,12 @@ public interface RuntimeArtifactUploadPort {
+      */
+     UploadedArtifact upload(String taskId, String attemptId, String name, String contentType, byte[] payload);
+
++    /** Attempt-scoped overload used by shared Worker slots. */
++    default UploadedArtifact upload(String taskId, String assignmentId, String attemptId, String leaseId,
++            String agentId, String attemptCapability, String name, String contentType, byte[] payload) {
++        return upload(taskId, attemptId, name, contentType, payload);
++    }
++
+     record UploadedArtifact(String storageKey, String downloadUrl) {
+         public UploadedArtifact {
+             if (storageKey == null || storageKey.isBlank()) {
+diff --git a/runtime/src/main/java/io/agentteams/runtime/RuntimeAttemptCapabilityPort.java b/runtime/src/main/java/io/agentteams/runtime/RuntimeAttemptCapabilityPort.java
+new file mode 100644
+index 0000000..7d75f91
+--- /dev/null
++++ b/runtime/src/main/java/io/agentteams/runtime/RuntimeAttemptCapabilityPort.java
+@@ -0,0 +1,10 @@
++package io.agentteams.runtime;
++
++import java.util.UUID;
++
++/** Supplies a short-lived capability bound to one durable Worker Assignment. */
++public interface RuntimeAttemptCapabilityPort {
++    String accessToken(UUID taskId, String assignmentId, String attemptId, String leaseId);
++
++    void release(UUID taskId);
++}
+diff --git a/runtime/src/test/java/io/agentteams/runtime/GatewayRuntimeAdapterArtifactUploadTest.java b/runtime/src/test/java/io/agentteams/runtime/GatewayRuntimeAdapterArtifactUploadTest.java
+index 6d92088..782c246 100644
+--- a/runtime/src/test/java/io/agentteams/runtime/GatewayRuntimeAdapterArtifactUploadTest.java
++++ b/runtime/src/test/java/io/agentteams/runtime/GatewayRuntimeAdapterArtifactUploadTest.java
+@@ -45,6 +45,49 @@ class GatewayRuntimeAdapterArtifactUploadTest {
+         assertThat(uploads.calls.get(1).contentType()).isEqualTo("application/json; charset=UTF-8");
+     }
+
++    @Test
++    void passesTenantAttemptCapabilityContextToArtifactUploadPort() {
++        List<AgentMessage> messages = new ArrayList<>();
++        FakeRuntime runtime = new FakeRuntime();
++        runtime.start(new AgentRuntimeContext("fake", 1, Clock.systemUTC(), result -> { }, java.util.Map.of()));
++        UUID taskId = UUID.randomUUID();
++        UUID assignmentId = UUID.randomUUID();
++        UUID leaseId = UUID.randomUUID();
++        RecordingUploadPort uploads = new RecordingUploadPort();
++        RuntimeAttemptCapabilityPort capabilities = new RuntimeAttemptCapabilityPort() {
++            @Override
++            public String accessToken(UUID task, String assignment, String attempt, String lease) {
++                assertThat(task).isEqualTo(taskId);
++                assertThat(assignment).isEqualTo(assignmentId.toString());
++                assertThat(attempt).isEqualTo(ATTEMPT_ID);
++                assertThat(lease).isEqualTo(leaseId.toString());
++                return "cap_" + "a".repeat(43);
++            }
++
++            @Override
++            public void release(UUID task) { }
++        };
++        GatewayRuntimeAdapter adapter = new GatewayRuntimeAdapter("worker-slot", messages::add, runtime,
++                Clock.fixed(Instant.EPOCH, ZoneOffset.UTC), uploads, 0, capabilities);
++        adapter.acceptAssignment(TaskAssigned.newBuilder().setMetadata(EventMetadata.newBuilder()
++                .setEventId(UUID.randomUUID().toString()).setAgentId("tenant-agent").setTaskId(taskId.toString())
++                .setAttemptId(ATTEMPT_ID).setLeaseId(leaseId.toString()).build())
++                .setAssignmentId(assignmentId.toString()).setTaskType("chat")
++                .setInputJson(com.google.protobuf.ByteString.copyFromUtf8("{}"))
++                .setLeaseExpiresAt(Timestamp.getDefaultInstance()).build());
++
++        adapter.complete(RuntimeResult.success(taskId,
++                "{\"artifacts\":[{\"name\":\"plan.md\",\"content\":\"plan body\"}]}", Instant.EPOCH));
++
++        assertThat(uploads.calls).hasSize(2);
++        assertThat(uploads.calls).allSatisfy(call -> {
++            assertThat(call.assignmentId()).isEqualTo(assignmentId.toString());
++            assertThat(call.leaseId()).isEqualTo(leaseId.toString());
++            assertThat(call.agentId()).isEqualTo("tenant-agent");
++            assertThat(call.capability()).isEqualTo("cap_" + "a".repeat(43));
++        });
++    }
++
+     @Test
+     void preservesExplicitTaskFileReferencesWithoutUploadingBytes() {
+         List<AgentMessage> messages = new ArrayList<>();
+@@ -132,18 +175,29 @@ class GatewayRuntimeAdapterArtifactUploadTest {
+         final List<Call> calls = new ArrayList<>();
+         RuntimeException error;
+
+-        record Call(String taskId, String attemptId, String name, String contentType, byte[] payload) {
++        record Call(String taskId, String assignmentId, String attemptId, String leaseId, String agentId,
++                String capability, String name, String contentType, byte[] payload) {
+         }
+
+         @Override
+         public UploadedArtifact upload(String taskId, String attemptId, String name, String contentType,
+                 byte[] payload) {
+-            calls.add(new Call(taskId, attemptId, name, contentType, payload));
++            calls.add(new Call(taskId, "", attemptId, "", "", "", name, contentType, payload));
+             if (error != null) {
+                 throw error;
+             }
+             return new UploadedArtifact("tasks/" + taskId + "/attempts/" + attemptId + "/artifacts/" + name,
+                     "http://minio/get");
+         }
++
++        @Override
++        public UploadedArtifact upload(String taskId, String assignmentId, String attemptId, String leaseId,
++                String agentId, String capability, String name, String contentType, byte[] payload) {
++            calls.add(new Call(taskId, assignmentId, attemptId, leaseId, agentId, capability, name, contentType,
++                    payload));
++            if (error != null) throw error;
++            return new UploadedArtifact("tasks/" + taskId + "/attempts/" + attemptId + "/artifacts/" + name,
++                    "http://minio/get");
++        }
+     }
+ }
+diff --git a/runtime/src/test/java/io/agentteams/runtime/GatewayRuntimeAdapterTest.java b/runtime/src/test/java/io/agentteams/runtime/GatewayRuntimeAdapterTest.java
+index 107f459..b959f8d 100644
+--- a/runtime/src/test/java/io/agentteams/runtime/GatewayRuntimeAdapterTest.java
++++ b/runtime/src/test/java/io/agentteams/runtime/GatewayRuntimeAdapterTest.java
+@@ -97,6 +97,25 @@ class GatewayRuntimeAdapterTest {
+                 .isEqualTo(CompletionStatus.COMPLETED);
+     }
+
++    @Test
++    void replacesAssignmentWhenItsDurableAssignmentIdChanges() {
++        FakeRuntime runtime = new FakeRuntime();
++        runtime.start(new AgentRuntimeContext("fake", 1, Clock.systemUTC(), result -> { }, java.util.Map.of()));
++        GatewayRuntimeAdapter adapter = new GatewayRuntimeAdapter("agent-1", ignored -> { }, runtime,
++                Clock.systemUTC());
++        UUID taskId = UUID.randomUUID();
++        String firstAssignment = UUID.randomUUID().toString();
++        String nextAssignment = UUID.randomUUID().toString();
++        TaskAssigned first = assignment(taskId).toBuilder().setAssignmentId(firstAssignment).build();
++        TaskAssigned retry = first.toBuilder().setAssignmentId(nextAssignment).build();
++
++        assertThat(adapter.acceptAssignment(first).accepted()).isTrue();
++        assertThat(adapter.acceptAssignment(retry).reason()).isEqualTo("accepted");
++
++        assertThat(runtime.status(taskId)).get().extracting(status -> status.task().metadata().get("assignmentId"))
++                .isEqualTo(nextAssignment);
++    }
++
+     @Test
+     void advancesExecutionVersionWhenReportingProgress() {
+         List<AgentMessage> messages = new ArrayList<>();
+@@ -137,6 +156,100 @@ class GatewayRuntimeAdapterTest {
+                 "toolId", "create_task", "quotaId", "quota-a", "quotaDimension", "daily_tokens"));
+     }
+
++    @Test
++    void bindsSlotEventsToTenantAssignmentAndUsesItsAttemptCapability() {
++        List<AgentMessage> messages = new ArrayList<>();
++        List<String> requested = new ArrayList<>();
++        FakeRuntime runtime = new FakeRuntime();
++        runtime.start(new AgentRuntimeContext("fake", 1, Clock.systemUTC(), result -> { }, java.util.Map.of()));
++        UUID taskId = UUID.randomUUID();
++        UUID assignmentId = UUID.randomUUID();
++        UUID attemptId = UUID.randomUUID();
++        UUID leaseId = UUID.randomUUID();
++        RuntimeAttemptCapabilityPort capabilities = new RuntimeAttemptCapabilityPort() {
++            @Override
++            public String accessToken(UUID task, String assignment, String attempt, String lease) {
++                requested.add(task + ":" + assignment + ":" + attempt + ":" + lease);
++                return "cap_" + "a".repeat(43);
++            }
++
++            @Override
++            public void release(UUID task) { }
++        };
++        GatewayRuntimeAdapter adapter = new GatewayRuntimeAdapter("worker-slot-1", messages::add, runtime,
++                Clock.fixed(Instant.EPOCH, ZoneOffset.UTC), null, 0, capabilities);
++        TaskAssigned assignment = TaskAssigned.newBuilder().setMetadata(EventMetadata.newBuilder()
++                .setEventId(UUID.randomUUID().toString()).setAgentId("tenant-agent-a").setTaskId(taskId.toString())
++                .setAttemptId(attemptId.toString()).setLeaseId(leaseId.toString())
++                .setOccurredAt(Timestamp.getDefaultInstance()).build())
++                .setAssignmentId(assignmentId.toString()).setTaskType("chat")
++                .setInputJson(com.google.protobuf.ByteString.copyFromUtf8("{}"))
++                .setLeaseExpiresAt(Timestamp.getDefaultInstance()).build();
++
++        assertThat(adapter.acceptAssignment(assignment).accepted()).isTrue();
++        adapter.progress(taskId, 1, "running", "started");
++        adapter.heartbeat(taskId, "running");
++        assertThat(adapter.reportEvent(taskId, "tool.called", "{}")).isTrue();
++        assertThat(adapter.complete(RuntimeResult.success(taskId, "done", Instant.EPOCH)))
++                .isEqualTo(CompletionStatus.COMPLETED);
++
++        assertThat(runtime.status(taskId)).get().extracting(status -> status.task().metadata())
++                .matches(metadata -> "tenant-agent-a".equals(metadata.get("agentId"))
++                        && assignmentId.toString().equals(metadata.get("assignmentId")));
++        assertThat(messages).allSatisfy(message -> {
++            EventMetadata metadata = switch (message.getPayloadCase()) {
++                case TASK_ACCEPTED -> message.getTaskAccepted().getMetadata();
++                case TASK_PROGRESS -> message.getTaskProgress().getMetadata();
++                case TASK_HEARTBEAT -> message.getTaskHeartbeat().getMetadata();
++                case TASK_EVENT_REPORT -> message.getTaskEventReport().getMetadata();
++                case TASK_COMPLETED -> message.getTaskCompleted().getMetadata();
++                default -> throw new AssertionError("unexpected payload " + message.getPayloadCase());
++            };
++            assertThat(metadata.getAgentId()).isEqualTo("tenant-agent-a");
++            assertThat(metadata.getAttemptCapability()).isEqualTo("cap_" + "a".repeat(43));
++        });
++        assertThat(requested).containsOnly(taskId + ":" + assignmentId + ":" + attemptId + ":" + leaseId)
++                .hasSize(5);
++    }
++
++    @Test
++    void rejectedSlotAssignmentCarriesTheAttemptCapability() {
++        List<AgentMessage> messages = new ArrayList<>();
++        UUID taskId = UUID.randomUUID();
++        UUID assignmentId = UUID.randomUUID();
++        UUID attemptId = UUID.randomUUID();
++        UUID leaseId = UUID.randomUUID();
++        RuntimeAttemptCapabilityPort capabilities = new RuntimeAttemptCapabilityPort() {
++            @Override
++            public String accessToken(UUID task, String assignment, String attempt, String lease) {
++                assertThat(task).isEqualTo(taskId);
++                assertThat(assignment).isEqualTo(assignmentId.toString());
++                assertThat(attempt).isEqualTo(attemptId.toString());
++                assertThat(lease).isEqualTo(leaseId.toString());
++                return "cap_" + "a".repeat(43);
++            }
++
++            @Override
++            public void release(UUID task) { }
++        };
++        GatewayRuntimeAdapter adapter = new GatewayRuntimeAdapter("worker-slot-1", messages::add,
++                new FakeRuntime(), Clock.systemUTC(), null, 0, capabilities);
++        TaskAssigned assignment = TaskAssigned.newBuilder().setMetadata(EventMetadata.newBuilder()
++                .setEventId(UUID.randomUUID().toString()).setAgentId("tenant-agent").setTaskId(taskId.toString())
++                .setAttemptId(attemptId.toString()).setLeaseId(leaseId.toString()).build())
++                .setAssignmentId(assignmentId.toString()).build();
++
++        adapter.rejectAssignment(assignment, "runtime unavailable");
++
++        assertThat(messages).singleElement().satisfies(message -> {
++            assertThat(message.getTaskAccepted().getAccepted()).isFalse();
++            assertThat(message.getTaskAccepted().getMetadata().getAgentId()).isEqualTo("tenant-agent");
++            assertThat(message.getTaskAccepted().getMetadata().getAttemptCapability())
++                    .isEqualTo("cap_" + "a".repeat(43));
++            assertThat(message.getTaskAccepted().getRejectionReason()).isEqualTo("runtime unavailable");
++        });
++    }
++
+     @Test
+     void carriesRuntimeUsageAndDimensionsOnTerminalEvent() {
+         List<AgentMessage> messages = new ArrayList<>();
+diff --git a/runtime/src/test/java/io/agentteams/runtime/GrpcRuntimeArtifactUploadPortTest.java b/runtime/src/test/java/io/agentteams/runtime/GrpcRuntimeArtifactUploadPortTest.java
+index d4edf9c..7c32115 100644
+--- a/runtime/src/test/java/io/agentteams/runtime/GrpcRuntimeArtifactUploadPortTest.java
++++ b/runtime/src/test/java/io/agentteams/runtime/GrpcRuntimeArtifactUploadPortTest.java
+@@ -1,9 +1,11 @@
+ package io.agentteams.runtime;
+
+ import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+ import com.sun.net.httpserver.HttpServer;
+ import io.agentteams.contracts.v1.CompleteArtifactUploadResponse;
++import io.agentteams.contracts.v1.EventMetadata;
+ import io.agentteams.contracts.v1.PrepareArtifactUploadResponse;
+ import io.agentteams.contracts.v1.TaskArtifactServiceGrpc;
+ import io.grpc.Metadata;
+@@ -24,6 +26,9 @@ class GrpcRuntimeArtifactUploadPortTest {
+     @Test
+     void sendsGatewayCredentialOnBothArtifactRpcCalls() throws Exception {
+         AtomicReference<String> token = new AtomicReference<>();
++        AtomicReference<EventMetadata> prepareMetadata = new AtomicReference<>();
++        AtomicReference<EventMetadata> completeMetadata = new AtomicReference<>();
++        AtomicReference<String> logicalAgentId = new AtomicReference<>();
+         Metadata.Key<String> tokenKey = Metadata.Key.of("x-agent-token", Metadata.ASCII_STRING_MARSHALLER);
+         ServerInterceptor capture = new ServerInterceptor() {
+             @Override
+@@ -46,6 +51,8 @@ class GrpcRuntimeArtifactUploadPortTest {
+                     @Override
+                     public void prepareTaskArtifactUpload(io.agentteams.contracts.v1.PrepareArtifactUploadRequest request,
+                             StreamObserver<PrepareArtifactUploadResponse> observer) {
++                        prepareMetadata.set(request.getMetadata());
++                        logicalAgentId.set(request.getAgentId());
+                         observer.onNext(PrepareArtifactUploadResponse.newBuilder().setAccepted(true)
+                                 .setStorageKey("tasks/task/artifacts/output.md")
+                                 .setUploadUrl("http://127.0.0.1:" + objectStore.getAddress().getPort() + "/put")
+@@ -56,6 +63,7 @@ class GrpcRuntimeArtifactUploadPortTest {
+                     @Override
+                     public void completeTaskArtifactUpload(io.agentteams.contracts.v1.CompleteArtifactUploadRequest request,
+                             StreamObserver<CompleteArtifactUploadResponse> observer) {
++                        completeMetadata.set(request.getMetadata());
+                         observer.onNext(CompleteArtifactUploadResponse.newBuilder().setAccepted(true)
+                                 .setArtifactId("artifact-1").setStorageKey(request.getStorageKey()).build());
+                         observer.onCompleted();
+@@ -70,6 +78,22 @@ class GrpcRuntimeArtifactUploadPortTest {
+                     "hello".getBytes())).isEqualTo(new RuntimeArtifactUploadPort.UploadedArtifact(
+                             "tasks/task/artifacts/output.md", "http://download/output.md"));
+             assertThat(token).hasValue("worker-gateway-token");
++
++            var slotPort = new GrpcRuntimeArtifactUploadPort(channel, "slot-id", Clock.systemUTC(),
++                    Duration.ofSeconds(2), () -> "wslot_worker_session", () -> "");
++            assertThatThrownBy(() -> slotPort.upload("task", "assignment", "attempt", "lease", "tenant-agent",
++                    "", "output.md", "text/markdown; charset=UTF-8", "hello".getBytes()))
++                    .isInstanceOf(IllegalStateException.class)
++                    .hasMessageContaining("requires a live Attempt capability context");
++            slotPort.upload("task", "assignment", "attempt", "lease", "tenant-agent", "cap_"
++                            + "a".repeat(43), "output.md", "text/markdown; charset=UTF-8", "hello".getBytes());
++            assertThat(logicalAgentId).hasValue("tenant-agent");
++            assertThat(prepareMetadata.get().getAgentId()).isEqualTo("tenant-agent");
++            assertThat(prepareMetadata.get().getTaskId()).isEqualTo("task");
++            assertThat(prepareMetadata.get().getAttemptId()).isEqualTo("attempt");
++            assertThat(prepareMetadata.get().getLeaseId()).isEqualTo("lease");
++            assertThat(prepareMetadata.get().getAttemptCapability()).isEqualTo("cap_" + "a".repeat(43));
++            assertThat(completeMetadata.get().getAttemptCapability()).isEqualTo("cap_" + "a".repeat(43));
+         } finally {
+             channel.shutdownNow();
+             gateway.shutdownNow();

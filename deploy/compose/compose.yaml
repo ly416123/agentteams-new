@@ -1,0 +1,519 @@
+name: agentteams
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: agentteams
+      POSTGRES_USER: agentteams
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agentteams -d agentteams"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [data]
+    restart: unless-stopped
+
+  nats:
+    image: nats:2.10-alpine
+    command: ["--jetstream", "--store_dir=/data/jetstream", "--http_port=8222"]
+    volumes:
+      - nats-data:/data/jetstream
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8222/healthz | grep -q ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    networks: [data]
+    restart: unless-stopped
+
+  nats-bootstrap:
+    image: natsio/nats-box:0.14.0
+    depends_on:
+      nats:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        until nats --server nats://nats:4222 stream ls >/dev/null 2>&1; do sleep 2; done
+        nats --server nats://nats:4222 stream info TASK_EVENTS >/dev/null 2>&1 || nats --server nats://nats:4222 stream add TASK_EVENTS --subjects 'task.events.*' --storage file --retention limits --defaults
+        nats --server nats://nats:4222 stream info AGENT_EVENTS >/dev/null 2>&1 || nats --server nats://nats:4222 stream add AGENT_EVENTS --subjects 'agent.events.*' --storage file --retention limits --defaults
+        nats --server nats://nats:4222 stream info CONTROL_EVENTS >/dev/null 2>&1 || nats --server nats://nats:4222 stream add CONTROL_EVENTS --subjects 'control.events' --storage file --retention limits --defaults
+        nats --server nats://nats:4222 stream info DEADLETTER_EVENTS >/dev/null 2>&1 || nats --server nats://nats:4222 stream add DEADLETTER_EVENTS --subjects 'deadletter.events' --storage file --retention limits --defaults
+        nats --server nats://nats:4222 stream info TASK_EVENTS >/dev/null
+        nats --server nats://nats:4222 stream info AGENT_EVENTS >/dev/null
+        nats --server nats://nats:4222 stream info CONTROL_EVENTS >/dev/null
+        nats --server nats://nats:4222 stream info DEADLETTER_EVENTS >/dev/null
+    networks: [data]
+    restart: "no"
+
+  database-role-setup:
+    image: postgres:16-alpine
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: agentteams
+      PGUSER: agentteams
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      CONTROL_PLANE_DB_PASSWORD: ${CONTROL_PLANE_DB_PASSWORD:?set CONTROL_PLANE_DB_PASSWORD in .env}
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        psql -v ON_ERROR_STOP=1 <<'SQL'
+        \getenv role_password CONTROL_PLANE_DB_PASSWORD
+        SELECT format('CREATE ROLE agentteams_runtime LOGIN PASSWORD %L NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS', :'role_password')
+         WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'agentteams_runtime')
+        \gexec
+        SELECT format('ALTER ROLE agentteams_runtime WITH LOGIN PASSWORD %L NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS', :'role_password')
+        \gexec
+        GRANT CONNECT ON DATABASE agentteams TO agentteams_runtime;
+        GRANT USAGE ON SCHEMA public TO agentteams_runtime;
+        GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO agentteams_runtime;
+        GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO agentteams_runtime;
+        GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO agentteams_runtime;
+        ALTER DEFAULT PRIVILEGES FOR ROLE agentteams IN SCHEMA public GRANT ALL ON TABLES TO agentteams_runtime;
+        ALTER DEFAULT PRIVILEGES FOR ROLE agentteams IN SCHEMA public GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO agentteams_runtime;
+        ALTER DEFAULT PRIVILEGES FOR ROLE agentteams IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO agentteams_runtime;
+        SQL
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [data]
+    restart: "no"
+
+  control-plane:
+    image: ${CONTROL_PLANE_IMAGE:?set CONTROL_PLANE_IMAGE to a published image digest}
+    platform: linux/amd64
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/agentteams
+      SPRING_DATASOURCE_USERNAME: agentteams_runtime
+      SPRING_DATASOURCE_PASSWORD: ${CONTROL_PLANE_DB_PASSWORD:?set CONTROL_PLANE_DB_PASSWORD in .env}
+      SPRING_FLYWAY_USER: agentteams
+      SPRING_FLYWAY_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      AGENTTEAMS_SCHEDULER_WORKER_SLOTS_ENABLED: ${WORKER_SLOT_SCHEDULING_ENABLED:-false}
+      AGENTTEAMS_NATS_ENABLED: "true"
+      AGENTTEAMS_NATS_URL: nats://nats:4222
+      AGENTTEAMS_OUTBOX_RELAY_ENABLED: "true"
+      AGENTTEAMS_TEAM_SYNC_ENABLED: "false"
+      AGENTTEAMS_WORKER_PROVISIONER_ENABLED: "false"
+      AGENTTEAMS_SANDBOX_ENABLED: "false"
+      AGENTTEAMS_STORAGE_ENABLED: ${AGENTTEAMS_STORAGE_ENABLED:-false}
+      AGENTTEAMS_SECURITY_API_ENABLED: ${API_AUTH_ENABLED:-false}
+      AGENTTEAMS_SECURITY_OIDC_ENABLED: ${API_AUTH_ENABLED:-false}
+      AGENTTEAMS_SECURITY_OIDC_ISSUER_URI: ${OIDC_ISSUER_URI:-}
+      AGENTTEAMS_SECURITY_OIDC_JWK_SET_URI: ${OIDC_JWK_SET_URI:-}
+      AGENTTEAMS_SECURITY_OIDC_AUDIENCE: ${OIDC_AUDIENCE:-}
+      AGENTTEAMS_SECURITY_OIDC_TENANT_CLAIM: ${OIDC_TENANT_CLAIM:-tenant}
+      AGENTTEAMS_SECURITY_OIDC_PROJECT_CLAIM: ${OIDC_PROJECT_CLAIM:-project}
+      AGENTTEAMS_SECURITY_OIDC_TEAM_CLAIM: ${OIDC_TEAM_CLAIM:-team}
+      AGENTTEAMS_SECURITY_OIDC_PERMISSIONS_CLAIM: ${OIDC_PERMISSIONS_CLAIM:-permissions}
+      AGENTTEAMS_STORAGE_ENDPOINT: http://seaweedfs:8333
+      AGENTTEAMS_STORAGE_BUCKET: agentteams
+      AGENTTEAMS_STORAGE_ACCESS_KEY: ${OBJECT_STORE_ACCESS_KEY:-}
+      AGENTTEAMS_STORAGE_SECRET_KEY: ${OBJECT_STORE_SECRET_KEY:-}
+      # The currently pinned 0.1.5 Control Plane binds storage credentials through these names.
+      MINIO_ACCESS_KEY: ${OBJECT_STORE_ACCESS_KEY:-}
+      MINIO_SECRET_KEY: ${OBJECT_STORE_SECRET_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      database-role-setup:
+        condition: service_completed_successfully
+      nats-bootstrap:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:${CONTROL_PLANE_PORT:-8080}:8080"
+    networks: [data, host-ingress]
+    restart: unless-stopped
+
+  worker-enrollment-db-setup:
+    image: postgres:16-alpine
+    profiles: [secure-api]
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: agentteams
+      PGUSER: agentteams
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      WORKER_ENROLLMENT_DB_PASSWORD: ${WORKER_ENROLLMENT_DB_PASSWORD:?set WORKER_ENROLLMENT_DB_PASSWORD in .env}
+      CREDENTIAL_PROXY_DB_PASSWORD: ${CREDENTIAL_PROXY_DB_PASSWORD:?set CREDENTIAL_PROXY_DB_PASSWORD in .env}
+      AGENTTEAMS_TENANT_CREDENTIAL_REFS_JSON: ${AGENTTEAMS_TENANT_CREDENTIAL_REFS_JSON:-[]}
+      AGENTTEAMS_WORKER_SLOT_IDS_JSON: ${WORKER_SLOT_IDS_JSON:-[]}
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        ready=0
+        attempt=0
+        while [ "$$attempt" -lt 90 ]; do
+          if psql -Atqc "SELECT to_regclass('public.agents') IS NOT NULL AND to_regclass('public.agent_sessions') IS NOT NULL AND to_regclass('public.task_attempts') IS NOT NULL AND to_regclass('public.task_assignments') IS NOT NULL AND to_regclass('public.agent_leases') IS NOT NULL AND to_regclass('public.resource_scopes') IS NOT NULL AND to_regclass('public.tenants') IS NOT NULL AND to_regclass('public.projects') IS NOT NULL AND to_regclass('public.project_memberships') IS NOT NULL" | grep -qx t; then ready=1; break; fi
+          attempt=$$((attempt + 1))
+          sleep 2
+        done
+        if [ "$$ready" -ne 1 ]; then echo "Control Plane agent/session schema did not become ready" >&2; exit 1; fi
+        psql -v ON_ERROR_STOP=1 <<'SQL'
+        \getenv role_password WORKER_ENROLLMENT_DB_PASSWORD
+        SELECT format('CREATE ROLE worker_enrollment LOGIN PASSWORD %L NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS', :'role_password')
+         WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'worker_enrollment')
+        \gexec
+        SELECT format('ALTER ROLE worker_enrollment WITH LOGIN PASSWORD %L NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS', :'role_password')
+        \gexec
+        \getenv proxy_role_password CREDENTIAL_PROXY_DB_PASSWORD
+        SELECT format('CREATE ROLE credential_proxy_runtime LOGIN PASSWORD %L NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS', :'proxy_role_password')
+         WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'credential_proxy_runtime')
+        \gexec
+        SELECT format('ALTER ROLE credential_proxy_runtime WITH LOGIN PASSWORD %L NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS', :'proxy_role_password')
+        \gexec
+        GRANT CONNECT ON DATABASE agentteams TO worker_enrollment;
+        GRANT CONNECT ON DATABASE agentteams TO credential_proxy_runtime;
+        GRANT USAGE ON SCHEMA public TO worker_enrollment;
+        SQL
+        psql -v ON_ERROR_STOP=1 -f /opt/worker-enrollment-rls.sql
+        psql -v ON_ERROR_STOP=1 -f /opt/credential-proxy.sql
+        psql -v ON_ERROR_STOP=1 <<'SQL'
+        \getenv worker_slot_ids_json AGENTTEAMS_WORKER_SLOT_IDS_JSON
+        INSERT INTO public.worker_slots(id, status)
+        SELECT slot_id_text::uuid, 'ACTIVE'
+          FROM jsonb_array_elements_text(:'worker_slot_ids_json'::jsonb) AS slot(slot_id_text)
+        ON CONFLICT (id) DO UPDATE
+          SET status = 'ACTIVE', updated_at = statement_timestamp();
+        SQL
+        psql -v ON_ERROR_STOP=1 <<'SQL'
+        \getenv provider_bindings_json AGENTTEAMS_TENANT_CREDENTIAL_REFS_JSON
+        WITH configured AS (
+          SELECT tenant_id, project_id, team_id
+          FROM jsonb_to_recordset(:'provider_bindings_json'::jsonb)
+            AS binding(tenant_id TEXT, project_id TEXT, team_id TEXT, model_credential_ref TEXT)
+        )
+        UPDATE public.tenant_model_proxy_credential_refs AS existing
+           SET enabled = false
+         WHERE NOT EXISTS (
+           SELECT 1 FROM configured
+            WHERE configured.tenant_id = existing.tenant_id
+              AND configured.project_id = existing.project_id
+              AND configured.team_id = existing.team_id
+         );
+        INSERT INTO public.tenant_model_proxy_credential_refs
+            (tenant_id, project_id, team_id, model_credential_ref, enabled)
+        SELECT tenant_id, project_id, team_id, model_credential_ref, true
+          FROM jsonb_to_recordset(:'provider_bindings_json'::jsonb)
+            AS binding(tenant_id TEXT, project_id TEXT, team_id TEXT, model_credential_ref TEXT)
+        ON CONFLICT (tenant_id, project_id, team_id) DO UPDATE
+          SET model_credential_ref = EXCLUDED.model_credential_ref, enabled = true;
+        GRANT credential_proxy_query TO credential_proxy_runtime;
+        SQL
+    volumes:
+      - ../../worker-enrollment/src/main/resources/db/worker-enrollment-rls.sql:/opt/worker-enrollment-rls.sql:ro
+      - ../../credential-proxy/src/main/resources/db/credential-proxy.sql:/opt/credential-proxy.sql:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      control-plane:
+        condition: service_started
+    networks: [data]
+    restart: "no"
+
+  credential-proxy:
+    image: agentteams-credential-proxy:0.1.0-SNAPSHOT
+    build:
+      context: ../..
+      dockerfile: credential-proxy/Dockerfile
+      secrets: [maven_settings]
+    profiles: [secure-api, worker-pool]
+    user: "${CREDENTIAL_PROXY_UID:-10001}:${CREDENTIAL_PROXY_GID:-10001}"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/agentteams
+      SPRING_DATASOURCE_USERNAME: credential_proxy_runtime
+      SPRING_DATASOURCE_PASSWORD: ${CREDENTIAL_PROXY_DB_PASSWORD:-}
+      AGENTTEAMS_CREDENTIAL_PROXY_SECRET_ROOT: /run/agentteams/provider-secrets
+      AGENTTEAMS_CREDENTIAL_PROXY_UPSTREAM_RESPONSES_URL: ${AGENTTEAMS_CREDENTIAL_PROXY_UPSTREAM_RESPONSES_URL:-https://api.openai.com/v1/responses}
+      AGENTTEAMS_CREDENTIAL_PROXY_ALLOWED_MODELS: ${AGENTTEAMS_CREDENTIAL_PROXY_ALLOWED_MODELS:-gpt-5.6-luna}
+      AGENTTEAMS_CREDENTIAL_PROXY_MAX_ACTIVE_STREAMS: ${AGENTTEAMS_CREDENTIAL_PROXY_MAX_ACTIVE_STREAMS:-64}
+    volumes:
+      - ${PROVIDER_CREDENTIALS_DIR:?set PROVIDER_CREDENTIALS_DIR in .env}:/run/agentteams/provider-secrets:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      worker-enrollment-db-setup:
+        condition: service_completed_successfully
+    networks: [data, worker-egress, provider-egress]
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8085/actuator/health/readiness"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+    restart: unless-stopped
+
+  worker-enrollment:
+    image: agentteams-worker-enrollment:0.1.0-SNAPSHOT
+    build:
+      context: ../..
+      dockerfile: worker-enrollment/Dockerfile
+      secrets: [maven_settings]
+    profiles: [secure-api]
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/agentteams
+      SPRING_DATASOURCE_USERNAME: worker_enrollment
+      SPRING_DATASOURCE_PASSWORD: ${WORKER_ENROLLMENT_DB_PASSWORD:-}
+      OIDC_ISSUER_URI: ${OIDC_ISSUER_URI:-}
+      OIDC_JWK_SET_URI: ${OIDC_JWK_SET_URI:-}
+      OIDC_AUDIENCE: ${OIDC_AUDIENCE:-}
+      OIDC_TENANT_CLAIM: ${OIDC_TENANT_CLAIM:-tenant}
+      OIDC_PROJECT_CLAIM: ${OIDC_PROJECT_CLAIM:-project}
+      OIDC_TEAM_CLAIM: ${OIDC_TEAM_CLAIM:-team}
+      OIDC_PERMISSIONS_CLAIM: ${OIDC_PERMISSIONS_CLAIM:-permissions}
+      AGENTTEAMS_ENROLLMENT_OIDC_ALLOW_INSECURE_LOOPBACK: "false"
+      AGENTTEAMS_ENROLLMENT_DEFAULT_TTL: ${AGENTTEAMS_ENROLLMENT_DEFAULT_TTL:-7d}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      worker-enrollment-db-setup:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:${ENROLLMENT_PORT:-8090}:8090"
+    networks: [data, host-ingress]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8090/actuator/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+    restart: unless-stopped
+
+  gateway:
+    image: ${GATEWAY_IMAGE:?set GATEWAY_IMAGE to a published image digest}
+    platform: linux/amd64
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/agentteams
+      SPRING_DATASOURCE_USERNAME: agentteams
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      AGENTTEAMS_GATEWAY_NATS_ENABLED: "true"
+      AGENTTEAMS_GATEWAY_NATS_URL: nats://nats:4222
+      AGENTTEAMS_GATEWAY_NATS_INSTANCE_ID: compose-gateway
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats-bootstrap:
+        condition: service_completed_successfully
+      control-plane:
+        condition: service_started
+    expose: ["9090"]
+    networks: [data, worker-egress]
+    restart: unless-stopped
+
+  worker-1:
+    image: ${WORKER_IMAGE:?set WORKER_IMAGE to a published image digest}
+    platform: linux/amd64
+    user: &worker-user "${CREDENTIAL_PROXY_UID:-10001}:${CREDENTIAL_PROXY_GID:-10001}"
+    profiles: [worker-pool, secure-api]
+    env_file:
+      - path: ${WORKER_1_CREDENTIALS_FILE:-./secrets/worker-1.runtime.env}
+        required: false
+    environment: &worker-env
+      AGENTTEAMS_AGENT_ID: ${WORKER_1_SLOT_ID:-00000000-0000-0000-0000-000000000001}
+      AGENTTEAMS_GATEWAY_HOST: gateway
+      AGENTTEAMS_GATEWAY_PORT: "9090"
+      AGENTTEAMS_RUNTIME: AGENTSCOPE
+      AGENTTEAMS_MODEL_PROVIDER: chatgpt-plan
+      AGENTTEAMS_MODEL: chatgpt-plan:gpt-5.6-luna
+      AGENTTEAMS_MAX_CONCURRENT_TASKS: "1"
+      AGENTTEAMS_ATTEMPT_CAPABILITY_ISSUE_URL: http://credential-proxy:8085/internal/v1/attempt-capabilities
+      AGENTTEAMS_CHATGPT_RESPONSES_URL: http://credential-proxy:8085/v1/responses
+    depends_on:
+      gateway:
+        condition: service_started
+      worker-enrollment:
+        condition: service_healthy
+      credential-proxy:
+        condition: service_healthy
+    networks: [worker-egress]
+    restart: unless-stopped
+
+  worker-2:
+    image: ${WORKER_IMAGE:?set WORKER_IMAGE to a published image digest}
+    platform: linux/amd64
+    user: *worker-user
+    profiles: [worker-pool, secure-api]
+    env_file:
+      - path: ${WORKER_2_CREDENTIALS_FILE:-./secrets/worker-2.runtime.env}
+        required: false
+    environment:
+      <<: *worker-env
+      AGENTTEAMS_AGENT_ID: ${WORKER_2_SLOT_ID:-00000000-0000-0000-0000-000000000002}
+    depends_on:
+      gateway:
+        condition: service_started
+      worker-enrollment:
+        condition: service_healthy
+      credential-proxy:
+        condition: service_healthy
+    networks: [worker-egress]
+    restart: unless-stopped
+
+  worker-3:
+    image: ${WORKER_IMAGE:?set WORKER_IMAGE to a published image digest}
+    platform: linux/amd64
+    user: *worker-user
+    profiles: [worker-pool, secure-api]
+    env_file:
+      - path: ${WORKER_3_CREDENTIALS_FILE:-./secrets/worker-3.runtime.env}
+        required: false
+    environment:
+      <<: *worker-env
+      AGENTTEAMS_AGENT_ID: ${WORKER_3_SLOT_ID:-00000000-0000-0000-0000-000000000003}
+    depends_on:
+      gateway:
+        condition: service_started
+      worker-enrollment:
+        condition: service_healthy
+      credential-proxy:
+        condition: service_healthy
+    networks: [worker-egress]
+    restart: unless-stopped
+
+  worker-4:
+    image: ${WORKER_IMAGE:?set WORKER_IMAGE to a published image digest}
+    platform: linux/amd64
+    user: *worker-user
+    profiles: [worker-pool, secure-api]
+    env_file:
+      - path: ${WORKER_4_CREDENTIALS_FILE:-./secrets/worker-4.runtime.env}
+        required: false
+    environment:
+      <<: *worker-env
+      AGENTTEAMS_AGENT_ID: ${WORKER_4_SLOT_ID:-00000000-0000-0000-0000-000000000004}
+    depends_on:
+      gateway:
+        condition: service_started
+      worker-enrollment:
+        condition: service_healthy
+      credential-proxy:
+        condition: service_healthy
+    networks: [worker-egress]
+    restart: unless-stopped
+
+  worker-5:
+    image: ${WORKER_IMAGE:?set WORKER_IMAGE to a published image digest}
+    platform: linux/amd64
+    user: *worker-user
+    profiles: [worker-pool, secure-api]
+    env_file:
+      - path: ${WORKER_5_CREDENTIALS_FILE:-./secrets/worker-5.runtime.env}
+        required: false
+    environment:
+      <<: *worker-env
+      AGENTTEAMS_AGENT_ID: ${WORKER_5_SLOT_ID:-00000000-0000-0000-0000-000000000005}
+    depends_on:
+      gateway:
+        condition: service_started
+      worker-enrollment:
+        condition: service_healthy
+      credential-proxy:
+        condition: service_healthy
+    networks: [worker-egress]
+    restart: unless-stopped
+
+  worker-6:
+    image: ${WORKER_IMAGE:?set WORKER_IMAGE to a published image digest}
+    platform: linux/amd64
+    user: *worker-user
+    profiles: [worker-pool, secure-api]
+    env_file:
+      - path: ${WORKER_6_CREDENTIALS_FILE:-./secrets/worker-6.runtime.env}
+        required: false
+    environment:
+      <<: *worker-env
+      AGENTTEAMS_AGENT_ID: ${WORKER_6_SLOT_ID:-00000000-0000-0000-0000-000000000006}
+    depends_on:
+      gateway:
+        condition: service_started
+      worker-enrollment:
+        condition: service_healthy
+      credential-proxy:
+        condition: service_healthy
+    networks: [worker-egress]
+    restart: unless-stopped
+
+  worker-7:
+    image: ${WORKER_IMAGE:?set WORKER_IMAGE to a published image digest}
+    platform: linux/amd64
+    user: *worker-user
+    profiles: [worker-pool, secure-api]
+    env_file:
+      - path: ${WORKER_7_CREDENTIALS_FILE:-./secrets/worker-7.runtime.env}
+        required: false
+    environment:
+      <<: *worker-env
+      AGENTTEAMS_AGENT_ID: ${WORKER_7_SLOT_ID:-00000000-0000-0000-0000-000000000007}
+    depends_on:
+      gateway:
+        condition: service_started
+      worker-enrollment:
+        condition: service_healthy
+      credential-proxy:
+        condition: service_healthy
+    networks: [worker-egress]
+    restart: unless-stopped
+
+  worker-8:
+    image: ${WORKER_IMAGE:?set WORKER_IMAGE to a published image digest}
+    platform: linux/amd64
+    user: *worker-user
+    profiles: [worker-pool, secure-api]
+    env_file:
+      - path: ${WORKER_8_CREDENTIALS_FILE:-./secrets/worker-8.runtime.env}
+        required: false
+    environment:
+      <<: *worker-env
+      AGENTTEAMS_AGENT_ID: ${WORKER_8_SLOT_ID:-00000000-0000-0000-0000-000000000008}
+    depends_on:
+      gateway:
+        condition: service_started
+      worker-enrollment:
+        condition: service_healthy
+      credential-proxy:
+        condition: service_healthy
+    networks: [worker-egress]
+    restart: unless-stopped
+
+  seaweedfs:
+    image: chrislusf/seaweedfs@sha256:57877e32bb90073b37dc109b438ba66e84fd5ed9ced5f5c04f56444ef243ce59
+    profiles: [storage]
+    environment:
+      AWS_ACCESS_KEY_ID: ${OBJECT_STORE_ACCESS_KEY:?set OBJECT_STORE_ACCESS_KEY when storage profile is enabled}
+      AWS_SECRET_ACCESS_KEY: ${OBJECT_STORE_SECRET_KEY:?set OBJECT_STORE_SECRET_KEY when storage profile is enabled}
+      S3_BUCKET: agentteams
+    volumes:
+      - seaweedfs-data:/data
+    expose: ["8333"]
+    networks: [data]
+    healthcheck:
+      test: ["CMD-SHELL", "code=$$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:8333/); [ \"$$code\" -ge 200 ] && [ \"$$code\" -lt 500 ]"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 15s
+    restart: unless-stopped
+
+secrets:
+  maven_settings:
+    file: ${MAVEN_SETTINGS_FILE:-/dev/null}
+
+volumes:
+  postgres-data:
+  nats-data:
+  seaweedfs-data:
+
+networks:
+  data:
+    internal: true
+  host-ingress:
+    driver: bridge
+  worker-egress:
+    internal: true
+  provider-egress:
+    driver: bridge

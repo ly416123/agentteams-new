@@ -1,0 +1,1416 @@
+diff --git a/agent-gateway/src/main/java/io/agentteams/gateway/AgentChannelService.java b/agent-gateway/src/main/java/io/agentteams/gateway/AgentChannelService.java
+index c4657ff..0b02f09 100644
+--- a/agent-gateway/src/main/java/io/agentteams/gateway/AgentChannelService.java
++++ b/agent-gateway/src/main/java/io/agentteams/gateway/AgentChannelService.java
+@@ -147,8 +147,8 @@ public final class AgentChannelService extends AgentChannelGrpc.AgentChannelImpl
+         Instant now = clock.instant();
+         AgentProfile profile = new AgentProfile(hello.getMetadata().getAgentId(), hello.getRuntimeName(),
+                 hello.getRuntimeVersion(), hello.getCapabilitiesMap(), hello.getSpecDigest(),
+-                hello.getConfigRevision(), hello.getSecretGeneration());
+-        registry.register(connection, profile, delivery.lastAcknowledgedSequence(profile.agentId()), now)
++                hello.getConfigRevision(), hello.getSecretGeneration(), decision.identityKind());
++        registry.register(connection, profile, delivery.lastAcknowledgedSequence(profile.recipientKey()), now)
+                 .ifPresent(replaced -> state.disconnected(replaced, now));
+         state.registered(registry.snapshot(connection).orElseThrow(), now);
+         connection.outbound().onNext(ready(profile.agentId(), negotiated, now));
+diff --git a/agent-gateway/src/main/java/io/agentteams/gateway/AgentGatewayGrpcConfiguration.java b/agent-gateway/src/main/java/io/agentteams/gateway/AgentGatewayGrpcConfiguration.java
+index 92933c0..6528100 100644
+--- a/agent-gateway/src/main/java/io/agentteams/gateway/AgentGatewayGrpcConfiguration.java
++++ b/agent-gateway/src/main/java/io/agentteams/gateway/AgentGatewayGrpcConfiguration.java
+@@ -75,12 +75,12 @@ public class AgentGatewayGrpcConfiguration {
+     @ConditionalOnBean(ControlPlaneArtifactUploadClient.class)
+     @ConditionalOnMissingBean(ArtifactUploadHandler.class)
+     public ArtifactUploadHandler artifactUploadHandler(ControlPlaneArtifactUploadClient client,
+-            GatewayArtifactUploadProperties properties) {
+-        if (properties.getWorkerToken() == null || properties.getWorkerToken().isBlank()) {
+-            throw new IllegalArgumentException("gateway artifact worker token must not be blank");
++            ObjectProvider<AgentSessionStore> sessionStores, Clock clock, AttemptCapabilityVerifier capabilities) {
++        AgentSessionStore sessions = sessionStores.getIfAvailable();
++        if (sessions == null) {
++            throw new IllegalArgumentException("Gateway Agent session store is required for Artifact uploads");
+         }
+-        return new ArtifactUploadHandler(client, Clock.systemUTC(), GrpcTransportIdentity::current,
+-                properties::getWorkerToken);
++        return new ArtifactUploadHandler(client, clock, GrpcTransportIdentity::current, sessions, capabilities);
+     }
+
+     @Bean
+@@ -249,8 +249,17 @@ public class AgentGatewayGrpcConfiguration {
+     @Bean
+     @ConditionalOnMissingBean(InboundEventHandler.class)
+     public InboundEventHandler inboundEventHandler(ConnectionRegistry registry, InboundEventPort events,
+-            GatewayApplicationHandler application, CommandDeliveryService delivery, Clock clock) {
+-        return new InboundEventHandler(registry, events, application, delivery, clock);
++            GatewayApplicationHandler application, CommandDeliveryService delivery, Clock clock,
++            AttemptCapabilityVerifier capabilities) {
++        return new InboundEventHandler(registry, events, application, delivery, clock, capabilities);
++    }
++
++    @Bean
++    @ConditionalOnMissingBean(AttemptCapabilityVerifier.class)
++    public AttemptCapabilityVerifier attemptCapabilityVerifier(ObjectProvider<DataSource> dataSources) {
++        DataSource dataSource = dataSources.getIfAvailable();
++        return dataSource == null ? AttemptCapabilityVerifier.denyAll()
++                : new JdbcAttemptCapabilityVerifier(new org.springframework.jdbc.core.JdbcTemplate(dataSource));
+     }
+
+     @Bean
+diff --git a/agent-gateway/src/main/java/io/agentteams/gateway/AgentProfile.java b/agent-gateway/src/main/java/io/agentteams/gateway/AgentProfile.java
+index 499609a..e569987 100644
+--- a/agent-gateway/src/main/java/io/agentteams/gateway/AgentProfile.java
++++ b/agent-gateway/src/main/java/io/agentteams/gateway/AgentProfile.java
+@@ -11,11 +11,18 @@ public record AgentProfile(
+         Map<String, String> capabilities,
+         String specDigest,
+         String configRevision,
+-        String secretGeneration) {
++        String secretGeneration,
++        GatewayIdentityKind identityKind) {
+
+     public AgentProfile(String agentId, String runtime, String runtimeVersion,
+             Map<String, String> capabilities) {
+-        this(agentId, runtime, runtimeVersion, capabilities, "", "", "");
++        this(agentId, runtime, runtimeVersion, capabilities, "", "", "", GatewayIdentityKind.AGENT);
++    }
++
++    public AgentProfile(String agentId, String runtime, String runtimeVersion, Map<String, String> capabilities,
++            String specDigest, String configRevision, String secretGeneration) {
++        this(agentId, runtime, runtimeVersion, capabilities, specDigest, configRevision, secretGeneration,
++                GatewayIdentityKind.AGENT);
+     }
+
+     public AgentProfile {
+@@ -23,12 +30,17 @@ public record AgentProfile(
+         requireText(runtime, "runtime");
+         requireText(runtimeVersion, "runtimeVersion");
+         Objects.requireNonNull(capabilities, "capabilities");
++        Objects.requireNonNull(identityKind, "identityKind");
+         capabilities = Map.copyOf(capabilities);
+         specDigest = optionalText(specDigest, "specDigest");
+         configRevision = optionalText(configRevision, "configRevision");
+         secretGeneration = optionalText(secretGeneration, "secretGeneration");
+     }
+
++    public String recipientKey() {
++        return identityKind.recipientKey(agentId);
++    }
++
+     private static void requireText(String value, String field) {
+         if (value == null || value.isBlank()) {
+             throw new IllegalArgumentException(field + " must not be blank");
+diff --git a/agent-gateway/src/main/java/io/agentteams/gateway/AgentSession.java b/agent-gateway/src/main/java/io/agentteams/gateway/AgentSession.java
+index c22b4a2..47ca4ed 100644
+--- a/agent-gateway/src/main/java/io/agentteams/gateway/AgentSession.java
++++ b/agent-gateway/src/main/java/io/agentteams/gateway/AgentSession.java
+@@ -5,11 +5,17 @@ import java.util.Objects;
+ import java.util.UUID;
+
+ /** Persistable session projection; only a hash of the bearer token is retained. */
+-public record AgentSession(UUID agentId, String tokenSha256, Instant expiresAt, boolean revoked) {
++public record AgentSession(UUID agentId, String tokenSha256, Instant expiresAt, boolean revoked,
++        GatewayIdentityKind identityKind) {
++    public AgentSession(UUID agentId, String tokenSha256, Instant expiresAt, boolean revoked) {
++        this(agentId, tokenSha256, expiresAt, revoked, GatewayIdentityKind.AGENT);
++    }
++
+     public AgentSession {
+         Objects.requireNonNull(agentId, "agentId");
+         if (tokenSha256 == null || tokenSha256.isBlank()) throw new IllegalArgumentException("tokenSha256 is required");
+         Objects.requireNonNull(expiresAt, "expiresAt");
++        Objects.requireNonNull(identityKind, "identityKind");
+     }
+
+     public boolean activeAt(Instant now) {
+diff --git a/agent-gateway/src/main/java/io/agentteams/gateway/ArtifactUploadHandler.java b/agent-gateway/src/main/java/io/agentteams/gateway/ArtifactUploadHandler.java
+index bc613f3..ba35f9e 100644
+--- a/agent-gateway/src/main/java/io/agentteams/gateway/ArtifactUploadHandler.java
++++ b/agent-gateway/src/main/java/io/agentteams/gateway/ArtifactUploadHandler.java
+@@ -17,7 +17,10 @@ import java.time.Duration;
+ import java.time.Instant;
+ import java.nio.charset.StandardCharsets;
+ import java.security.MessageDigest;
++import java.security.NoSuchAlgorithmException;
++import java.util.HexFormat;
+ import java.util.Objects;
++import java.util.Optional;
+ import java.util.function.Supplier;
+
+ /**
+@@ -35,28 +38,21 @@ public final class ArtifactUploadHandler extends TaskArtifactServiceGrpc.TaskArt
+     private final Clock clock;
+     /** Transport credential reader; blank means the call carries no identity. */
+     private final Supplier<String> transportIdentity;
+-    /** Expected Worker credential; blank keeps the package-private test constructor presence-only. */
+-    private final Supplier<String> expectedTransportCredential;
++    private final AgentSessionStore sessions;
++    private final AttemptCapabilityVerifier capabilities;
+
+-    public ArtifactUploadHandler(ArtifactUploadBridge client) {
+-        this(client, Clock.systemUTC());
++    public ArtifactUploadHandler(ArtifactUploadBridge client, Clock clock, Supplier<String> transportIdentity,
++            AgentSessionStore sessions) {
++        this(client, clock, transportIdentity, sessions, AttemptCapabilityVerifier.denyAll());
+     }
+
+-    public ArtifactUploadHandler(ArtifactUploadBridge client, Clock clock) {
+-        this(client, clock, GrpcTransportIdentity::current);
+-    }
+-
+-    ArtifactUploadHandler(ArtifactUploadBridge client, Clock clock, Supplier<String> transportIdentity) {
+-        this(client, clock, transportIdentity, () -> "");
+-    }
+-
+-    ArtifactUploadHandler(ArtifactUploadBridge client, Clock clock, Supplier<String> transportIdentity,
+-            Supplier<String> expectedTransportCredential) {
++    public ArtifactUploadHandler(ArtifactUploadBridge client, Clock clock, Supplier<String> transportIdentity,
++            AgentSessionStore sessions, AttemptCapabilityVerifier capabilities) {
+         this.client = Objects.requireNonNull(client, "client");
+         this.clock = Objects.requireNonNull(clock, "clock");
+         this.transportIdentity = Objects.requireNonNull(transportIdentity, "transportIdentity");
+-        this.expectedTransportCredential = Objects.requireNonNull(expectedTransportCredential,
+-                "expectedTransportCredential");
++        this.sessions = Objects.requireNonNull(sessions, "sessions");
++        this.capabilities = Objects.requireNonNull(capabilities, "capabilities");
+     }
+
+     @Override
+@@ -64,7 +60,8 @@ public final class ArtifactUploadHandler extends TaskArtifactServiceGrpc.TaskArt
+             StreamObserver<PrepareArtifactUploadResponse> observer) {
+         try {
+             validatePrepare(request);
+-            requireTransportCredential();
++            requireTransportCredential(request.getAgentId(), request.getTaskId(), request.getAttemptId(),
++                    request.getMetadata());
+             ArtifactUploadHttp.PrepareResponse prepared = client.prepare(new ArtifactUploadHttp.PrepareRequest(
+                     request.getTaskId(), request.getAttemptId(), request.getAgentId(), request.getName(),
+                     request.getContentType(),
+@@ -99,7 +96,8 @@ public final class ArtifactUploadHandler extends TaskArtifactServiceGrpc.TaskArt
+             StreamObserver<CompleteArtifactUploadResponse> observer) {
+         try {
+             validateComplete(request);
+-            requireTransportCredential();
++            requireTransportCredential(request.getAgentId(), request.getTaskId(), request.getAttemptId(),
++                    request.getMetadata());
+             ArtifactUploadHttp.CompleteResponse completed = client.complete(
+                     new ArtifactUploadHttp.CompleteRequest(request.getTaskId(), request.getAttemptId(),
+                             request.getAgentId(), request.getName(), request.getStorageKey(),
+@@ -132,17 +130,40 @@ public final class ArtifactUploadHandler extends TaskArtifactServiceGrpc.TaskArt
+      * 不适用独立 unary 调用，凭证非空是第一道身份闸门）。空凭证直接以
+      * UNAUTHENTICATED 拒绝，不触碰 Control Plane。
+      */
+-    private void requireTransportCredential() {
++    private void requireTransportCredential(String requestedAgentId, String taskId, String attemptId,
++            EventMetadata metadata) {
+         String credential = transportIdentity.get();
+         if (credential == null || credential.isBlank()) {
+             throw new UnauthenticatedException();
+         }
+-        String expected = expectedTransportCredential.get();
+-        if (expected != null && !expected.isBlank()
+-                && !MessageDigest.isEqual(credential.trim().getBytes(StandardCharsets.UTF_8),
+-                        expected.trim().getBytes(StandardCharsets.UTF_8))) {
++        Optional<AgentSession> session = sessions.findByTokenSha256(sha256(credential));
++        if (session.isEmpty() || !session.get().activeAt(clock.instant())) {
+             throw new UnauthenticatedException();
+         }
++        AgentSession authenticated = session.get();
++        if (authenticated.identityKind() == GatewayIdentityKind.AGENT) {
++            if (!authenticated.agentId().toString().equals(requestedAgentId.trim())) {
++                throw new UnauthenticatedException();
++            }
++            return;
++        }
++        if (authenticated.identityKind() != GatewayIdentityKind.WORKER_SLOT
++                || !metadata.getAgentId().equals(requestedAgentId.trim())
++                || !metadata.getTaskId().equals(taskId.trim())
++                || !metadata.getAttemptId().equals(attemptId.trim())
++                || metadata.getLeaseId().isBlank()
++                || !capabilities.valid(authenticated.agentId(), metadata)) {
++            throw new UnauthenticatedException();
++        }
++    }
++
++    private static String sha256(String value) {
++        try {
++            return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
++                    .digest(value.getBytes(StandardCharsets.UTF_8)));
++        } catch (NoSuchAlgorithmException impossible) {
++            throw new IllegalStateException("SHA-256 is unavailable", impossible);
++        }
+     }
+
+     /** Distinct from IllegalArgumentException so it maps to UNAUTHENTICATED, not INVALID_ARGUMENT. */
+diff --git a/agent-gateway/src/main/java/io/agentteams/gateway/AttemptCapabilityVerifier.java b/agent-gateway/src/main/java/io/agentteams/gateway/AttemptCapabilityVerifier.java
+new file mode 100644
+index 0000000..151662e
+--- /dev/null
++++ b/agent-gateway/src/main/java/io/agentteams/gateway/AttemptCapabilityVerifier.java
+@@ -0,0 +1,18 @@
++package io.agentteams.gateway;
++
++import io.agentteams.contracts.v1.EventMetadata;
++import java.util.UUID;
++
++/** Verifies that an execution capability is live and bound to this Gateway slot and event. */
++@FunctionalInterface
++public interface AttemptCapabilityVerifier {
++    boolean valid(ConnectionRegistry.ConnectionSnapshot connection, EventMetadata metadata);
++
++    default boolean valid(UUID slotId, EventMetadata metadata) {
++        return false;
++    }
++
++    static AttemptCapabilityVerifier denyAll() {
++        return (connection, metadata) -> false;
++    }
++}
+diff --git a/agent-gateway/src/main/java/io/agentteams/gateway/AuthenticationPort.java b/agent-gateway/src/main/java/io/agentteams/gateway/AuthenticationPort.java
+index 7c6fa3c..e7f15bd 100644
+--- a/agent-gateway/src/main/java/io/agentteams/gateway/AuthenticationPort.java
++++ b/agent-gateway/src/main/java/io/agentteams/gateway/AuthenticationPort.java
+@@ -7,19 +7,28 @@ public interface AuthenticationPort {
+
+     AuthenticationDecision authenticate(AgentConnection connection, AgentHello hello);
+
+-    record AuthenticationDecision(boolean accepted, String rejectionReason) {
++    record AuthenticationDecision(boolean accepted, String rejectionReason, GatewayIdentityKind identityKind) {
++        public AuthenticationDecision(boolean accepted, String rejectionReason) {
++            this(accepted, rejectionReason, GatewayIdentityKind.AGENT);
++        }
++
+         public AuthenticationDecision {
+             if (!accepted && (rejectionReason == null || rejectionReason.isBlank())) {
+                 throw new IllegalArgumentException("rejectionReason is required for rejected authentication");
+             }
++            if (identityKind == null) throw new IllegalArgumentException("identityKind is required");
+         }
+
+         public static AuthenticationDecision allow() {
+-            return new AuthenticationDecision(true, "");
++            return allow(GatewayIdentityKind.AGENT);
++        }
++
++        public static AuthenticationDecision allow(GatewayIdentityKind identityKind) {
++            return new AuthenticationDecision(true, "", identityKind);
+         }
+
+         public static AuthenticationDecision rejected(String reason) {
+-            return new AuthenticationDecision(false, reason);
++            return new AuthenticationDecision(false, reason, GatewayIdentityKind.AGENT);
+         }
+     }
+ }
+diff --git a/agent-gateway/src/main/java/io/agentteams/gateway/CommandDeliveryService.java b/agent-gateway/src/main/java/io/agentteams/gateway/CommandDeliveryService.java
+index 2709df7..651e380 100644
+--- a/agent-gateway/src/main/java/io/agentteams/gateway/CommandDeliveryService.java
++++ b/agent-gateway/src/main/java/io/agentteams/gateway/CommandDeliveryService.java
+@@ -44,7 +44,7 @@ public final class CommandDeliveryService {
+     /** Replays the durable unacknowledged suffix in the store's per-Agent sequence order. */
+     public int replay(AgentConnection connection) {
+         ConnectionRegistry.ConnectionSnapshot snapshot = requireCurrent(connection);
+-        List<SequencedCommand> pending = commands.replayUnacknowledged(snapshot.agentId());
++        List<SequencedCommand> pending = commands.replayUnacknowledged(snapshot.recipientKey());
+         int sent = 0;
+         for (SequencedCommand command : pending) {
+             if (!registry.isCurrent(connection)) {
+@@ -72,7 +72,7 @@ public final class CommandDeliveryService {
+             throw new InvalidAcknowledgementException("acknowledged sequence must be positive");
+         }
+         AcknowledgementValidation validation = commands.validateAcknowledgement(
+-                before.agentId(), before.connectionId(), sequence);
++                before.recipientKey(), before.connectionId(), sequence);
+         if (validation == null || !validation.accepted()) {
+             String reason = validation == null ? "durable acknowledgement validation returned no result"
+                     : validation.rejectionReason();
+@@ -84,7 +84,7 @@ public final class CommandDeliveryService {
+             throw new GatewayExceptions.StaleConnection("acknowledgement came from a stale connection");
+         }
+         if (advancesCursor) {
+-            commands.acknowledge(before.agentId(), sequence);
++            commands.acknowledge(before.recipientKey(), sequence);
+         }
+         return true;
+     }
+@@ -96,7 +96,7 @@ public final class CommandDeliveryService {
+         requireCapabilities(connection, command.message());
+         StreamObserver<ServerMessage> outbound = connection.outbound();
+         outbound.onNext(command.message());
+-        commands.markDelivered(connection.profile().orElseThrow().agentId(), connection.connectionId(),
++        commands.markDelivered(connection.profile().orElseThrow().recipientKey(), connection.connectionId(),
+                 command.sequence());
+     }
+
+diff --git a/agent-gateway/src/main/java/io/agentteams/gateway/ConnectionRegistry.java b/agent-gateway/src/main/java/io/agentteams/gateway/ConnectionRegistry.java
+index 4f79974..b90e96a 100644
+--- a/agent-gateway/src/main/java/io/agentteams/gateway/ConnectionRegistry.java
++++ b/agent-gateway/src/main/java/io/agentteams/gateway/ConnectionRegistry.java
+@@ -13,7 +13,7 @@ import java.util.concurrent.ConcurrentHashMap;
+ public final class ConnectionRegistry {
+
+     private final Map<UUID, AgentConnection> connections = new ConcurrentHashMap<>();
+-    private final Map<String, AgentConnection> currentByAgent = new ConcurrentHashMap<>();
++    private final Map<String, AgentConnection> currentByIdentity = new ConcurrentHashMap<>();
+     private final ConnectionTermination termination;
+     private final GatewayMetricsPort metrics;
+
+@@ -44,7 +44,7 @@ public final class ConnectionRegistry {
+         Objects.requireNonNull(profile, "profile");
+         connection.register(profile, initialAckSequence, seenAt);
+         metrics.connectionRegistered();
+-        AgentConnection replaced = currentByAgent.put(profile.agentId(), connection);
++        AgentConnection replaced = currentByIdentity.put(profile.recipientKey(), connection);
+         if (replaced == null || replaced == connection) {
+             return Optional.empty();
+         }
+@@ -62,15 +62,19 @@ public final class ConnectionRegistry {
+     }
+
+     public Optional<AgentConnection> current(String agentId) {
+-        if (agentId == null || agentId.isBlank()) {
++        return current(GatewayIdentityKind.AGENT, agentId);
++    }
++
++    public Optional<AgentConnection> current(GatewayIdentityKind identityKind, String identityId) {
++        if (identityId == null || identityId.isBlank()) {
+             return Optional.empty();
+         }
+-        return Optional.ofNullable(currentByAgent.get(agentId));
++        return Optional.ofNullable(currentByIdentity.get(identityKind.recipientKey(identityId)));
+     }
+
+     public boolean isCurrent(AgentConnection connection) {
+         return connection != null && connection.profile().map(profile ->
+-                currentByAgent.get(profile.agentId()) == connection).orElse(false);
++                currentByIdentity.get(profile.recipientKey()) == connection).orElse(false);
+     }
+
+     public Optional<ConnectionSnapshot> snapshot(AgentConnection connection) {
+@@ -80,7 +84,7 @@ public final class ConnectionRegistry {
+         AgentProfile profile = connection.profile().orElseThrow();
+         return Optional.of(new ConnectionSnapshot(connection.connectionId(), profile.agentId(), profile.runtime(),
+                 profile.runtimeVersion(), profile.specDigest(), profile.configRevision(), profile.secretGeneration(),
+-                profile.capabilities(), connection.lastSeen(), connection.lastAckSequence()));
++                profile.capabilities(), connection.lastSeen(), connection.lastAckSequence(), profile.identityKind()));
+     }
+
+     public Optional<ConnectionSnapshot> touch(AgentConnection connection, Instant at) {
+@@ -110,7 +114,7 @@ public final class ConnectionRegistry {
+             metrics.connectionClosed();
+         }
+         Optional<AgentProfile> profile = connection.profile();
+-        if (profile.isEmpty() || !currentByAgent.remove(profile.get().agentId(), connection)) {
++        if (profile.isEmpty() || !currentByIdentity.remove(profile.get().recipientKey(), connection)) {
+             return Optional.empty();
+         }
+         return snapshot(connection);
+@@ -133,7 +137,15 @@ public final class ConnectionRegistry {
+             String secretGeneration,
+             Map<String, String> capabilities,
+             Instant lastSeen,
+-            long lastAckSequence) {
++            long lastAckSequence,
++            GatewayIdentityKind identityKind) {
++
++        public ConnectionSnapshot(UUID connectionId, String agentId, String runtime, String runtimeVersion,
++                String specDigest, String configRevision, String secretGeneration, Map<String, String> capabilities,
++                Instant lastSeen, long lastAckSequence) {
++            this(connectionId, agentId, runtime, runtimeVersion, specDigest, configRevision, secretGeneration,
++                    capabilities, lastSeen, lastAckSequence, GatewayIdentityKind.AGENT);
++        }
+
+         public ConnectionSnapshot {
+             Objects.requireNonNull(connectionId, "connectionId");
+@@ -145,6 +157,7 @@ public final class ConnectionRegistry {
+             secretGeneration = optionalText(secretGeneration, "secretGeneration");
+             capabilities = Map.copyOf(Objects.requireNonNull(capabilities, "capabilities"));
+             Objects.requireNonNull(lastSeen, "lastSeen");
++            Objects.requireNonNull(identityKind, "identityKind");
+             if (lastAckSequence < 0) {
+                 throw new IllegalArgumentException("lastAckSequence must not be negative");
+             }
+@@ -153,7 +166,11 @@ public final class ConnectionRegistry {
+         public ConnectionSnapshot(UUID connectionId, String agentId, String runtime, String runtimeVersion,
+                 Map<String, String> capabilities, Instant lastSeen, long lastAckSequence) {
+             this(connectionId, agentId, runtime, runtimeVersion, "", "", "", capabilities, lastSeen,
+-                    lastAckSequence);
++                    lastAckSequence, GatewayIdentityKind.AGENT);
++        }
++
++        public String recipientKey() {
++            return identityKind.recipientKey(agentId);
+         }
+
+         private static void requireText(String value, String field) {
+diff --git a/agent-gateway/src/main/java/io/agentteams/gateway/GatewayArtifactUploadProperties.java b/agent-gateway/src/main/java/io/agentteams/gateway/GatewayArtifactUploadProperties.java
+index 395f8b8..69b065c 100644
+--- a/agent-gateway/src/main/java/io/agentteams/gateway/GatewayArtifactUploadProperties.java
++++ b/agent-gateway/src/main/java/io/agentteams/gateway/GatewayArtifactUploadProperties.java
+@@ -10,7 +10,6 @@ public class GatewayArtifactUploadProperties {
+     private boolean enabled;
+     private URI controlPlaneUrl;
+     private String internalToken = "";
+-    private String workerToken = "";
+     private Duration requestTimeout = Duration.ofSeconds(5);
+
+     public boolean isEnabled() {
+@@ -37,14 +36,6 @@ public class GatewayArtifactUploadProperties {
+         this.internalToken = internalToken == null ? "" : internalToken;
+     }
+
+-    public String getWorkerToken() {
+-        return workerToken;
+-    }
+-
+-    public void setWorkerToken(String workerToken) {
+-        this.workerToken = workerToken == null ? "" : workerToken;
+-    }
+-
+     public Duration getRequestTimeout() {
+         return requestTimeout;
+     }
+diff --git a/agent-gateway/src/main/java/io/agentteams/gateway/GatewayIdentityKind.java b/agent-gateway/src/main/java/io/agentteams/gateway/GatewayIdentityKind.java
+new file mode 100644
+index 0000000..84aab19
+--- /dev/null
++++ b/agent-gateway/src/main/java/io/agentteams/gateway/GatewayIdentityKind.java
+@@ -0,0 +1,11 @@
++package io.agentteams.gateway;
++
++/** Distinguishes tenant Agents from tenant-neutral fixed-capacity Worker slots. */
++public enum GatewayIdentityKind {
++    AGENT,
++    WORKER_SLOT;
++
++    public String recipientKey(String id) {
++        return this == AGENT ? id : "worker-slot:" + id;
++    }
++}
+diff --git a/agent-gateway/src/main/java/io/agentteams/gateway/HttpGatewayWorkerOperationObservationReporter.java b/agent-gateway/src/main/java/io/agentteams/gateway/HttpGatewayWorkerOperationObservationReporter.java
+index bdb3477..918dac6 100644
+--- a/agent-gateway/src/main/java/io/agentteams/gateway/HttpGatewayWorkerOperationObservationReporter.java
++++ b/agent-gateway/src/main/java/io/agentteams/gateway/HttpGatewayWorkerOperationObservationReporter.java
+@@ -45,6 +45,7 @@ public final class HttpGatewayWorkerOperationObservationReporter
+     public void report(ConnectionRegistry.ConnectionSnapshot connection, boolean online, Instant observedAt) {
+         Objects.requireNonNull(connection, "connection");
+         Objects.requireNonNull(observedAt, "observedAt");
++        if (connection.identityKind() != GatewayIdentityKind.AGENT) return;
+         UUID agentId;
+         try {
+             agentId = UUID.fromString(connection.agentId());
+diff --git a/agent-gateway/src/main/java/io/agentteams/gateway/InboundEventHandler.java b/agent-gateway/src/main/java/io/agentteams/gateway/InboundEventHandler.java
+index 21010c4..a703c3f 100644
+--- a/agent-gateway/src/main/java/io/agentteams/gateway/InboundEventHandler.java
++++ b/agent-gateway/src/main/java/io/agentteams/gateway/InboundEventHandler.java
+@@ -17,14 +17,22 @@ public final class InboundEventHandler {
+     private final GatewayApplicationHandler application;
+     private final CommandDeliveryService delivery;
+     private final Clock clock;
++    private final AttemptCapabilityVerifier capabilities;
+
+     public InboundEventHandler(ConnectionRegistry registry, InboundEventPort events,
+             GatewayApplicationHandler application, CommandDeliveryService delivery, Clock clock) {
++        this(registry, events, application, delivery, clock, AttemptCapabilityVerifier.denyAll());
++    }
++
++    public InboundEventHandler(ConnectionRegistry registry, InboundEventPort events,
++            GatewayApplicationHandler application, CommandDeliveryService delivery, Clock clock,
++            AttemptCapabilityVerifier capabilities) {
+         this.registry = Objects.requireNonNull(registry, "registry");
+         this.events = Objects.requireNonNull(events, "events");
+         this.application = Objects.requireNonNull(application, "application");
+         this.delivery = Objects.requireNonNull(delivery, "delivery");
+         this.clock = Objects.requireNonNull(clock, "clock");
++        this.capabilities = Objects.requireNonNull(capabilities, "capabilities");
+     }
+
+     public void handle(AgentConnection connection, AgentMessage message) {
+@@ -41,25 +49,63 @@ public final class InboundEventHandler {
+             // 任何失败丢弃并告警，绝不关闭承载终态事件的流；终态事件
+             // 保持 fail-fast 不变。
+             try {
+-                handleTracked(connection, snapshot, message);
++                handleTracked(connection, snapshot, authorizeAndStripCapability(snapshot, message));
+             } catch (RuntimeException error) {
+                 System.getLogger(InboundEventHandler.class.getName()).log(System.Logger.Level.WARNING,
+                         "Dropping task event report: " + error.getMessage());
+             }
+             return;
+         }
+-        handleTracked(connection, snapshot, message);
++        handleTracked(connection, snapshot, authorizeAndStripCapability(snapshot, message));
++    }
++
++    private AgentMessage authorizeAndStripCapability(ConnectionRegistry.ConnectionSnapshot snapshot,
++            AgentMessage message) {
++        EventMetadata eventMetadata = metadata(message);
++        boolean executionEvent = switch (message.getPayloadCase()) {
++            case TASK_ACCEPTED, TASK_PROGRESS, TASK_HEARTBEAT, TASK_COMPLETED, TASK_FAILED, TASK_EVENT_REPORT -> true;
++            default -> false;
++        };
++        if (snapshot.identityKind() == GatewayIdentityKind.WORKER_SLOT && executionEvent
++                && (eventMetadata.getAttemptCapability().isBlank() || !capabilities.valid(snapshot, eventMetadata))) {
++            throw new GatewayExceptions.InvalidMessage(
++                    "Worker slot execution event requires a valid Attempt capability");
++        }
++        return stripCapability(message);
++    }
++
++    private static AgentMessage stripCapability(AgentMessage message) {
++        return switch (message.getPayloadCase()) {
++            case TASK_ACCEPTED -> message.toBuilder().setTaskAccepted(message.getTaskAccepted().toBuilder()
++                    .setMetadata(message.getTaskAccepted().getMetadata().toBuilder().clearAttemptCapability())).build();
++            case TASK_PROGRESS -> message.toBuilder().setTaskProgress(message.getTaskProgress().toBuilder()
++                    .setMetadata(message.getTaskProgress().getMetadata().toBuilder().clearAttemptCapability())).build();
++            case TASK_HEARTBEAT -> message.toBuilder().setTaskHeartbeat(message.getTaskHeartbeat().toBuilder()
++                    .setMetadata(message.getTaskHeartbeat().getMetadata().toBuilder().clearAttemptCapability())).build();
++            case TASK_COMPLETED -> message.toBuilder().setTaskCompleted(message.getTaskCompleted().toBuilder()
++                    .setMetadata(message.getTaskCompleted().getMetadata().toBuilder().clearAttemptCapability())).build();
++            case TASK_FAILED -> message.toBuilder().setTaskFailed(message.getTaskFailed().toBuilder()
++                    .setMetadata(message.getTaskFailed().getMetadata().toBuilder().clearAttemptCapability())).build();
++            case TASK_EVENT_REPORT -> message.toBuilder().setTaskEventReport(message.getTaskEventReport().toBuilder()
++                    .setMetadata(message.getTaskEventReport().getMetadata().toBuilder().clearAttemptCapability())).build();
++            case AGENT_HEARTBEAT -> message.toBuilder().setAgentHeartbeat(message.getAgentHeartbeat().toBuilder()
++                    .setMetadata(message.getAgentHeartbeat().getMetadata().toBuilder().clearAttemptCapability())).build();
++            case CONFIG_APPLIED -> message.toBuilder().setConfigApplied(message.getConfigApplied().toBuilder()
++                    .setMetadata(message.getConfigApplied().getMetadata().toBuilder().clearAttemptCapability())).build();
++            default -> message;
++        };
+     }
+
+     private void handleTracked(AgentConnection connection, ConnectionRegistry.ConnectionSnapshot snapshot,
+             AgentMessage message) {
+         EventMetadata metadata = metadata(message);
+-        validateMetadata(snapshot, metadata);
++        validateMetadata(snapshot, metadata, message.getPayloadCase());
+         Instant receivedAt = clock.instant();
+         // This handler owns the in-memory lastSeen update; AgentChannelService mirrors it to AgentStatePort.
+         ConnectionRegistry.ConnectionSnapshot seenConnection = registry.touch(connection, receivedAt)
+                 .orElseThrow(() -> new GatewayExceptions.StaleConnection("connection became stale"));
+-        boolean first = events.recordIfNew(metadata.getEventId(), snapshot.agentId(), snapshot.connectionId(), receivedAt);
++        boolean first = events.recordIfNew(metadata.getEventId(), snapshot.recipientKey(),
++                snapshot.connectionId(), receivedAt);
+         if (first) {
+             route(seenConnection, message);
+         }
+@@ -68,7 +114,7 @@ public final class InboundEventHandler {
+
+     private void handleAck(AgentConnection connection, ConnectionRegistry.ConnectionSnapshot snapshot, Ack ack) {
+         EventMetadata metadata = ack.getMetadata();
+-        validateMetadata(snapshot, metadata);
++        validateMetadata(snapshot, metadata, AgentMessage.PayloadCase.ACK);
+         if (ack.getAckedEventId().isBlank()) {
+             throw new InvalidAcknowledgementException("acked event_id is required");
+         }
+@@ -126,11 +172,19 @@ public final class InboundEventHandler {
+         };
+     }
+
+-    private static void validateMetadata(ConnectionRegistry.ConnectionSnapshot snapshot, EventMetadata metadata) {
++    private static void validateMetadata(ConnectionRegistry.ConnectionSnapshot snapshot, EventMetadata metadata,
++            AgentMessage.PayloadCase payloadCase) {
+         if (metadata.getEventId().isBlank()) {
+             throw new GatewayExceptions.InvalidMessage("event_id is required");
+         }
+-        if (metadata.getAgentId().isBlank() || !snapshot.agentId().equals(metadata.getAgentId())) {
++        boolean slotExecutionEvent = snapshot.identityKind() == GatewayIdentityKind.WORKER_SLOT
++                && switch (payloadCase) {
++                    case TASK_ACCEPTED, TASK_PROGRESS, TASK_HEARTBEAT, TASK_COMPLETED, TASK_FAILED,
++                            TASK_EVENT_REPORT -> true;
++                    default -> false;
++                };
++        if (metadata.getAgentId().isBlank()
++                || (!slotExecutionEvent && !snapshot.agentId().equals(metadata.getAgentId()))) {
+             throw new GatewayExceptions.InvalidMessage("event agent_id does not match the connection");
+         }
+     }
+diff --git a/agent-gateway/src/main/java/io/agentteams/gateway/JdbcAgentSessionStore.java b/agent-gateway/src/main/java/io/agentteams/gateway/JdbcAgentSessionStore.java
+index 89374b6..661198b 100644
+--- a/agent-gateway/src/main/java/io/agentteams/gateway/JdbcAgentSessionStore.java
++++ b/agent-gateway/src/main/java/io/agentteams/gateway/JdbcAgentSessionStore.java
+@@ -13,11 +13,21 @@ public final class JdbcAgentSessionStore implements AgentSessionStore {
+
+     @Override
+     public Optional<AgentSession> findByTokenSha256(String tokenSha256) {
+-        return jdbc.query("""
+-                SELECT agent_id, token_sha256, expires_at, revoked_at
+-                  FROM agent_sessions WHERE token_sha256 = ?
++        var matches = jdbc.query("""
++                SELECT agent_id, token_sha256, expires_at, revoked_at, identity_kind
++                  FROM (
++                        SELECT agent_id, token_sha256, expires_at, revoked_at, 'AGENT'::text AS identity_kind
++                          FROM agent_sessions WHERE token_sha256 = ?
++                        UNION ALL
++                        SELECT slot_id AS agent_id, ?::char(64) AS token_sha256, expires_at, revoked_at,
++                               'WORKER_SLOT'::text AS identity_kind
++                          FROM public.worker_enrollment_worker_slot_session_by_token_sha256(?::char(64))
++                  ) sessions
+                 """, (rs, row) -> new AgentSession(rs.getObject("agent_id", UUID.class),
+                         rs.getString("token_sha256"), rs.getTimestamp("expires_at").toInstant(),
+-                        rs.getTimestamp("revoked_at") != null), tokenSha256).stream().findFirst();
++                        rs.getTimestamp("revoked_at") != null,
++                        GatewayIdentityKind.valueOf(rs.getString("identity_kind"))),
++                tokenSha256, tokenSha256, tokenSha256);
++        return matches.size() == 1 ? Optional.of(matches.get(0)) : Optional.empty();
+     }
+ }
+diff --git a/agent-gateway/src/main/java/io/agentteams/gateway/JdbcAgentStateStore.java b/agent-gateway/src/main/java/io/agentteams/gateway/JdbcAgentStateStore.java
+index 0032b2b..453cb6c 100644
+--- a/agent-gateway/src/main/java/io/agentteams/gateway/JdbcAgentStateStore.java
++++ b/agent-gateway/src/main/java/io/agentteams/gateway/JdbcAgentStateStore.java
+@@ -36,9 +36,11 @@ public class JdbcAgentStateStore implements GatewayStateStore {
+     public void registered(ConnectionRegistry.ConnectionSnapshot connection, Instant at) {
+         Objects.requireNonNull(connection, "connection");
+         Objects.requireNonNull(at, "at");
+-        UUID agentId = canonicalAgentId(connection.agentId());
+-        updateCanonicalAgentOnRegister(agentId, connection.runtime(), connection.capabilities(), at);
+-        jdbc.update(upsertSql(), connection.agentId(), connection.connectionId(), "ONLINE", "READY",
++        if (connection.identityKind() == GatewayIdentityKind.AGENT) {
++            UUID agentId = canonicalAgentId(connection.agentId());
++            updateCanonicalAgentOnRegister(agentId, connection.runtime(), connection.capabilities(), at);
++        }
++        jdbc.update(upsertSql(), connection.recipientKey(), connection.connectionId(), "ONLINE", "READY",
+                 connection.runtime(), connection.runtimeVersion(), capabilitiesJson(connection.capabilities()),
+                 connection.specDigest(), connection.configRevision(), connection.secretGeneration(),
+                 Timestamp.from(at), Timestamp.from(at), Timestamp.from(at), Timestamp.from(at));
+@@ -57,12 +59,14 @@ public class JdbcAgentStateStore implements GatewayStateStore {
+                 WHERE agent_id = ? AND connection_id = ?
+                 """, connection.runtime(), connection.runtimeVersion(), capabilitiesJson(connection.capabilities()),
+                 connection.specDigest(), connection.configRevision(), connection.secretGeneration(),
+-                Timestamp.from(at), Timestamp.from(at), connection.agentId(), connection.connectionId());
++                Timestamp.from(at), Timestamp.from(at), connection.recipientKey(), connection.connectionId());
+         if (owned == 0) {
+             return false;
+         }
+-        refreshCanonicalAgent(canonicalAgentId(connection.agentId()), connection.runtime(),
+-                connection.capabilities(), at);
++        if (connection.identityKind() == GatewayIdentityKind.AGENT) {
++            refreshCanonicalAgent(canonicalAgentId(connection.agentId()), connection.runtime(),
++                    connection.capabilities(), at);
++        }
+         reportOperation(connection, true, at);
+         return true;
+     }
+@@ -75,12 +79,14 @@ public class JdbcAgentStateStore implements GatewayStateStore {
+                 UPDATE gateway_agent_state
+                    SET presence = 'OFFLINE', phase = 'DISCONNECTED', disconnected_at = ?, updated_at = ?
+                  WHERE agent_id = ? AND connection_id = ?
+-                """, Timestamp.from(at), Timestamp.from(at), connection.agentId(), connection.connectionId());
++                """, Timestamp.from(at), Timestamp.from(at), connection.recipientKey(), connection.connectionId());
+         if (owned == 0) {
+             return false;
+         }
+-        updateCanonicalAgentOnDisconnect(canonicalAgentId(connection.agentId()), connection.runtime(),
+-                connection.capabilities(), at);
++        if (connection.identityKind() == GatewayIdentityKind.AGENT) {
++            updateCanonicalAgentOnDisconnect(canonicalAgentId(connection.agentId()), connection.runtime(),
++                    connection.capabilities(), at);
++        }
+         reportOperation(connection, false, at);
+         return true;
+     }
+diff --git a/agent-gateway/src/main/java/io/agentteams/gateway/JdbcAttemptCapabilityVerifier.java b/agent-gateway/src/main/java/io/agentteams/gateway/JdbcAttemptCapabilityVerifier.java
+new file mode 100644
+index 0000000..4b89c52
+--- /dev/null
++++ b/agent-gateway/src/main/java/io/agentteams/gateway/JdbcAttemptCapabilityVerifier.java
+@@ -0,0 +1,63 @@
++package io.agentteams.gateway;
++
++import io.agentteams.contracts.v1.EventMetadata;
++import java.nio.charset.StandardCharsets;
++import java.security.MessageDigest;
++import java.security.NoSuchAlgorithmException;
++import java.util.HexFormat;
++import java.util.UUID;
++import java.util.regex.Pattern;
++import org.springframework.jdbc.core.JdbcTemplate;
++
++/** Validates a slot's short-lived Attempt capability through the narrow database function. */
++public final class JdbcAttemptCapabilityVerifier implements AttemptCapabilityVerifier {
++    private static final Pattern TOKEN = Pattern.compile("cap_[A-Za-z0-9_-]{43}");
++    private static final String SQL = """
++            SELECT public.credential_proxy_gateway_validate_attempt_capability(?, ?, ?, ?, ?, ?)
++            """;
++
++    private final JdbcTemplate jdbc;
++
++    public JdbcAttemptCapabilityVerifier(JdbcTemplate jdbc) {
++        this.jdbc = java.util.Objects.requireNonNull(jdbc, "jdbc");
++    }
++
++    @Override
++    public boolean valid(ConnectionRegistry.ConnectionSnapshot connection, EventMetadata metadata) {
++        if (connection == null || connection.identityKind() != GatewayIdentityKind.WORKER_SLOT) {
++            return false;
++        }
++        try {
++            return valid(UUID.fromString(connection.agentId()), metadata);
++        } catch (IllegalArgumentException malformed) {
++            return false;
++        }
++    }
++
++    @Override
++    public boolean valid(UUID slotId, EventMetadata metadata) {
++        if (slotId == null || metadata == null || !TOKEN.matcher(metadata.getAttemptCapability()).matches()) {
++            return false;
++        }
++        try {
++            UUID agentId = UUID.fromString(metadata.getAgentId());
++            UUID taskId = UUID.fromString(metadata.getTaskId());
++            UUID attemptId = UUID.fromString(metadata.getAttemptId());
++            UUID leaseId = UUID.fromString(metadata.getLeaseId());
++            Boolean authorized = jdbc.queryForObject(SQL, Boolean.class, sha256(metadata.getAttemptCapability()),
++                    slotId, agentId, taskId, attemptId, leaseId);
++            return Boolean.TRUE.equals(authorized);
++        } catch (IllegalArgumentException malformed) {
++            return false;
++        }
++    }
++
++    private static String sha256(String value) {
++        try {
++            return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
++                    .digest(value.getBytes(StandardCharsets.UTF_8)));
++        } catch (NoSuchAlgorithmException impossible) {
++            throw new IllegalStateException("SHA-256 is unavailable", impossible);
++        }
++    }
++}
+diff --git a/agent-gateway/src/main/java/io/agentteams/gateway/SessionTokenAuthenticator.java b/agent-gateway/src/main/java/io/agentteams/gateway/SessionTokenAuthenticator.java
+index d83f52b..87761b2 100644
+--- a/agent-gateway/src/main/java/io/agentteams/gateway/SessionTokenAuthenticator.java
++++ b/agent-gateway/src/main/java/io/agentteams/gateway/SessionTokenAuthenticator.java
+@@ -38,7 +38,7 @@ public final class SessionTokenAuthenticator implements AgentAuthenticator {
+             return AuthenticationDecision.rejected("agent identity is invalid");
+         }
+         return found.get().agentId().equals(claimed)
+-                ? AuthenticationDecision.allow()
++                ? AuthenticationDecision.allow(found.get().identityKind())
+                 : AuthenticationDecision.rejected("session agent does not match Hello agent");
+     }
+
+diff --git a/agent-gateway/src/main/java/io/agentteams/gateway/TaskAssignedCommandHandler.java b/agent-gateway/src/main/java/io/agentteams/gateway/TaskAssignedCommandHandler.java
+index 272f4aa..3db622a 100644
+--- a/agent-gateway/src/main/java/io/agentteams/gateway/TaskAssignedCommandHandler.java
++++ b/agent-gateway/src/main/java/io/agentteams/gateway/TaskAssignedCommandHandler.java
+@@ -70,6 +70,7 @@ public final class TaskAssignedCommandHandler {
+                 .build();
+         TaskAssigned.Builder assignedBuilder = TaskAssigned.newBuilder()
+                 .setMetadata(metadata)
++                .setAssignmentId(payload.assignmentId().toString())
+                 .setTaskType(taskFields.taskType())
+                 .setInputJson(taskFields.inputJson())
+                 .addAllRequiredCapabilities(taskFields.requiredCapabilities())
+diff --git a/agent-gateway/src/test/java/io/agentteams/gateway/ArtifactUploadHandlerTest.java b/agent-gateway/src/test/java/io/agentteams/gateway/ArtifactUploadHandlerTest.java
+index 98458fc..10ee2e3 100644
+--- a/agent-gateway/src/test/java/io/agentteams/gateway/ArtifactUploadHandlerTest.java
++++ b/agent-gateway/src/test/java/io/agentteams/gateway/ArtifactUploadHandlerTest.java
+@@ -17,22 +17,28 @@ import java.time.Duration;
+ import java.time.Instant;
+ import java.time.ZoneOffset;
+ import java.util.ArrayList;
++import java.util.HexFormat;
+ import java.util.List;
++import java.util.Optional;
+ import java.util.UUID;
++import java.security.MessageDigest;
+ import java.util.function.Supplier;
+ import org.junit.jupiter.api.Test;
+
+ class ArtifactUploadHandlerTest {
+     private static final String TASK_ID = UUID.randomUUID().toString();
+     private static final String ATTEMPT_ID = UUID.randomUUID().toString();
++    private static final UUID AGENT_ID = UUID.randomUUID();
+
+     /** 现有用例默认持有传输凭证；空白凭证场景由专门的拒绝用例覆盖。 */
+-    private static final Supplier<String> CREDENTIAL = () -> "worker-1";
++    private static final String SESSION_TOKEN = "worker-session-token";
++    private static final Supplier<String> CREDENTIAL = () -> SESSION_TOKEN;
+
+     @Test
+     void mapsPrepareToBridgeAndReturnsPresignedTicket() {
+         RecordingBridge bridge = new RecordingBridge();
+-        ArtifactUploadHandler handler = new ArtifactUploadHandler(bridge, Clock.systemUTC(), CREDENTIAL);
++        ArtifactUploadHandler handler = new ArtifactUploadHandler(bridge, Clock.systemUTC(), CREDENTIAL,
++                activeSessionFor(AGENT_ID));
+         RecordingObserver<PrepareArtifactUploadResponse> observer = new RecordingObserver<>();
+
+         handler.prepareTaskArtifactUpload(prepareRequest(), observer);
+@@ -49,7 +55,7 @@ class ArtifactUploadHandlerTest {
+         assertThat(bridge.prepares).singleElement().satisfies(call -> {
+             assertThat(call.taskId()).isEqualTo(TASK_ID);
+             assertThat(call.attemptId()).isEqualTo(ATTEMPT_ID);
+-            assertThat(call.agentId()).isEqualTo("worker-1");
++            assertThat(call.agentId()).isEqualTo(AGENT_ID.toString());
+             assertThat(call.name()).isEqualTo("plan.md");
+             assertThat(call.contentType()).isEqualTo("text/markdown");
+             // Without a deadline the presign window stays at the default.
+@@ -57,11 +63,118 @@ class ArtifactUploadHandlerTest {
+         });
+     }
+
++    @Test
++    void rejectsArtifactRequestForAgentOtherThanAuthenticatedSession() {
++        RecordingBridge bridge = new RecordingBridge();
++        ArtifactUploadHandler handler = new ArtifactUploadHandler(bridge, Clock.systemUTC(), CREDENTIAL,
++                activeSessionFor(AGENT_ID));
++        RecordingObserver<PrepareArtifactUploadResponse> observer = new RecordingObserver<>();
++        PrepareArtifactUploadRequest forged = PrepareArtifactUploadRequest.newBuilder()
++                .mergeFrom(prepareRequest())
++                .setAgentId(UUID.randomUUID().toString())
++                .build();
++
++        handler.prepareTaskArtifactUpload(forged, observer);
++
++        assertThat(observer.values).singleElement().satisfies(response -> assertThat(response.getAccepted()).isFalse());
++        assertThat(bridge.prepares).isEmpty();
++    }
++
++    @Test
++    void rejectsWorkerSlotSessionForArtifactOperationsUntilAttemptCapabilityExists() {
++        RecordingBridge bridge = new RecordingBridge();
++        String token = "worker-slot-token";
++        String hash = SessionTokenAuthenticator.sha256(token);
++        AgentSessionStore slotSession = candidate -> hash.equals(candidate)
++                ? java.util.Optional.of(new AgentSession(AGENT_ID, hash, Instant.now().plusSeconds(60), false,
++                        GatewayIdentityKind.WORKER_SLOT))
++                : java.util.Optional.empty();
++        ArtifactUploadHandler handler = new ArtifactUploadHandler(bridge, Clock.systemUTC(), () -> token, slotSession);
++        RecordingObserver<PrepareArtifactUploadResponse> prepare = new RecordingObserver<>();
++        RecordingObserver<CompleteArtifactUploadResponse> complete = new RecordingObserver<>();
++
++        handler.prepareTaskArtifactUpload(prepareRequest(), prepare);
++        handler.completeTaskArtifactUpload(completeRequest(), complete);
++
++        assertThat(prepare.values).singleElement().satisfies(response -> {
++            assertThat(response.getAccepted()).isFalse();
++            assertThat(response.getProtocolError())
++                    .isEqualTo(ArtifactProtocolError.ARTIFACT_PROTOCOL_ERROR_UNAUTHENTICATED);
++        });
++        assertThat(complete.values).singleElement().satisfies(response -> {
++            assertThat(response.getAccepted()).isFalse();
++            assertThat(response.getProtocolError())
++                    .isEqualTo(ArtifactProtocolError.ARTIFACT_PROTOCOL_ERROR_UNAUTHENTICATED);
++        });
++        assertThat(bridge.prepares).isEmpty();
++        assertThat(bridge.completes).isEmpty();
++    }
++
++    @Test
++    void acceptsSlotArtifactCallsOnlyWithLiveMatchingAttemptCapability() {
++        RecordingBridge bridge = new RecordingBridge();
++        String token = "worker-slot-token";
++        String hash = SessionTokenAuthenticator.sha256(token);
++        UUID slotId = UUID.randomUUID();
++        AgentSessionStore slotSession = candidate -> hash.equals(candidate)
++                ? Optional.of(new AgentSession(slotId, hash, Instant.now().plusSeconds(60), false,
++                        GatewayIdentityKind.WORKER_SLOT))
++                : Optional.empty();
++        AttemptCapabilityVerifier verifier = new AttemptCapabilityVerifier() {
++            @Override
++            public boolean valid(ConnectionRegistry.ConnectionSnapshot connection, EventMetadata metadata) {
++                return false;
++            }
++
++            @Override
++            public boolean valid(UUID suppliedSlotId, EventMetadata metadata) {
++                return slotId.equals(suppliedSlotId) && metadata.getAttemptCapability().equals("cap_valid")
++                        && metadata.getTaskId().equals(TASK_ID) && metadata.getAttemptId().equals(ATTEMPT_ID)
++                        && !metadata.getLeaseId().isBlank();
++            }
++        };
++        ArtifactUploadHandler handler = new ArtifactUploadHandler(bridge, Clock.systemUTC(), () -> token,
++                slotSession, verifier);
++        EventMetadata metadata = prepareRequest().getMetadata().toBuilder().setAttemptCapability("cap_valid").build();
++        PrepareArtifactUploadRequest request = prepareRequest().toBuilder().setMetadata(metadata).build();
++        RecordingObserver<PrepareArtifactUploadResponse> accepted = new RecordingObserver<>();
++        handler.prepareTaskArtifactUpload(request, accepted);
++        assertThat(accepted.values).singleElement().satisfies(response -> assertThat(response.getAccepted()).isTrue());
++        assertThat(bridge.prepares).hasSize(1);
++
++        CompleteArtifactUploadRequest completeRequest = completeRequest().toBuilder()
++                .setMetadata(completeRequest().getMetadata().toBuilder().setAttemptCapability("cap_valid")).build();
++        RecordingObserver<CompleteArtifactUploadResponse> completed = new RecordingObserver<>();
++        handler.completeTaskArtifactUpload(completeRequest, completed);
++        assertThat(completed.values).singleElement().satisfies(response -> assertThat(response.getAccepted()).isTrue());
++        assertThat(bridge.completes).hasSize(1);
++
++        RecordingObserver<PrepareArtifactUploadResponse> denied = new RecordingObserver<>();
++        handler.prepareTaskArtifactUpload(request.toBuilder()
++                .setMetadata(metadata.toBuilder().setAttemptCapability("cap_wrong")).build(), denied);
++        assertThat(denied.values).singleElement().satisfies(response -> {
++            assertThat(response.getAccepted()).isFalse();
++            assertThat(response.getProtocolError())
++                    .isEqualTo(ArtifactProtocolError.ARTIFACT_PROTOCOL_ERROR_UNAUTHENTICATED);
++        });
++        assertThat(bridge.prepares).hasSize(1);
++        RecordingObserver<CompleteArtifactUploadResponse> rejectedComplete = new RecordingObserver<>();
++        handler.completeTaskArtifactUpload(completeRequest.toBuilder()
++                .setMetadata(completeRequest.getMetadata().toBuilder().setAttemptCapability("cap_wrong")).build(),
++                rejectedComplete);
++        assertThat(rejectedComplete.values).singleElement().satisfies(response -> {
++            assertThat(response.getAccepted()).isFalse();
++            assertThat(response.getProtocolError())
++                    .isEqualTo(ArtifactProtocolError.ARTIFACT_PROTOCOL_ERROR_UNAUTHENTICATED);
++        });
++        assertThat(bridge.completes).hasSize(1);
++    }
++
+     @Test
+     void clampsThePresignWindowToTheWorkerDeadline() {
+         RecordingBridge bridge = new RecordingBridge();
+         Clock clock = Clock.fixed(Instant.EPOCH, ZoneOffset.UTC);
+-        ArtifactUploadHandler handler = new ArtifactUploadHandler(bridge, clock, CREDENTIAL);
++        ArtifactUploadHandler handler = new ArtifactUploadHandler(bridge, clock, CREDENTIAL, activeSessionFor(AGENT_ID));
+         RecordingObserver<PrepareArtifactUploadResponse> observer = new RecordingObserver<>();
+         PrepareArtifactUploadRequest request = PrepareArtifactUploadRequest.newBuilder()
+                 .mergeFrom(prepareRequest())
+@@ -77,7 +190,7 @@ class ArtifactUploadHandlerTest {
+     @Test
+     void rejectsMalformedPrepareWithoutCallingTheBridge() {
+         RecordingBridge bridge = new RecordingBridge();
+-        ArtifactUploadHandler handler = new ArtifactUploadHandler(bridge, Clock.systemUTC(), CREDENTIAL);
++        ArtifactUploadHandler handler = new ArtifactUploadHandler(bridge, Clock.systemUTC(), CREDENTIAL, activeSessionFor(AGENT_ID));
+         RecordingObserver<PrepareArtifactUploadResponse> observer = new RecordingObserver<>();
+
+         handler.prepareTaskArtifactUpload(PrepareArtifactUploadRequest.newBuilder()
+@@ -97,7 +210,7 @@ class ArtifactUploadHandlerTest {
+         RecordingBridge bridge = new RecordingBridge();
+         bridge.prepareError = new ControlPlaneArtifactUploadClient.ControlPlaneInvocationException(
+                 "Control Plane artifact endpoint returned HTTP 403", 403);
+-        ArtifactUploadHandler handler = new ArtifactUploadHandler(bridge, Clock.systemUTC(), CREDENTIAL);
++        ArtifactUploadHandler handler = new ArtifactUploadHandler(bridge, Clock.systemUTC(), CREDENTIAL, activeSessionFor(AGENT_ID));
+         RecordingObserver<PrepareArtifactUploadResponse> observer = new RecordingObserver<>();
+
+         handler.prepareTaskArtifactUpload(prepareRequest(), observer);
+@@ -112,7 +225,7 @@ class ArtifactUploadHandlerTest {
+     @Test
+     void mapsCompleteToBridgeAndReturnsArtifactId() {
+         RecordingBridge bridge = new RecordingBridge();
+-        ArtifactUploadHandler handler = new ArtifactUploadHandler(bridge, Clock.systemUTC(), CREDENTIAL);
++        ArtifactUploadHandler handler = new ArtifactUploadHandler(bridge, Clock.systemUTC(), CREDENTIAL, activeSessionFor(AGENT_ID));
+         RecordingObserver<CompleteArtifactUploadResponse> observer = new RecordingObserver<>();
+
+         handler.completeTaskArtifactUpload(completeRequest(), observer);
+@@ -136,7 +249,7 @@ class ArtifactUploadHandlerTest {
+     @Test
+     void rejectsMalformedCompleteWithoutCallingTheBridge() {
+         RecordingBridge bridge = new RecordingBridge();
+-        ArtifactUploadHandler handler = new ArtifactUploadHandler(bridge, Clock.systemUTC(), CREDENTIAL);
++        ArtifactUploadHandler handler = new ArtifactUploadHandler(bridge, Clock.systemUTC(), CREDENTIAL, activeSessionFor(AGENT_ID));
+         RecordingObserver<CompleteArtifactUploadResponse> observer = new RecordingObserver<>();
+
+         handler.completeTaskArtifactUpload(CompleteArtifactUploadRequest.newBuilder()
+@@ -153,9 +266,8 @@ class ArtifactUploadHandlerTest {
+     @Test
+     void rejectsPrepareWithoutTransportCredential() {
+         RecordingBridge bridge = new RecordingBridge();
+-        // 公理二：无传输凭证（x-agent-token/Bearer）的 unary 调用直接拒绝，
+-        // 不触碰 Control Plane。凭证有效性由未来的认证端口校验。
+-        ArtifactUploadHandler handler = new ArtifactUploadHandler(bridge, Clock.systemUTC(), () -> "");
++        // Empty session bearer is rejected before calling the Control Plane.
++        ArtifactUploadHandler handler = new ArtifactUploadHandler(bridge, Clock.systemUTC(), () -> "", activeSessionFor(AGENT_ID));
+         RecordingObserver<PrepareArtifactUploadResponse> observer = new RecordingObserver<>();
+
+         handler.prepareTaskArtifactUpload(prepareRequest(), observer);
+@@ -171,7 +283,7 @@ class ArtifactUploadHandlerTest {
+     @Test
+     void rejectsCompleteWithoutTransportCredential() {
+         RecordingBridge bridge = new RecordingBridge();
+-        ArtifactUploadHandler handler = new ArtifactUploadHandler(bridge, Clock.systemUTC(), () -> "");
++        ArtifactUploadHandler handler = new ArtifactUploadHandler(bridge, Clock.systemUTC(), () -> "", activeSessionFor(AGENT_ID));
+         RecordingObserver<CompleteArtifactUploadResponse> observer = new RecordingObserver<>();
+
+         handler.completeTaskArtifactUpload(completeRequest(), observer);
+@@ -188,7 +300,7 @@ class ArtifactUploadHandlerTest {
+     void rejectsWrongTransportCredential() {
+         RecordingBridge bridge = new RecordingBridge();
+         ArtifactUploadHandler handler = new ArtifactUploadHandler(bridge, Clock.systemUTC(),
+-                () -> "wrong-token", () -> "worker-gateway-token");
++                () -> "wrong-token", activeSessionFor(AGENT_ID));
+         RecordingObserver<PrepareArtifactUploadResponse> observer = new RecordingObserver<>();
+
+         handler.prepareTaskArtifactUpload(prepareRequest(), observer);
+@@ -205,23 +317,36 @@ class ArtifactUploadHandlerTest {
+         return PrepareArtifactUploadRequest.newBuilder()
+                 .setMetadata(EventMetadata.newBuilder()
+                         .setEventId(UUID.randomUUID().toString())
+-                        .setAgentId("worker-1").setTaskId(TASK_ID).setAttemptId(ATTEMPT_ID)
++                        .setAgentId(AGENT_ID.toString()).setTaskId(TASK_ID).setAttemptId(ATTEMPT_ID)
+                         .setLeaseId(UUID.randomUUID().toString()))
+                 .setProtocolVersion(ProtocolVersion.newBuilder().setMajor(2).setMinor(3))
+-                .setTaskId(TASK_ID).setAttemptId(ATTEMPT_ID).setAgentId("worker-1")
++                .setTaskId(TASK_ID).setAttemptId(ATTEMPT_ID).setAgentId(AGENT_ID.toString())
+                 .setName("plan.md").setContentType("text/markdown")
+                 .setSizeBytes(9)
+                 .build();
+     }
+
++    private static AgentSessionStore activeSessionFor(UUID agentId) {
++        String tokenHash;
++        try {
++            tokenHash = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
++                    .digest(SESSION_TOKEN.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
++        } catch (java.security.NoSuchAlgorithmException impossible) {
++            throw new IllegalStateException(impossible);
++        }
++        return suppliedHash -> tokenHash.equals(suppliedHash)
++                ? Optional.of(new AgentSession(agentId, tokenHash, Instant.now().plusSeconds(300), false))
++                : Optional.empty();
++    }
++
+     private static CompleteArtifactUploadRequest completeRequest() {
+         return CompleteArtifactUploadRequest.newBuilder()
+                 .setMetadata(EventMetadata.newBuilder()
+                         .setEventId(UUID.randomUUID().toString())
+-                        .setAgentId("worker-1").setTaskId(TASK_ID).setAttemptId(ATTEMPT_ID)
++                        .setAgentId(AGENT_ID.toString()).setTaskId(TASK_ID).setAttemptId(ATTEMPT_ID)
+                         .setLeaseId(UUID.randomUUID().toString()))
+                 .setProtocolVersion(ProtocolVersion.newBuilder().setMajor(2).setMinor(3))
+-                .setTaskId(TASK_ID).setAttemptId(ATTEMPT_ID).setAgentId("worker-1")
++                .setTaskId(TASK_ID).setAttemptId(ATTEMPT_ID).setAgentId(AGENT_ID.toString())
+                 .setName("plan.md").setContentType("text/markdown")
+                 .setStorageKey("tasks/" + TASK_ID + "/attempts/" + ATTEMPT_ID + "/artifacts/plan.md")
+                 .setSizeBytes(9).setSha256("abc")
+diff --git a/agent-gateway/src/test/java/io/agentteams/gateway/ArtifactUploadWiringTest.java b/agent-gateway/src/test/java/io/agentteams/gateway/ArtifactUploadWiringTest.java
+index e8cf191..7e8effb 100644
+--- a/agent-gateway/src/test/java/io/agentteams/gateway/ArtifactUploadWiringTest.java
++++ b/agent-gateway/src/test/java/io/agentteams/gateway/ArtifactUploadWiringTest.java
+@@ -31,8 +31,8 @@ class ArtifactUploadWiringTest {
+                 .withPropertyValues("agentteams.gateway.grpc.port=0",
+                         "agentteams.gateway.artifact.enabled=true",
+                         "agentteams.gateway.artifact.control-plane-url=http://control-plane:8080",
+-                        "agentteams.gateway.artifact.internal-token=kind-quota-internal",
+-                        "agentteams.gateway.artifact.worker-token=worker-gateway-token")
++                        "agentteams.gateway.artifact.internal-token=kind-quota-internal")
++                .withBean(AgentSessionStore.class, () -> tokenHash -> java.util.Optional.empty())
+                 .run(context -> {
+                     assertThat(context).hasSingleBean(ControlPlaneArtifactUploadClient.class);
+                     assertThat(context).hasSingleBean(ArtifactUploadHandler.class);
+diff --git a/agent-gateway/src/test/java/io/agentteams/gateway/ConnectionRegistryTest.java b/agent-gateway/src/test/java/io/agentteams/gateway/ConnectionRegistryTest.java
+index 822851e..e465383 100644
+--- a/agent-gateway/src/test/java/io/agentteams/gateway/ConnectionRegistryTest.java
++++ b/agent-gateway/src/test/java/io/agentteams/gateway/ConnectionRegistryTest.java
+@@ -38,6 +38,22 @@ class ConnectionRegistryTest {
+                 .doesNotContain("task", "taskId", "attemptId", "inputJson", "taskState");
+     }
+
++    @Test
++    void keepsAgentAndWorkerSlotConnectionsSeparateEvenWhenTheirIdsMatch() {
++        ConnectionRegistry registry = new ConnectionRegistry();
++        Instant at = Instant.parse("2026-08-16T00:00:00Z");
++        String sharedId = UUID.randomUUID().toString();
++        AgentConnection agent = registry.open(sink(), "agent-peer", at);
++        AgentConnection slot = registry.open(sink(), "slot-peer", at);
++        registry.register(agent, new AgentProfile(sharedId, "agentscope", "0.4.0", Map.of()), 0, at);
++        registry.register(slot, new AgentProfile(sharedId, "agentscope", "0.4.0", Map.of(),
++                "", "", "", GatewayIdentityKind.WORKER_SLOT), 0, at);
++
++        assertThat(registry.current(sharedId)).contains(agent);
++        assertThat(registry.current(GatewayIdentityKind.WORKER_SLOT, sharedId)).contains(slot);
++        assertThat(registry.snapshot(slot).orElseThrow().recipientKey()).isEqualTo("worker-slot:" + sharedId);
++    }
++
+     @Test
+     void replacingConnectionActivelyClosesOldStreamWithNonRetryableStaleReason() {
+         List<AgentConnection> terminated = new ArrayList<>();
+diff --git a/agent-gateway/src/test/java/io/agentteams/gateway/InboundEventHandlerTest.java b/agent-gateway/src/test/java/io/agentteams/gateway/InboundEventHandlerTest.java
+index 230b12e..838eb96 100644
+--- a/agent-gateway/src/test/java/io/agentteams/gateway/InboundEventHandlerTest.java
++++ b/agent-gateway/src/test/java/io/agentteams/gateway/InboundEventHandlerTest.java
+@@ -8,6 +8,7 @@ import io.grpc.stub.StreamObserver;
+ import java.time.Clock;
+ import java.time.Instant;
+ import java.time.ZoneOffset;
++import java.util.Map;
+ import org.junit.jupiter.api.Test;
+
+ class InboundEventHandlerTest {
+@@ -31,6 +32,76 @@ class InboundEventHandlerTest {
+                 .containsExactly("accepted-1");
+     }
+
++    @Test
++    void refusesExecutionEventsFromSlotIdentityUntilAttemptCapabilityExists() {
++        ConnectionRegistry registry = new ConnectionRegistry();
++        GatewayTestFixtures.RecordingInboundStore eventStore = new GatewayTestFixtures.RecordingInboundStore();
++        GatewayTestFixtures.RecordingApplicationHandler application =
++                new GatewayTestFixtures.RecordingApplicationHandler();
++        InboundEventHandler handler = handler(registry, eventStore, application);
++        AgentConnection slot = registry.open(new GatewayTestFixtures.RecordingObserver(), "slot-peer", fixedClock().instant());
++        registry.register(slot, new AgentProfile("slot-1", "agentscope", "0.4.0", Map.of(),
++                "", "", "", GatewayIdentityKind.WORKER_SLOT), 0, fixedClock().instant());
++
++        assertThatThrownBy(() -> handler.handle(slot, GatewayTestFixtures.accepted("slot-1", "slot-event")))
++                .isInstanceOf(GatewayExceptions.InvalidMessage.class)
++                .hasMessageContaining("Attempt capability");
++        assertThat(eventStore.seen).isEmpty();
++        assertThat(application.accepted).isEmpty();
++    }
++
++    @Test
++    void validatesAndStripsSlotAttemptCapabilityBeforeForwardingExecutionEvent() {
++        ConnectionRegistry registry = new ConnectionRegistry();
++        GatewayTestFixtures.RecordingInboundStore eventStore = new GatewayTestFixtures.RecordingInboundStore();
++        GatewayTestFixtures.RecordingApplicationHandler application =
++                new GatewayTestFixtures.RecordingApplicationHandler();
++        java.util.List<String> validated = new java.util.ArrayList<>();
++        AttemptCapabilityVerifier verifier = (connection, metadata) -> {
++            validated.add(metadata.getAttemptCapability());
++            return connection.identityKind() == GatewayIdentityKind.WORKER_SLOT
++                    && connection.agentId().equals("slot-1")
++                    && metadata.getAgentId().equals("tenant-agent-1");
++        };
++        InboundEventHandler handler = handler(registry, eventStore, application, verifier);
++        AgentConnection slot = registry.open(new GatewayTestFixtures.RecordingObserver(), "slot-peer", fixedClock().instant());
++        registry.register(slot, new AgentProfile("slot-1", "agentscope", "0.4.0", Map.of(),
++                "", "", "", GatewayIdentityKind.WORKER_SLOT), 0, fixedClock().instant());
++        AgentMessage input = GatewayTestFixtures.accepted("tenant-agent-1", "slot-event");
++        AgentMessage message = input.toBuilder().setTaskAccepted(input.getTaskAccepted().toBuilder()
++                .setMetadata(input.getTaskAccepted().getMetadata().toBuilder()
++                        .setAttemptCapability("cap_valid_attempt_token"))).build();
++
++        handler.handle(slot, message);
++
++        assertThat(validated).containsExactly("cap_valid_attempt_token");
++        assertThat(eventStore.agents).containsExactly("worker-slot:slot-1");
++        assertThat(application.accepted).singleElement().satisfies(event ->
++                assertThat(event.getMetadata().getAttemptCapability()).isEmpty());
++    }
++
++    @Test
++    void rejectsSlotExecutionEventWhenAttemptCapabilityDoesNotMatchAuthenticatedSlot() {
++        ConnectionRegistry registry = new ConnectionRegistry();
++        GatewayTestFixtures.RecordingInboundStore eventStore = new GatewayTestFixtures.RecordingInboundStore();
++        GatewayTestFixtures.RecordingApplicationHandler application =
++                new GatewayTestFixtures.RecordingApplicationHandler();
++        InboundEventHandler handler = handler(registry, eventStore, application, (connection, metadata) -> false);
++        AgentConnection slot = registry.open(new GatewayTestFixtures.RecordingObserver(), "slot-peer", fixedClock().instant());
++        registry.register(slot, new AgentProfile("slot-1", "agentscope", "0.4.0", Map.of(),
++                "", "", "", GatewayIdentityKind.WORKER_SLOT), 0, fixedClock().instant());
++        AgentMessage input = GatewayTestFixtures.accepted("tenant-agent-1", "forged-slot-event");
++        AgentMessage message = input.toBuilder().setTaskAccepted(input.getTaskAccepted().toBuilder()
++                .setMetadata(input.getTaskAccepted().getMetadata().toBuilder()
++                        .setAttemptCapability("cap_other_attempt_token"))).build();
++
++        assertThatThrownBy(() -> handler.handle(slot, message))
++                .isInstanceOf(GatewayExceptions.InvalidMessage.class)
++                .hasMessageContaining("Attempt capability");
++        assertThat(eventStore.seen).isEmpty();
++        assertThat(application.accepted).isEmpty();
++    }
++
+     @Test
+     void forwardsProgressToPortAndApplication() {
+         GatewayTestFixtures.RecordingInboundStore eventStore = new GatewayTestFixtures.RecordingInboundStore();
+@@ -218,6 +289,15 @@ class InboundEventHandlerTest {
+         return new InboundEventHandler(registry, eventStore, application, delivery, fixedClock());
+     }
+
++    private static InboundEventHandler handler(ConnectionRegistry registry,
++            GatewayTestFixtures.RecordingInboundStore eventStore,
++            GatewayTestFixtures.RecordingApplicationHandler application,
++            AttemptCapabilityVerifier verifier) {
++        CommandDeliveryService delivery = new CommandDeliveryService(registry,
++                new GatewayTestFixtures.RecordingCommandStore(), fixedClock());
++        return new InboundEventHandler(registry, eventStore, application, delivery, fixedClock(), verifier);
++    }
++
+     private static Clock fixedClock() {
+         return Clock.fixed(Instant.parse("2026-08-16T00:00:00Z"), ZoneOffset.UTC);
+     }
+diff --git a/agent-gateway/src/test/java/io/agentteams/gateway/JdbcAgentSessionStoreTest.java b/agent-gateway/src/test/java/io/agentteams/gateway/JdbcAgentSessionStoreTest.java
+index 27c9f98..1a69bc6 100644
+--- a/agent-gateway/src/test/java/io/agentteams/gateway/JdbcAgentSessionStoreTest.java
++++ b/agent-gateway/src/test/java/io/agentteams/gateway/JdbcAgentSessionStoreTest.java
+@@ -15,10 +15,38 @@ class JdbcAgentSessionStoreTest {
+     void delegatesHashedLookupToDatabase() {
+         JdbcTemplate jdbc = mock(JdbcTemplate.class);
+         UUID agentId = UUID.randomUUID();
+-        when(jdbc.query(any(String.class), any(RowMapper.class), any(Object.class))).thenAnswer(invocation ->
++        when(jdbc.query(any(String.class), any(RowMapper.class), any(Object[].class))).thenAnswer(invocation ->
+                 java.util.List.of(new AgentSession(agentId, "a".repeat(64),
+                         java.time.Instant.parse("2026-08-16T00:01:00Z"), false)));
+         assertThat(new JdbcAgentSessionStore(jdbc).findByTokenSha256("a".repeat(64)))
+                 .get().extracting(AgentSession::agentId).isEqualTo(agentId);
+     }
++
++    @Test
++    void preservesWorkerSlotIdentityFromDatabaseLookup() {
++        JdbcTemplate jdbc = mock(JdbcTemplate.class);
++        UUID slotId = UUID.randomUUID();
++        when(jdbc.query(any(String.class), any(RowMapper.class), any(Object[].class))).thenAnswer(invocation ->
++                java.util.List.of(new AgentSession(slotId, "b".repeat(64),
++                        java.time.Instant.parse("2026-08-16T00:01:00Z"), false, GatewayIdentityKind.WORKER_SLOT)));
++
++        assertThat(new JdbcAgentSessionStore(jdbc).findByTokenSha256("b".repeat(64)))
++                .get().satisfies(session -> {
++                    assertThat(session.agentId()).isEqualTo(slotId);
++                    assertThat(session.identityKind()).isEqualTo(GatewayIdentityKind.WORKER_SLOT);
++                });
++    }
++
++    @Test
++    void rejectsAmbiguousBearerPresentInBothIdentityStores() {
++        JdbcTemplate jdbc = mock(JdbcTemplate.class);
++        UUID agentId = UUID.randomUUID();
++        UUID slotId = UUID.randomUUID();
++        when(jdbc.query(any(String.class), any(RowMapper.class), any(Object[].class))).thenReturn(java.util.List.of(
++                new AgentSession(agentId, "c".repeat(64), java.time.Instant.MAX, false),
++                new AgentSession(slotId, "c".repeat(64), java.time.Instant.MAX, false,
++                        GatewayIdentityKind.WORKER_SLOT)));
++
++        assertThat(new JdbcAgentSessionStore(jdbc).findByTokenSha256("c".repeat(64))).isEmpty();
++    }
+ }
+diff --git a/agent-gateway/src/test/java/io/agentteams/gateway/JdbcAgentStateStoreTest.java b/agent-gateway/src/test/java/io/agentteams/gateway/JdbcAgentStateStoreTest.java
+index 68c6526..017b614 100644
+--- a/agent-gateway/src/test/java/io/agentteams/gateway/JdbcAgentStateStoreTest.java
++++ b/agent-gateway/src/test/java/io/agentteams/gateway/JdbcAgentStateStoreTest.java
+@@ -42,6 +42,22 @@ class JdbcAgentStateStoreTest {
+         assertThat(canonicalArgs.getValue()).contains(agentId, "READY", "deepseek-worker");
+     }
+
++    @Test
++    void projectsWorkerSlotPresenceWithoutMutatingTenantAgentState() {
++        JdbcTemplate jdbc = org.mockito.Mockito.mock(JdbcTemplate.class);
++        JdbcAgentStateStore store = new JdbcAgentStateStore(jdbc);
++        UUID slotId = UUID.randomUUID();
++        ConnectionRegistry.ConnectionSnapshot connection = new ConnectionRegistry.ConnectionSnapshot(
++                UUID.randomUUID(), slotId.toString(), "agentscope", "0.4.0", "", "", "",
++                Map.of("tasks", "1"), Instant.parse("2026-08-16T00:00:00Z"), 0,
++                GatewayIdentityKind.WORKER_SLOT);
++
++        store.registered(connection, Instant.parse("2026-08-16T00:00:00Z"));
++
++        verify(jdbc).update(contains("gateway_agent_state"), any(Object[].class));
++        verify(jdbc, org.mockito.Mockito.never()).update(contains("UPDATE agents"), any(Object[].class));
++    }
++
+     @Test
+     void persistsWorkerVersionFactsInGatewayProjection() {
+         JdbcTemplate jdbc = org.mockito.Mockito.mock(JdbcTemplate.class);
+diff --git a/agent-gateway/src/test/java/io/agentteams/gateway/SessionTokenAuthenticatorTest.java b/agent-gateway/src/test/java/io/agentteams/gateway/SessionTokenAuthenticatorTest.java
+index ce48129..7673675 100644
+--- a/agent-gateway/src/test/java/io/agentteams/gateway/SessionTokenAuthenticatorTest.java
++++ b/agent-gateway/src/test/java/io/agentteams/gateway/SessionTokenAuthenticatorTest.java
+@@ -29,6 +29,21 @@ class SessionTokenAuthenticatorTest {
+         assertThat(authenticator.authenticate(connection("wrong"), hello).accepted()).isFalse();
+     }
+
++    @Test
++    void authenticatesWorkerSlotAsTenantNeutralIdentity() {
++        String token = "slot-secret-token";
++        AgentSession session = new AgentSession(AGENT, SessionTokenAuthenticator.sha256(token),
++                NOW.plusSeconds(60), false, GatewayIdentityKind.WORKER_SLOT);
++        SessionTokenAuthenticator authenticator = new SessionTokenAuthenticator(
++                hash -> hash.equals(session.tokenSha256()) ? Optional.of(session) : Optional.empty(),
++                Clock.fixed(NOW, ZoneOffset.UTC));
++
++        var decision = authenticator.authenticate(connection(token), hello(AGENT));
++
++        assertThat(decision.accepted()).isTrue();
++        assertThat(decision.identityKind()).isEqualTo(GatewayIdentityKind.WORKER_SLOT);
++    }
++
+     @Test
+     void rejectsExpiredRevokedAndMismatchedSessions() {
+         String token = "secret-token";
+diff --git a/agent-gateway/src/test/java/io/agentteams/gateway/TaskAssignedCommandHandlerTest.java b/agent-gateway/src/test/java/io/agentteams/gateway/TaskAssignedCommandHandlerTest.java
+index 78ee3af..7fa99fd 100644
+--- a/agent-gateway/src/test/java/io/agentteams/gateway/TaskAssignedCommandHandlerTest.java
++++ b/agent-gateway/src/test/java/io/agentteams/gateway/TaskAssignedCommandHandlerTest.java
+@@ -54,6 +54,7 @@ class TaskAssignedCommandHandlerTest {
+         assertThat(message.getTaskAssigned().getMetadata().getAttemptId()).isEqualTo(ATTEMPT_ID.toString());
+         assertThat(message.getTaskAssigned().getMetadata().getLeaseId()).isEqualTo(LEASE_ID.toString());
+         assertThat(message.getTaskAssigned().getMetadata().getAgentId()).isEqualTo(AGENT_ID.toString());
++        assertThat(message.getTaskAssigned().getAssignmentId()).isEqualTo(ASSIGNMENT_ID.toString());
+         assertThat(message.getTaskAssigned().getTaskType()).isEqualTo("summarize");
+         assertThat(message.getTaskAssigned().getInputJson()).isEqualTo(ByteString.copyFromUtf8("{\"text\":\"hello\"}"));
+         assertThat(message.getTaskAssigned().getRequiredCapabilitiesList()).containsExactly("llm", "workspace");
+diff --git a/contracts/src/main/proto/agent_channel.proto b/contracts/src/main/proto/agent_channel.proto
+index 5d0cad4..5bc6f48 100644
+--- a/contracts/src/main/proto/agent_channel.proto
++++ b/contracts/src/main/proto/agent_channel.proto
+@@ -39,6 +39,9 @@ message EventMetadata {
+   string correlation_id = 9;
+   string traceparent = 10;
+   string tracestate = 11;
++  // Short-lived capability for the exact active Attempt. Gateways validate
++  // it before routing execution events and strip it before persistence.
++  string attempt_capability = 12;
+ }
+
+ message AgentHello {
+@@ -104,6 +107,9 @@ message TaskAssigned {
+   SandboxAssignment sandbox = 12;
+   // Minimal summary-only memory context assembled by the Control Plane.
+   bytes memory_context_json = 13;
++  // Durable Assignment identity used only by the authenticated Worker to
++  // obtain a short-lived Attempt capability after delivery.
++  string assignment_id = 14;
+ }
+
+ message TaskAccepted {
+diff --git a/runtime/src/test/java/io/agentteams/runtime/GatewayRuntimeAdapterTest.java b/runtime/src/test/java/io/agentteams/runtime/GatewayRuntimeAdapterTest.java
+index 107f459..4d2c2ed 100644
+--- a/runtime/src/test/java/io/agentteams/runtime/GatewayRuntimeAdapterTest.java
++++ b/runtime/src/test/java/io/agentteams/runtime/GatewayRuntimeAdapterTest.java
+@@ -137,6 +137,56 @@ class GatewayRuntimeAdapterTest {
+                 "toolId", "create_task", "quotaId", "quota-a", "quotaDimension", "daily_tokens"));
+     }
+
++    @Test
++    void bindsSlotEventsToTenantAssignmentAndUsesItsAttemptCapability() {
++        List<AgentMessage> messages = new ArrayList<>();
++        List<String> requested = new ArrayList<>();
++        FakeRuntime runtime = new FakeRuntime();
++        runtime.start(new AgentRuntimeContext("fake", 1, Clock.systemUTC(), result -> { }, java.util.Map.of()));
++        UUID taskId = UUID.randomUUID();
++        UUID assignmentId = UUID.randomUUID();
++        UUID attemptId = UUID.randomUUID();
++        UUID leaseId = UUID.randomUUID();
++        RuntimeAttemptCapabilityPort capabilities = (task, assignment, attempt, lease) -> {
++            requested.add(task + ":" + assignment + ":" + attempt + ":" + lease);
++            return "cap_" + "a".repeat(43);
++        };
++        GatewayRuntimeAdapter adapter = new GatewayRuntimeAdapter("worker-slot-1", messages::add, runtime,
++                Clock.fixed(Instant.EPOCH, ZoneOffset.UTC), null, 0, capabilities);
++        TaskAssigned assignment = TaskAssigned.newBuilder().setMetadata(EventMetadata.newBuilder()
++                .setEventId(UUID.randomUUID().toString()).setAgentId("tenant-agent-a").setTaskId(taskId.toString())
++                .setAttemptId(attemptId.toString()).setLeaseId(leaseId.toString())
++                .setOccurredAt(Timestamp.getDefaultInstance()).build())
++                .setAssignmentId(assignmentId.toString()).setTaskType("chat")
++                .setInputJson(com.google.protobuf.ByteString.copyFromUtf8("{}"))
++                .setLeaseExpiresAt(Timestamp.getDefaultInstance()).build();
++
++        assertThat(adapter.acceptAssignment(assignment).accepted()).isTrue();
++        adapter.progress(taskId, 1, "running", "started");
++        adapter.heartbeat(taskId, "running");
++        assertThat(adapter.reportEvent(taskId, "tool.called", "{}")).isTrue();
++        assertThat(adapter.complete(RuntimeResult.success(taskId, "done", Instant.EPOCH)))
++                .isEqualTo(CompletionStatus.COMPLETED);
++
++        assertThat(runtime.status(taskId)).get().extracting(status -> status.task().metadata())
++                .matches(metadata -> "tenant-agent-a".equals(metadata.get("agentId"))
++                        && assignmentId.toString().equals(metadata.get("assignmentId")));
++        assertThat(messages).allSatisfy(message -> {
++            EventMetadata metadata = switch (message.getPayloadCase()) {
++                case TASK_ACCEPTED -> message.getTaskAccepted().getMetadata();
++                case TASK_PROGRESS -> message.getTaskProgress().getMetadata();
++                case TASK_HEARTBEAT -> message.getTaskHeartbeat().getMetadata();
++                case TASK_EVENT_REPORT -> message.getTaskEventReport().getMetadata();
++                case TASK_COMPLETED -> message.getTaskCompleted().getMetadata();
++                default -> throw new AssertionError("unexpected payload " + message.getPayloadCase());
++            };
++            assertThat(metadata.getAgentId()).isEqualTo("tenant-agent-a");
++            assertThat(metadata.getAttemptCapability()).isEqualTo("cap_" + "a".repeat(43));
++        });
++        assertThat(requested).containsOnly(taskId + ":" + assignmentId + ":" + attemptId + ":" + leaseId)
++                .hasSize(5);
++    }
++
+     @Test
+     void carriesRuntimeUsageAndDimensionsOnTerminalEvent() {
+         List<AgentMessage> messages = new ArrayList<>();
