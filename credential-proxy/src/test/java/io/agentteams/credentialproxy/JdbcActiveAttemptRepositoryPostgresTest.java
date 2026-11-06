@@ -83,10 +83,12 @@ class JdbcActiveAttemptRepositoryPostgresTest {
                 POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword()));
         jdbc.execute("DROP FUNCTION IF EXISTS credential_proxy_revalidate(UUID) CASCADE");
         jdbc.execute("DROP FUNCTION IF EXISTS credential_proxy_authenticate(TEXT) CASCADE");
+        jdbc.execute("DROP FUNCTION IF EXISTS credential_proxy_revalidate_v2(UUID) CASCADE");
+        jdbc.execute("DROP FUNCTION IF EXISTS credential_proxy_authenticate_v2(TEXT) CASCADE");
         jdbc.execute("DROP FUNCTION IF EXISTS credential_proxy_active_attempts(UUID) CASCADE");
         jdbc.execute("DROP FUNCTION IF EXISTS credential_proxy_active_attempts(UUID, TEXT, TEXT, TEXT) CASCADE");
         jdbc.execute("DROP ROLE IF EXISTS credential_proxy_test");
-        jdbc.execute("DROP TABLE IF EXISTS worker_model_proxy_credentials, agent_sessions, worker_enrollment_agent_scopes CASCADE");
+        jdbc.execute("DROP TABLE IF EXISTS attempt_model_proxy_credentials, worker_model_proxy_credentials, agent_sessions, worker_enrollment_agent_scopes CASCADE");
         jdbc.execute("DROP TABLE IF EXISTS task_assignments, task_attempts, agent_leases, resource_scopes CASCADE");
         jdbc.execute("DO $$ BEGIN "
                 + "IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'credential_proxy_runtime') THEN EXECUTE 'DROP OWNED BY credential_proxy_runtime'; END IF; "
@@ -278,6 +280,41 @@ class JdbcActiveAttemptRepositoryPostgresTest {
     }
 
     @Test
+    void attemptCredentialDerivesTenantFromTaskAndExpiresWithItsExactLease() throws Exception {
+        UUID tenantBTask = id("88000000-0000-0000-0000-000000000052");
+        UUID tenantBAttempt = id("88000000-0000-0000-0000-000000000053");
+        UUID tenantBLease = id("88000000-0000-0000-0000-000000000054");
+        UUID tenantBCredential = id("88000000-0000-0000-0000-000000000055");
+        String tenantBToken = "atp_" + "B".repeat(43);
+        insertScope("TASK", tenantBTask, "tenant-b", "project-b", "team-b");
+        insertActive(AGENT, tenantBTask, tenantBAttempt, tenantBLease);
+        insertAttemptCredential(tenantBCredential, AGENT, tenantBTask, tenantBAttempt, tenantBLease,
+                tenantBToken, "vault://tenant-b/project-b/chatgpt");
+
+        var authenticator = new JdbcModelProxyCredentialAuthenticator(jdbc);
+        AuthenticatedWorker identity = new AuthenticatedWorker(tenantBCredential, AGENT, "tenant-b", "project-b",
+                "team-b", "vault://tenant-b/project-b/chatgpt", tenantBAttempt, tenantBLease);
+        jdbc.execute("CREATE ROLE credential_proxy_test LOGIN PASSWORD 'proxy-test-password'");
+        jdbc.execute("GRANT credential_proxy_query TO credential_proxy_test");
+        var restricted = new JdbcTemplate(new DriverManagerDataSource(
+                POSTGRES.getJdbcUrl(), "credential_proxy_test", "proxy-test-password"));
+        var restrictedAuthenticator = new JdbcModelProxyCredentialAuthenticator(restricted);
+        assertThat(restrictedAuthenticator.authenticate(tenantBToken)).contains(identity);
+        assertThat(restrictedAuthenticator.revalidate(identity)).contains(identity);
+        var candidate = new JdbcActiveAttemptRepository(restricted).findActiveAttempts(identity).getFirst();
+        assertThat(candidate).isEqualTo(new ActiveAttemptCandidate(AGENT, "tenant-b", "project-b", "team-b",
+                tenantBTask, tenantBAttempt, tenantBLease, candidate.leaseExpiresAt(), true, true, true));
+        assertThatThrownBy(() -> restricted.queryForObject(
+                "SELECT token_sha256 FROM attempt_model_proxy_credentials", String.class))
+                .isInstanceOf(org.springframework.dao.DataAccessException.class);
+
+        jdbc.update("UPDATE agent_leases SET status = 'RELEASED', released_at = now() WHERE id = ?", tenantBLease);
+        assertThat(restrictedAuthenticator.authenticate(tenantBToken)).isEmpty();
+        assertThat(restrictedAuthenticator.revalidate(identity)).isEmpty();
+        assertThat(new JdbcActiveAttemptRepository(restricted).findActiveAttempts(identity)).isEmpty();
+    }
+
+    @Test
     void httpRequestUsesDatabaseAttemptScopeAndForwardsOnlyTheResolvedProviderCredential() throws Exception {
         insertScope("WORKER", AGENT, "tenant-a", "project-a", "team-a");
         insertScope("TASK", TASK, "tenant-a", "project-a", "team-a");
@@ -404,6 +441,14 @@ class JdbcActiveAttemptRepositoryPostgresTest {
         jdbc.update("INSERT INTO worker_enrollment_agent_scopes VALUES (?, ?, ?, ?)", agent, tenant, project, team);
         jdbc.update("INSERT INTO worker_model_proxy_credentials VALUES (?, ?, ?, ?, ?, ?, ?, 'vault://tenant-b/project-b/chatgpt', now() + interval '10 minutes', NULL, now())",
                 credential, session, agent, tenant, project, team, sha256(token));
+    }
+
+    private void insertAttemptCredential(UUID credential, UUID agent, UUID task, UUID attempt, UUID lease,
+            String token, String modelCredentialRef) throws Exception {
+        jdbc.update("INSERT INTO attempt_model_proxy_credentials(id, agent_id, task_id, attempt_id, lease_id, "
+                        + "token_sha256, model_credential_ref, expires_at) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, now() + interval '10 minutes')",
+                credential, agent, task, attempt, lease, sha256(token), modelCredentialRef);
     }
 
     private void insertActive(UUID agent, UUID task, UUID attempt, UUID lease) {

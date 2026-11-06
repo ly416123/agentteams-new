@@ -24,11 +24,16 @@ public final class AttemptExecutionContextResolver {
 
         ActiveAttemptCandidate candidate = candidates.getFirst();
         Instant now = clock.instant();
-        if (candidate == null
-                || !worker.agentId().equals(candidate.agentId())
-                || !worker.tenantId().equals(candidate.tenantId())
-                || !worker.projectId().equals(candidate.projectId())
-                || !worker.teamId().equals(candidate.teamId())
+        boolean identityMatches = candidate != null && worker.agentId().equals(candidate.agentId());
+        if (identityMatches && worker.isAttemptBound()) {
+            identityMatches = worker.attemptId().equals(candidate.attemptId())
+                    && worker.leaseId().equals(candidate.leaseId());
+        } else if (identityMatches) {
+            identityMatches = worker.tenantId().equals(candidate.tenantId())
+                    && worker.projectId().equals(candidate.projectId())
+                    && worker.teamId().equals(candidate.teamId());
+        }
+        if (!identityMatches
                 || !candidate.leaseActive()
                 || !candidate.attemptActive()
                 || !candidate.assignmentActive()

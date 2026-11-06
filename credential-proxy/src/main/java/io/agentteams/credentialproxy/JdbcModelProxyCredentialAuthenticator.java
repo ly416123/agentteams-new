@@ -12,12 +12,14 @@ import org.springframework.jdbc.core.JdbcTemplate;
 /** Resolves a model proxy bearer token through a narrow database function; the token is never queried in plaintext. */
 public final class JdbcModelProxyCredentialAuthenticator implements ModelProxyAuthenticator {
     private static final String AUTHENTICATE_SQL = """
-            SELECT proxy_credential_id, agent_id, tenant_id, project_id, team_id, model_credential_ref
-              FROM public.credential_proxy_authenticate(?)
+            SELECT proxy_credential_id, agent_id, tenant_id, project_id, team_id, model_credential_ref,
+                   attempt_id, lease_id
+              FROM public.credential_proxy_authenticate_v2(?)
             """;
     private static final String REVALIDATE_SQL = """
-            SELECT proxy_credential_id, agent_id, tenant_id, project_id, team_id, model_credential_ref
-              FROM public.credential_proxy_revalidate(?)
+            SELECT proxy_credential_id, agent_id, tenant_id, project_id, team_id, model_credential_ref,
+                   attempt_id, lease_id
+              FROM public.credential_proxy_revalidate_v2(?)
             """;
 
     private final JdbcTemplate jdbc;
@@ -46,7 +48,9 @@ public final class JdbcModelProxyCredentialAuthenticator implements ModelProxyAu
                         rs.getString("tenant_id"),
                         rs.getString("project_id"),
                         rs.getString("team_id"),
-                        rs.getString("model_credential_ref")), parameter);
+                        rs.getString("model_credential_ref"),
+                        rs.getObject("attempt_id", java.util.UUID.class),
+                        rs.getObject("lease_id", java.util.UUID.class)), parameter);
         if (identities.size() != 1) return Optional.empty();
         return Optional.of(identities.getFirst());
     }

@@ -108,6 +108,47 @@ class AttemptExecutionContextResolverTest {
                 .isInstanceOf(AttemptExecutionDeniedException.class);
     }
 
+    @Test
+    void tenantNeutralCredentialMayResolveOnlyItsAttemptScope() {
+        UUID tenantBTask = UUID.randomUUID();
+        ActiveAttemptCandidate candidate = new ActiveAttemptCandidate(AGENT_ID, "tenant-b", "project-b",
+                "team-b", tenantBTask, ATTEMPT_ID, LEASE_ID, NOW.plusSeconds(600), true, true, true);
+        AuthenticatedWorker attemptCredential = new AuthenticatedWorker(PROXY_CREDENTIAL_ID, AGENT_ID,
+                null, null, null, "vault://tenant-b/project-b/model", ATTEMPT_ID, LEASE_ID);
+
+        AttemptExecutionContext context = resolver(List.of(candidate)).resolve(attemptCredential);
+
+        assertThat(context.tenantId()).isEqualTo("tenant-b");
+        assertThat(context.projectId()).isEqualTo("project-b");
+        assertThat(context.taskId()).isEqualTo(tenantBTask);
+        assertThat(context.attemptId()).isEqualTo(ATTEMPT_ID);
+        assertThat(context.leaseId()).isEqualTo(LEASE_ID);
+    }
+
+    @Test
+    void tenantNeutralCredentialCannotResolveAnotherAttemptOrLeaseForSameAgent() {
+        ActiveAttemptCandidate candidate = new ActiveAttemptCandidate(AGENT_ID, "tenant-b", "project-b",
+                "team-b", TASK_ID, UUID.randomUUID(), UUID.randomUUID(), NOW.plusSeconds(600), true, true, true);
+        AuthenticatedWorker attemptCredential = new AuthenticatedWorker(PROXY_CREDENTIAL_ID, AGENT_ID,
+                null, null, null, "vault://tenant-b/project-b/model", ATTEMPT_ID, LEASE_ID);
+
+        assertThatThrownBy(() -> resolver(List.of(candidate)).resolve(attemptCredential))
+                .isInstanceOf(AttemptExecutionDeniedException.class);
+    }
+
+    @Test
+    void attemptCredentialMustCarryBothAttemptAndLeaseButNoPartialTenantScope() {
+        assertThatThrownBy(() -> new AuthenticatedWorker(PROXY_CREDENTIAL_ID, AGENT_ID,
+                null, null, null, "model-ref", ATTEMPT_ID, null))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new AuthenticatedWorker(PROXY_CREDENTIAL_ID, AGENT_ID,
+                "tenant-a", null, "team-a", "model-ref", ATTEMPT_ID, LEASE_ID))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new AuthenticatedWorker(PROXY_CREDENTIAL_ID, AGENT_ID,
+                null, null, null, "model-ref", null, null))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
     private static AuthenticatedWorker worker() {
         return new AuthenticatedWorker(PROXY_CREDENTIAL_ID, AGENT_ID, "tenant-a", "project-a", "team-a",
                 "model-credential-a");

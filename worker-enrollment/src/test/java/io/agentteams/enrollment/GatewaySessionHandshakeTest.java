@@ -107,7 +107,8 @@ class GatewaySessionHandshakeTest {
         Handshake handshake = connect(agentId, token);
         try {
             byte[] ready = handshake.responses().poll(10, TimeUnit.SECONDS);
-            assertThat(ready).isNotNull();
+            assertThat(ready).as("Gateway never sent Ready; status=%s, logs:\n%s",
+                    handshake.status().peek(), gateway.getLogs()).isNotNull();
             assertThat(readyAccepted(ready)).isTrue();
             assertThat(handshake.status().poll(10, TimeUnit.SECONDS)).isNull();
             assertThat(jdbc.queryForObject(

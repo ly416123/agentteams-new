@@ -28,6 +28,12 @@ Attempt 心跳和 Lease 到期用于发现失联 Worker；超时策略区分可�
 
 实测确认当前上游实现尚不满足上述合同：普通 Worker 派发、TaskEvent、Enrollment Session 和 Credential Proxy 都要求长期 Worker scope 等于 Task scope；代理凭据的 modelCredentialRef 也绑定到该长期 scope。审计细节见[共享 Worker 跨租户边界审计](../../audits/2026-11-06-shared-worker-tenant-boundary.md)。因此 Attempt capability 与 Tenant-neutral slot 是公平调度接入持久队列之前的前置安全阶段。
 
+### Attempt capability 实现进度
+
+Credential Proxy 已增加第二种身份模式的本地实现：原 Enrollment 凭据继续绑定 Tenant/Project/Team；Attempt 凭据绑定 Agent + Attempt + Lease，数据库从 TASK `resource_scopes` 派生 Tenant/Project/Team，并在每次代理鉴权及流式转发前确认同一活动 Assignment/Attempt/Lease。数据库仅保留新 token 的 SHA-256，代理上下文有效期不超过 Lease。对应 PostgreSQL Testcontainers 用例已实际运行通过。
+
+这只是 Credential Proxy 的一段能力，**尚不代表共享 Worker 已端到端打通**。当前仍缺 Control Plane 在领取任务事务中签发/轮换该 capability、Worker 安全领取 capability 的传输协议（不能把明文 bearer token 写入普通持久 Outbox）、TaskEvent/Artifact/workspace 全链路验证 Attempt/Lease、按 Task Tenant 选择可信 Provider credential ref，以及 Attempt 结束后的上下文/workspace 清理。以上完成并通过双租户真实 Worker 验收前，禁止把 Worker 的长期 scope 检查移除，也不能把当前 Tenant-bound Worker 宣称为 Tenant-neutral 共享槽位。
+
 ## 并发运行模型
 
 Java 虚拟线程不作为调度公平或租户隔离机制。先保留当前 Worker 执行器，并用代表性负载测出 I/O 等待、CPU 占用、线程数和上下文传播；若执行线程主要阻塞在网络/磁盘 I/O，再以有界并发评估虚拟线程。CPU 密集任务继续使用有界执行器及 CPU 限额；不可信工具/代码需由子进程或明确的沙箱 Provider 隔离。

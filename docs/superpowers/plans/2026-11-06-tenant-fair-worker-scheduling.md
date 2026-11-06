@@ -39,10 +39,14 @@
 - [ ] Task/Attempt/Lease 原子领取时生成随机 Attempt capability，仅存哈希，明文只交给已认证的目标 Worker；租约释放、取消、超时/恢复时撤销。
 - [ ] Control Plane TaskEvent、文件/Artifact/workspace API 从 capability 派生 Attempt 和 Task scope，拒绝 Worker 请求自报 Tenant；覆盖缺失、过期、伪造、跨 Attempt、跨 Tenant 测试。
 - [ ] Credential Proxy 以 capability 解析活跃 Attempt 与 TASK scope，并按 Tenant/Project 选择 Provider 凭据；长期 Worker Session 不承载 Tenant modelCredentialRef。
+- [ ] Control Plane 原子签发/轮换 capability，并通过不落明文数据库的 Worker 领取协议传递；Attempt/Lease 结束时撤销或自然失效。
+- [ ] TaskEvent、Artifact、workspace 请求统一验证 capability；清理上下文/workspace 后才释放共享槽位。
 - [ ] 同一固定槽位连续执行 Tenant A/B Attempt，验证 workspace、凭据引用、事件和 Artifact 不能串用；完成清理后才允许再领取。
 - [ ] 固定上游补丁、Enrollment、Credential Proxy 各自 CI 硬门禁验证上述合同，零跳过。
 
 **完成证据：** A/B 交替 Attempt 的 PostgreSQL/HTTP/代理集成测试和真实 Worker POC；旧的 scope 相等校验只有在新的 Attempt capability 校验已验证替代后才能移除。
+
+**进度更新（2026-11-06）：** Credential Proxy 已实现 Attempt-bound token 数据解析原型，token hash 绑定 Agent/Task/Attempt/Lease；Tenant/Project/Team scope 从 Task scope 派生，只有对应 Assignment/Attempt/Lease 仍活动时认证和重验证才成功。旧 Tenant-bound Enrollment token 保持严格 scope 校验。Credential Proxy 模块全量 48 项测试通过（PostgreSQL Testcontainers 10 项在本机 Docker 实际运行；0 failure/error/skipped）。当前集成 fixture 直接写入 capability 行；Control Plane 尚未在分配事务中签发，也没有安全 Worker 领取协议，TaskEvent/Artifact/workspace 尚未验证 capability。因此共享池门槛未完成；不能先移除现有 Worker/Task scope guard。
 
 ### 任务 2：定义并测试租户公平调度器
 
