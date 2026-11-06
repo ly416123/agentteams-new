@@ -879,3 +879,195 @@ index 0000000..5e15346
 +        return java.util.HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(value));
 +    }
 +}
+diff --git a/control-plane/src/test/java/io/agentteams/controlplane/worker/WorkerDrainLifecycleTest.java b/control-plane/src/test/java/io/agentteams/controlplane/worker/WorkerDrainLifecycleTest.java
+new file mode 100644
+index 0000000..b022df1
+--- /dev/null
++++ b/control-plane/src/test/java/io/agentteams/controlplane/worker/WorkerDrainLifecycleTest.java
+@@ -0,0 +1,186 @@
++package io.agentteams.controlplane.worker;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++
++import io.agentteams.controlplane.persistence.AgentLeaseRecord;
++import io.agentteams.controlplane.persistence.AgentRecord;
++import io.agentteams.controlplane.persistence.FoundationPersistenceService;
++import io.agentteams.controlplane.persistence.TaskAttemptRecord;
++import io.agentteams.controlplane.persistence.TaskRecord;
++import io.agentteams.controlplane.service.WorkerLifecycleConflictException;
++import io.agentteams.domain.agent.AgentPhase;
++import io.agentteams.domain.task.TaskPhase;
++import java.lang.reflect.InvocationTargetException;
++import java.time.Duration;
++import java.time.Instant;
++import java.util.UUID;
++import org.flywaydb.core.Flyway;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.jdbc.core.JdbcTemplate;
++import org.testcontainers.containers.PostgreSQLContainer;
++import org.testcontainers.junit.jupiter.Container;
++import org.testcontainers.junit.jupiter.Testcontainers;
++
++@Testcontainers(disabledWithoutDocker = true)
++class WorkerDrainLifecycleTest {
++    private static final Instant NOW = Instant.parse("2026-11-06T00:00:00Z");
++
++    @Container
++    static final PostgreSQLContainer<?> POSTGRES = new PostgreSQLContainer<>("postgres:16-alpine");
++
++    private FoundationPersistenceService persistence;
++    private JdbcTemplate jdbc;
++    private WorkerOperationService operations;
++
++    @BeforeEach
++    void resetDatabase() {
++        Flyway.configure().locations("filesystem:src/main/resources/db/migration")
++                .dataSource(POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword())
++                .cleanDisabled(false).load().clean();
++        Flyway.configure().locations("filesystem:src/main/resources/db/migration")
++                .dataSource(POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword()).load().migrate();
++        org.postgresql.ds.PGSimpleDataSource dataSource = new org.postgresql.ds.PGSimpleDataSource();
++        dataSource.setURL(POSTGRES.getJdbcUrl());
++        dataSource.setUser(POSTGRES.getUsername());
++        dataSource.setPassword(POSTGRES.getPassword());
++        persistence = new FoundationPersistenceService(dataSource);
++        jdbc = new JdbcTemplate(dataSource);
++        operations = new WorkerOperationService(persistence, java.time.Clock.fixed(NOW, java.time.ZoneOffset.UTC),
++                Duration.ofMinutes(2));
++    }
++
++    @Test
++    void marksDrainCompleteOnceTheFinalLeaseIsReleased() {
++        UUID agentId = readyAgent();
++        WorkerOperation drain = operations.drain(agentId, 0, "drain-complete-1");
++
++        recover(NOW);
++
++        assertThat(operations.get(agentId, drain.id()).status()).isEqualTo(WorkerOperationStatus.DRAINED);
++        assertThat(persistence.findAgent(agentId)).get().extracting(AgentRecord::phase)
++                .isEqualTo(AgentPhase.DRAINING);
++    }
++
++    @Test
++    void leavesDrainPendingWhileAnAttemptLeaseIsActive() {
++        UUID agentId = readyAgent();
++        insertActiveLease(agentId);
++        WorkerOperation drain = operations.drain(agentId, 0, "drain-active-lease-1");
++
++        recover(NOW.plusSeconds(180));
++
++        assertThat(operations.get(agentId, drain.id()).status()).isEqualTo(WorkerOperationStatus.PENDING);
++    }
++
++    @Test
++    void canActivateTheSameWorkerAfterGatewayReconnectAndDrain() {
++        UUID agentId = readyAgent();
++        WorkerOperation drain = operations.drain(agentId, 0, "drain-before-activate-1");
++        recover(NOW.plusSeconds(180));
++        insertGatewayOnline(agentId);
++
++        WorkerOperation activate = invokeActivate(agentId, 1, "activate-1");
++        WorkerOperation repeated = invokeActivate(agentId, 1, "activate-1");
++
++        assertThat(activate.type().name()).isEqualTo("ACTIVATE");
++        assertThat(activate.status()).isEqualTo(WorkerOperationStatus.SUCCEEDED);
++        assertThat(repeated.id()).isEqualTo(activate.id());
++        assertThat(operations.get(agentId, drain.id()).status()).isEqualTo(WorkerOperationStatus.DRAINED);
++        assertThat(persistence.findAgent(agentId)).get().extracting(AgentRecord::phase).isEqualTo(AgentPhase.READY);
++    }
++
++    @Test
++    void refusesActivationUntilGatewayHasReconnected() {
++        UUID agentId = readyAgent();
++        operations.drain(agentId, 0, "drain-offline-activate-1");
++        recover(NOW);
++
++        assertThatThrownBy(() -> invokeActivate(agentId, 1, "activate-offline-1"))
++                .isInstanceOf(WorkerLifecycleConflictException.class)
++                .hasMessage("WORKER_NOT_ONLINE");
++        assertThat(persistence.findAgent(agentId)).get().extracting(AgentRecord::phase)
++                .isEqualTo(AgentPhase.DRAINING);
++    }
++
++    @Test
++    void refusesActivationWhileAnAttemptLeaseRemainsActive() {
++        UUID agentId = readyAgent();
++        insertActiveLease(agentId);
++        operations.drain(agentId, 0, "drain-active-activate-1");
++        insertGatewayOnline(agentId);
++
++        assertThatThrownBy(() -> invokeActivate(agentId, 1, "activate-active-1"))
++                .isInstanceOf(WorkerLifecycleConflictException.class)
++                .hasMessage("WORKER_HAS_ACTIVE_TASKS");
++        assertThat(persistence.findAgent(agentId)).get().extracting(AgentRecord::phase)
++                .isEqualTo(AgentPhase.DRAINING);
++    }
++
++    @Test
++    void refusesActivationWhenTheDrainOperationHasNotReachedDrained() {
++        UUID agentId = readyAgent();
++        operations.drain(agentId, 0, "drain-not-ready-1");
++        insertGatewayOnline(agentId);
++        insertActiveLease(agentId);
++
++        assertThatThrownBy(() -> invokeActivate(agentId, 1, "activate-not-drained-1"))
++                .isInstanceOf(WorkerLifecycleConflictException.class)
++                .hasMessage("WORKER_HAS_ACTIVE_TASKS");
++    }
++
++    private UUID readyAgent() {
++        UUID id = UUID.randomUUID();
++        persistence.inTransaction(tx -> {
++            tx.agents().insert(AgentRecord.create(id, "worker-" + id, AgentPhase.READY,
++                    "agentscope", "{}", NOW));
++            return null;
++        });
++        return id;
++    }
++
++    private void recover(Instant at) {
++        persistence.inTransaction(tx -> WorkerOperationService.recoverExpiredOperations(tx, at));
++    }
++
++    private void insertActiveLease(UUID agentId) {
++        UUID taskId = UUID.randomUUID();
++        UUID attemptId = UUID.randomUUID();
++        UUID leaseId = UUID.randomUUID();
++        Instant expiresAt = NOW.plusSeconds(60);
++        persistence.inTransaction(tx -> {
++            tx.tasks().insert(new TaskRecord(taskId, "task", "", TaskPhase.ASSIGNED, 0, "{}", "actor", "test",
++                    null, null, NOW, NOW, 1));
++            tx.taskAttempts().insert(new TaskAttemptRecord(attemptId, taskId, leaseId, TaskPhase.ASSIGNED,
++                    expiresAt, null, "scheduler", "control-plane", null, null, NOW, NOW, 1));
++            tx.agentLeases().insert(new AgentLeaseRecord(leaseId, agentId, attemptId, NOW, expiresAt, null,
++                    "ACTIVE", NOW, NOW, 0));
++            return null;
++        });
++    }
++
++    private void insertGatewayOnline(UUID agentId) {
++        jdbc.update("""
++                INSERT INTO gateway_agent_state
++                    (agent_id, connection_id, presence, phase, runtime, runtime_version, capabilities,
++                     connected_at, last_seen_at, disconnected_at, updated_at)
++                VALUES (?, ?, 'ONLINE', 'READY', 'agentscope', 'v0.1.5', '{}'::jsonb, ?, ?, NULL, ?)
++                """, agentId.toString(), UUID.randomUUID(), NOW, NOW, NOW);
++    }
++
++    private WorkerOperation invokeActivate(UUID agentId, long expectedVersion, String idempotencyKey) {
++        try {
++            return (WorkerOperation) WorkerOperationService.class
++                    .getMethod("activate", UUID.class, long.class, String.class)
++                    .invoke(operations, agentId, expectedVersion, idempotencyKey);
++        } catch (NoSuchMethodException missing) {
++            throw new AssertionError("missing WorkerOperationService.activate lifecycle API", missing);
++        } catch (IllegalAccessException impossible) {
++            throw new AssertionError("activate lifecycle API must be public", impossible);
++        } catch (InvocationTargetException wrapped) {
++            if (wrapped.getCause() instanceof RuntimeException runtime) throw runtime;
++            throw new AssertionError("activate lifecycle API failed", wrapped.getCause());
++        }
++    }
++}
