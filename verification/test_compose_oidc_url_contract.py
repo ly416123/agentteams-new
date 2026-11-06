@@ -86,7 +86,7 @@ class ComposeOidcUrlContractTest(unittest.TestCase):
     def test_rejects_self_hosted_without_hardened_control_plane_build(self) -> None:
         result = self.validate(deployment_mode="self-hosted-small")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("self-hosted-small requires the pinned TASK_EVENT-hardened Control Plane", result.stderr)
+        self.assertIn("TASK_EVENT-hardened Control Plane source build", result.stderr)
 
     def test_accepts_self_hosted_with_pinned_hardened_control_plane_build(self) -> None:
         result = self.validate(
@@ -103,7 +103,7 @@ class ComposeOidcUrlContractTest(unittest.TestCase):
             control_plane_image="ghcr.io/ly416123/agentteams-control-plane@sha256:403c3da94d436c19ce09e2d347f9e4182fb972a41adc5995c57694922fb94173",
         )
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("self-hosted-small requires the pinned TASK_EVENT-hardened Control Plane", result.stderr)
+        self.assertIn("TASK_EVENT-hardened Control Plane source build", result.stderr)
 
 
 if __name__ == "__main__":

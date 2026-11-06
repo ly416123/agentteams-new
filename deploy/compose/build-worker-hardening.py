@@ -42,7 +42,7 @@ def extract_source(archive: Path, destination: Path) -> None:
 def require_tests(source: Path) -> None:
     report = source / "agent-worker/target/surefire-reports" / f"TEST-{TEST_CLASS}.xml"
     suite = ET.parse(report).getroot()
-    if (suite.attrib["tests"] != "17" or suite.attrib["skipped"] != "0"
+    if (suite.attrib["tests"] != "18" or suite.attrib["skipped"] != "0"
             or suite.attrib["failures"] != "0" or suite.attrib["errors"] != "0"):
         raise RuntimeError(f"required Attempt workspace tests failed: {suite.attrib}")
 
@@ -73,7 +73,7 @@ def main() -> int:
                            stdout=output, check=True, timeout=120)
         extract_source(archive, source)
         run(["patch", "--batch", "--forward", "-p1", "-i", str(patch_file)], cwd=source)
-        run(["mvn", "--batch-mode", "--no-transfer-progress", "-pl", "agent-worker",
+        run(["mvn", "--batch-mode", "--no-transfer-progress", "-pl", "agent-worker", "-am",
              "-Dtest=ConfiguredAgentScopeHarnessFactoryTest", "-Dsurefire.failIfNoSpecifiedTests=false", "test"], cwd=source)
         require_tests(source)
         run(["docker", "build", "--platform", "linux/amd64", "--label",

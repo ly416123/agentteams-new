@@ -11,7 +11,7 @@
  import java.util.Objects;
  import java.util.Map;
 @@ -97,12 +100,17 @@
- 
+
      @Override
      public void release(UUID taskId) {
 -        bindings.remove(Objects.requireNonNull(taskId, "taskId"));
@@ -20,7 +20,7 @@
 +        if (binding == null || binding.profile() != SandboxProfile.NONE) return;
 +        deleteLocalWorkspace(workspaceFor(binding));
      }
- 
+
      @Override
      public void releaseAll() {
 -        bindings.clear();
@@ -28,7 +28,7 @@
 +            release(taskId);
 +        }
      }
- 
+
      @Override
 @@ -144,13 +152,17 @@
              throw new IllegalArgumentException("sandbox workspace must expose a verified local workspace");
@@ -94,13 +94,22 @@
 +            LOG.log(System.Logger.Level.WARNING, "Unable to remove terminal local workspace");
 +        }
      }
- 
+
      private static Set<String> requiredTaskTools(String inputJson) {
 --- a/agent-worker/src/test/java/io/agentteams/worker/agentscope/ConfiguredAgentScopeHarnessFactoryTest.java
 +++ b/agent-worker/src/test/java/io/agentteams/worker/agentscope/ConfiguredAgentScopeHarnessFactoryTest.java
-@@ -74,7 +74,47 @@
+@@ -25,6 +25,8 @@
+ import java.time.ZoneOffset;
+ import java.util.List;
+ import java.util.Map;
++import java.util.HashSet;
++import java.util.Set;
+ import java.util.UUID;
+ import java.util.concurrent.atomic.AtomicReference;
+ import reactor.core.publisher.Flux;
+@@ -74,7 +76,76 @@
                  Clock.fixed(Instant.parse("2026-08-26T00:00:00Z"), ZoneOffset.UTC), ignored -> { }, Map.of()));
- 
+
          assertThat(harness).isNotNull();
 +        harness.close();
 +    }
@@ -130,6 +139,35 @@
 +    }
 +
 +    @Test
++    void isolatesLocalWorkspacesAcrossTenantsInOneWorkerProcess() throws Exception {
++        ConfiguredAgentScopeHarnessFactory factory = new ConfiguredAgentScopeHarnessFactory(
++                new TestModel(), AgentScopeWorkspaceFactory.testOnly(new ReadySandboxRuntime(),
++                        Clock.fixed(Instant.parse("2026-08-26T00:00:00Z"), ZoneOffset.UTC), root), root);
++        RuntimeTask tenantATask = scopedTask("tenant-a", "project-a", "team-a", "attempt-shared", "lease-a");
++        RuntimeTask tenantBTask = scopedTask("tenant-b", "project-b", "team-b", "attempt-shared", "lease-b");
++        Set<Path> before = localWorkspaces();
++
++        var tenantAHarness = factory.create(tenantATask, context());
++        Set<Path> afterTenantA = localWorkspaces();
++        Path tenantAWorkspace = afterTenantA.stream().filter(path -> !before.contains(path))
++                .findFirst().orElseThrow();
++        Files.writeString(tenantAWorkspace.resolve("private-tenant-data.txt"), "tenant A only");
++
++        var tenantBHarness = factory.create(tenantBTask, context());
++        Set<Path> afterTenantB = localWorkspaces();
++        Path tenantBWorkspace = afterTenantB.stream().filter(path -> !afterTenantA.contains(path))
++                .findFirst().orElseThrow();
++
++        assertThat(tenantBWorkspace).isNotEqualTo(tenantAWorkspace);
++        assertThat(tenantBWorkspace.resolve("private-tenant-data.txt")).doesNotExist();
++
++        tenantAHarness.close();
++        factory.release(tenantATask.id());
++        tenantBHarness.close();
++        factory.release(tenantBTask.id());
++    }
++
++    @Test
 +    void removesAttemptLocalWorkspaceWhenRuntimeReleasesIt() throws Exception {
 +        UUID taskId = UUID.randomUUID();
 +        ConfiguredAgentScopeHarnessFactory factory = new ConfiguredAgentScopeHarnessFactory(
@@ -144,11 +182,11 @@
 +
 +        assertThat(workspace).doesNotExist();
      }
- 
+
      @Test
-@@ -355,11 +395,23 @@
+@@ -355,11 +426,40 @@
      }
- 
+
      private RuntimeTask task(String attemptId, String leaseId) {
 -        return new RuntimeTask(UUID.randomUUID(), "chat", "hello", Map.of(
 +        return task(UUID.randomUUID(), attemptId, leaseId);
@@ -159,13 +197,30 @@
                  "tenantId", "tenant-a", "projectId", "project-a", "teamId", "team-a",
                  "agentId", "agent-a", "attemptId", attemptId, "leaseId", leaseId));
      }
- 
+
 +    private Path localWorkspace() throws Exception {
 +        try (var paths = Files.list(root)) {
 +            return paths.filter(Files::isDirectory)
 +                    .filter(path -> !path.getFileName().toString().equals(".agentscope-state"))
 +                    .findFirst().orElseThrow();
 +        }
++    }
++
++    private Set<Path> localWorkspaces() throws Exception {
++        Set<Path> workspaces = new HashSet<>();
++        try (var paths = Files.list(root)) {
++            paths.filter(Files::isDirectory)
++                    .filter(path -> !path.getFileName().toString().equals(".agentscope-state"))
++                    .forEach(workspaces::add);
++        }
++        return workspaces;
++    }
++
++    private RuntimeTask scopedTask(String tenant, String project, String team,
++            String attempt, String lease) {
++        return new RuntimeTask(UUID.randomUUID(), "chat", "hello", Map.of(
++                "tenantId", tenant, "projectId", project, "teamId", team,
++                "agentId", "agent-a", "attemptId", attempt, "leaseId", lease));
 +    }
 +
      private RuntimeTask sandboxTask(String attemptId) {
