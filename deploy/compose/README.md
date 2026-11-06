@@ -122,7 +122,14 @@ Gateway Token 和模型代理 Token 互不通用；数据库只存两者的 SHA-
 python3 ./restart-worker.py 1 /secure/path/control-plane-access-token --env-file .env
 ```
 
-脚本先调用 Control Plane Drain 并等待 operation 进入 `DRAINED`；到达前不会停止 Worker。随后只重启对应 `worker-N` 固定槽位，等待 Gateway 重新握手，再通过 Activate 恢复同一 Agent 为 READY。脚本会打印 Drain/Activate operation ID，不会把 token 写入参数、日志或容器环境。Drain 或 Gateway 重连超时会安全退出并保留 Worker 的 DRAINING 状态，需先查看 operation 状态，再恢复流程；不要用 `TERMINATE` 替代。升级时先在 `.env` 锁定新 Worker image digest 并拉取镜像，再执行该命令。
+脚本先调用 Control Plane Drain 并等待 operation 进入 `DRAINED`；到达前不会停止 Worker。随后只重启对应 `worker-N` 固定槽位，等待 Gateway 重新握手，再通过 Activate 恢复同一 Agent 为 READY。脚本会打印 Drain/Activate operation ID，不会把 token 写入参数、日志或容器环境。Drain 等待超时或命令中断后，可用打印出的 Drain operation ID 恢复：
+
+```sh
+python3 ./restart-worker.py 1 /secure/path/control-plane-access-token \
+  --env-file .env --resume-operation-id <drain-operation-uuid>
+```
+
+续跑会校验 operation 属于该 Worker 且类型为 `DRAIN`，并等到 `DRAINED` 后才操作容器。Gateway 重连超时后也可用同一命令重试；重启固定槽位是幂等的。不要用 `TERMINATE` 替代。升级时先在 `.env` 锁定新 Worker image digest 并拉取镜像，再执行该命令。
 
 ## 状态与运维
 

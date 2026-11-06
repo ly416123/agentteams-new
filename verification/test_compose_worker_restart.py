@@ -93,6 +93,41 @@ class ComposeWorkerRestartTest(unittest.TestCase):
                 patch.object(restart_worker.time, "sleep"):
             restart_worker.run(env, 1, token, 30)
 
+    def test_resume_drain_restarts_only_after_operation_is_drained(self):
+        temp, env, token = self.fixture()
+        self.addCleanup(temp.cleanup)
+        worker_id = "94b27ea2-263b-4fda-91e2-5d69ebcbb722"
+        operation_id = "b1b4333c-e4bf-4b95-a25e-614a81b2ec8f"
+        responses = [
+            {"id": worker_id, "phase": "DRAINING", "version": 4},
+            {"id": operation_id, "agentId": worker_id, "type": "DRAIN", "status": "DRAINED"},
+            {"id": operation_id, "agentId": worker_id, "type": "DRAIN", "status": "DRAINED"},
+            {"id": worker_id, "phase": "DRAINING", "version": 4},
+            {"id": "activate-op", "type": "ACTIVATE", "status": "SUCCEEDED"},
+            {"id": worker_id, "phase": "READY", "version": 4},
+        ]
+        compose = []
+        with patch.object(restart_worker, "request_json", side_effect=responses) as request, \
+                patch.object(restart_worker, "compose_command", side_effect=lambda *args: compose.append(args)), \
+                patch.object(restart_worker.time, "sleep"):
+            restart_worker.run(env, 1, token, 30, operation_id)
+        self.assertEqual([item[2] for item in compose], ["stop", "up"])
+        self.assertEqual(request.call_args_list[1].args[2:4],
+                         ("GET", f"/api/v1/agents/{worker_id}/operations/{operation_id}"))
+
+    def test_resume_rejects_operation_from_another_worker_before_compose(self):
+        temp, env, token = self.fixture()
+        self.addCleanup(temp.cleanup)
+        compose = []
+        with patch.object(restart_worker, "request_json", side_effect=[
+                {"id": "94b27ea2-263b-4fda-91e2-5d69ebcbb722", "phase": "DRAINING", "version": 4},
+                {"id": "b1b4333c-e4bf-4b95-a25e-614a81b2ec8f",
+                 "agentId": "00000000-0000-0000-0000-000000000000", "type": "DRAIN", "status": "DRAINED"},
+        ]), patch.object(restart_worker, "compose_command", side_effect=lambda *args: compose.append(args)):
+            with self.assertRaisesRegex(restart_worker.LifecycleError, "DRAIN for this Worker"):
+                restart_worker.run(env, 1, token, 30, "b1b4333c-e4bf-4b95-a25e-614a81b2ec8f")
+        self.assertEqual(compose, [])
+
 
 if __name__ == "__main__":
     unittest.main()

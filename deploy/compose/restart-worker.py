@@ -91,7 +91,8 @@ def compose_command(project: str, env_file: Path, *arguments: str) -> None:
     subprocess.run(command, check=True)
 
 
-def run(env_file: Path, slot: int, token_file: Path, timeout: int) -> None:
+def run(env_file: Path, slot: int, token_file: Path, timeout: int,
+        resume_operation_id: str | None = None) -> None:
     values = read_env(env_file)
     if values.get("API_AUTH_ENABLED") != "true":
         raise LifecycleError("API_AUTH_ENABLED=true is required for Worker lifecycle operations")
@@ -113,19 +114,36 @@ def run(env_file: Path, slot: int, token_file: Path, timeout: int) -> None:
     base_url = f"http://127.0.0.1:{port}"
     agent_path = f"/api/v1/agents/{agent_id}"
     agent = request_json(base_url, token, "GET", agent_path)
-    if agent.get("id") != agent_id or agent.get("phase") not in {"READY", "BUSY"}:
-        raise LifecycleError(f"worker is not drainable (phase={agent.get('phase', 'unknown')})")
-
-    drain_key = str(uuid.uuid4())
-    drain = request_json(base_url, token, "POST", agent_path + "/operations/drain",
-                         {"expectedVersion": agent["version"]}, drain_key)
-    operation_id = drain.get("id")
-    if not operation_id:
-        raise LifecycleError("Drain request did not return an operation ID")
-    print(f"Drain requested: operation={operation_id}")
+    if agent.get("id") != agent_id:
+        raise LifecycleError("Control Plane returned an unexpected Worker")
+    phase = agent.get("phase")
+    if resume_operation_id:
+        try:
+            uuid.UUID(resume_operation_id)
+        except ValueError as error:
+            raise LifecycleError("resume operation ID must be a UUID") from error
+        operation_id = resume_operation_id
+        operation_path = f"{agent_path}/operations/{operation_id}"
+        drain = request_json(base_url, token, "GET", operation_path)
+        if drain.get("id") != operation_id or drain.get("agentId") != agent_id or drain.get("type") != "DRAIN":
+            raise LifecycleError("resume operation must be a DRAIN for this Worker")
+        if phase not in {"DRAINING", "READY", "BUSY"}:
+            raise LifecycleError(f"cannot resume Worker restart from phase={phase or 'unknown'}")
+        print(f"Resuming Drain: operation={operation_id}")
+    else:
+        if phase not in {"READY", "BUSY"}:
+            suffix = "; rerun with --resume-operation-id <drain-operation-id>" if phase == "DRAINING" else ""
+            raise LifecycleError(f"worker is not drainable (phase={phase or 'unknown'}){suffix}")
+        drain_key = str(uuid.uuid4())
+        drain = request_json(base_url, token, "POST", agent_path + "/operations/drain",
+                             {"expectedVersion": agent["version"]}, drain_key)
+        operation_id = drain.get("id")
+        if not operation_id:
+            raise LifecycleError("Drain request did not return an operation ID")
+        operation_path = f"{agent_path}/operations/{operation_id}"
+        print(f"Drain requested: operation={operation_id}")
 
     deadline = time.monotonic() + timeout
-    operation_path = f"{agent_path}/operations/{operation_id}"
     while time.monotonic() < deadline:
         operation = request_json(base_url, token, "GET", operation_path)
         status = operation.get("status")
@@ -173,11 +191,12 @@ def main() -> int:
     parser.add_argument("oidc_token_file", type=Path, help="OIDC access-token file owned by you, mode 0600")
     parser.add_argument("--env-file", type=Path, default=SCRIPT_DIR / ".env")
     parser.add_argument("--timeout", type=int, default=600, help="drain/reconnect timeout in seconds")
+    parser.add_argument("--resume-operation-id", help="resume a previously requested DRAIN operation")
     args = parser.parse_args()
     if args.timeout < 10 or args.timeout > 7200:
         parser.error("--timeout must be between 10 and 7200 seconds")
     try:
-        run(args.env_file.resolve(), args.slot, args.oidc_token_file, args.timeout)
+        run(args.env_file.resolve(), args.slot, args.oidc_token_file, args.timeout, args.resume_operation_id)
     except (LifecycleError, subprocess.CalledProcessError) as error:
         print(f"Worker restart stopped safely: {error}", file=sys.stderr)
         return 1
