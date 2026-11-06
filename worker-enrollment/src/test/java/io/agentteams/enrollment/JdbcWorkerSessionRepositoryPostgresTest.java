@@ -67,8 +67,8 @@ class JdbcWorkerSessionRepositoryPostgresTest {
                 )
                 """);
         jdbc.execute("CREATE TABLE platform_identities (id UUID PRIMARY KEY, subject TEXT NOT NULL)");
-        jdbc.execute("CREATE TABLE tenants(id UUID PRIMARY KEY, status TEXT NOT NULL)");
-        jdbc.execute("CREATE TABLE projects(id UUID PRIMARY KEY, tenant_id TEXT NOT NULL, status TEXT NOT NULL)");
+        jdbc.execute("CREATE TABLE tenants(id UUID PRIMARY KEY, external_key TEXT NOT NULL, status TEXT NOT NULL)");
+        jdbc.execute("CREATE TABLE projects(id UUID PRIMARY KEY, tenant_id TEXT NOT NULL, name TEXT NOT NULL, status TEXT NOT NULL)");
         jdbc.execute("""
                 CREATE TABLE project_memberships(
                     tenant_id TEXT NOT NULL, project_id UUID NOT NULL, subject TEXT NOT NULL,
@@ -217,8 +217,9 @@ class JdbcWorkerSessionRepositoryPostgresTest {
 
     @Test
     void membershipFunctionUsesCurrentActiveRoleAndDoesNotGrantDirectMembershipReads() {
-        jdbc.update("INSERT INTO tenants(id, status) VALUES (?, 'ACTIVE')", MEMBERSHIP_TENANT_ID);
-        jdbc.update("INSERT INTO projects(id, tenant_id, status) VALUES (?, ?, 'ACTIVE')",
+        jdbc.update("INSERT INTO tenants(id, external_key, status) VALUES (?, 'tenant-alias', 'ACTIVE')",
+                MEMBERSHIP_TENANT_ID);
+        jdbc.update("INSERT INTO projects(id, tenant_id, name, status) VALUES (?, ?, 'project-alias', 'ACTIVE')",
                 MEMBERSHIP_PROJECT_ID, MEMBERSHIP_TENANT_ID.toString());
         jdbc.update("INSERT INTO project_memberships(tenant_id, project_id, subject, role, status) "
                         + "VALUES (?, ?, 'operator', 'ADMIN', 'ACTIVE')",
@@ -230,6 +231,15 @@ class JdbcWorkerSessionRepositoryPostgresTest {
         WorkerScope scope = new WorkerScope(MEMBERSHIP_TENANT_ID.toString(), MEMBERSHIP_PROJECT_ID.toString(), "team-a");
 
         assertThat(restrictedRepository.hasActiveProjectManagementMembership("operator", scope)).isTrue();
+        assertThat(restrictedRepository.hasActiveProjectManagementMembership("operator",
+                new WorkerScope("tenant-alias", "project-alias", "team-a")))
+                .as("OIDC tenant and project aliases resolve only within the active member's tenant")
+                .isTrue();
+        assertThat(restrictedRepository.resolveAuthorizedScope("operator",
+                new WorkerScope("tenant-alias", "project-alias", "team-a")))
+                .contains(new WorkerScope("tenant-alias", MEMBERSHIP_PROJECT_ID.toString(), "team-a"));
+        assertThat(restrictedRepository.resolveAuthorizedScope("other-subject",
+                new WorkerScope("tenant-alias", "project-alias", "team-a"))).isEmpty();
         assertThatThrownBy(() -> new JdbcTemplate(restrictedDataSource).queryForObject(
                 "SELECT count(*) FROM project_memberships", Long.class))
                 .isInstanceOf(org.springframework.dao.DataAccessException.class);

@@ -50,14 +50,14 @@ public class WorkerSessionService {
         Objects.requireNonNull(agentId, "agentId");
         requireSubject(subject);
         Objects.requireNonNull(callerScope, "callerScope");
-        requireActiveMembership(subject, callerScope);
+        WorkerScope authorizedScope = requireAuthorizedScope(subject, callerScope);
         if (modelCredentialRef != null) validateModelCredentialRef(modelCredentialRef);
         Duration ttl = requestedTtl == null ? defaultTtl : validateTtl(requestedTtl);
 
-        repository.setExecutionScope(callerScope);
+        repository.setExecutionScope(authorizedScope);
         WorkerSessionRepository.WorkerRegistration worker = repository.findAgent(agentId)
                 .orElseThrow(() -> new WorkerEnrollmentException("Worker is not available in caller scope"));
-        if (!callerScope.equalsScope(worker.scope()) || !isEnrollable(worker.phase())) {
+        if (!authorizedScope.equalsScope(worker.scope()) || !isEnrollable(worker.phase())) {
             throw new WorkerEnrollmentException("Worker is not available in caller scope");
         }
 
@@ -73,7 +73,7 @@ public class WorkerSessionService {
             modelProxyToken = requireGeneratedModelProxyToken(modelProxyTokens.generate());
             proxyCredentialId = UUID.randomUUID();
             repository.insertModelProxyCredential(new ModelProxyCredentialRecord(proxyCredentialId, sessionId,
-                    agentId, callerScope, sha256(modelProxyToken), modelCredentialRef, expiresAt, now));
+                    agentId, authorizedScope, sha256(modelProxyToken), modelCredentialRef, expiresAt, now));
         }
         return new IssuedWorkerSession(sessionId, agentId, accessToken, expiresAt,
                 proxyCredentialId, modelProxyToken);
@@ -86,11 +86,11 @@ public class WorkerSessionService {
         Objects.requireNonNull(sessionId, "sessionId");
         requireSubject(subject);
         Objects.requireNonNull(callerScope, "callerScope");
-        requireActiveMembership(subject, callerScope);
-        repository.setExecutionScope(callerScope);
+        WorkerScope authorizedScope = requireAuthorizedScope(subject, callerScope);
+        repository.setExecutionScope(authorizedScope);
         Optional<WorkerSessionRepository.WorkerSessionOwnership> session =
                 repository.findSessionForUpdate(agentId, sessionId);
-        if (session.isEmpty() || !callerScope.equalsScope(session.get().scope())) {
+        if (session.isEmpty() || !authorizedScope.equalsScope(session.get().scope())) {
             throw new WorkerEnrollmentException("Worker session is not available in caller scope");
         }
         if (!repository.revoke(agentId, sessionId, clock.instant())) {
@@ -104,10 +104,10 @@ public class WorkerSessionService {
         }
     }
 
-    private void requireActiveMembership(String subject, WorkerScope scope) {
-        if (!repository.hasActiveProjectManagementMembership(subject, scope)) {
-            throw new WorkerEnrollmentException("Worker session is not available in caller scope");
-        }
+    private WorkerScope requireAuthorizedScope(String subject, WorkerScope scope) {
+        return repository.resolveAuthorizedScope(subject, scope)
+                .orElseThrow(() -> new WorkerEnrollmentException(
+                        "Worker session is not available in caller scope"));
     }
 
     private static void requireSubject(String subject) {

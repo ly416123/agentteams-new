@@ -35,12 +35,18 @@ public class JdbcWorkerSessionRepository implements WorkerSessionRepository {
 
     @Override
     public boolean hasActiveProjectManagementMembership(String subject, WorkerScope scope) {
+        return resolveAuthorizedScope(subject, scope).isPresent();
+    }
+
+    @Override
+    public Optional<WorkerScope> resolveAuthorizedScope(String subject, WorkerScope requestedScope) {
         Objects.requireNonNull(subject, "subject");
-        Objects.requireNonNull(scope, "scope");
-        Boolean allowed = jdbc.queryForObject(
-                "SELECT public.worker_enrollment_has_active_project_management_membership(?, ?, ?)",
-                Boolean.class, subject, scope.tenant(), scope.project());
-        return Boolean.TRUE.equals(allowed);
+        Objects.requireNonNull(requestedScope, "requestedScope");
+        String canonicalProjectId = jdbc.queryForObject(
+                "SELECT public.worker_enrollment_resolve_authorized_project_id(?, ?, ?)",
+                String.class, subject, requestedScope.tenant(), requestedScope.project());
+        return Optional.ofNullable(canonicalProjectId)
+                .map(projectId -> new WorkerScope(requestedScope.tenant(), projectId, requestedScope.team()));
     }
 
     @Override

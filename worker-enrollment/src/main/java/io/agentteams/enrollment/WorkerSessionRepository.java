@@ -9,6 +9,8 @@ public interface WorkerSessionRepository {
 
     boolean hasActiveProjectManagementMembership(String subject, WorkerScope scope);
 
+    Optional<WorkerScope> resolveAuthorizedScope(String subject, WorkerScope requestedScope);
+
     Optional<WorkerRegistration> findAgent(UUID agentId);
 
     void insert(WorkerSessionRecord session);

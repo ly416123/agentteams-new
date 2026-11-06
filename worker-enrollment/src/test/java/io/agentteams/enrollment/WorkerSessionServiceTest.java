@@ -57,6 +57,18 @@ class WorkerSessionServiceTest {
     }
 
     @Test
+    void canonicalizesAuthorizedProjectNameBeforeComparingWorkerAndBindingProxyCredential() {
+        InMemoryRepository repository = new InMemoryRepository();
+        WorkerSessionService service = service(repository);
+
+        service.issue(AGENT_ID, SUBJECT, new WorkerScope("tenant-a", "project-alias", "team-a"),
+                PERMISSIONS, Duration.ofHours(1), "vault://tenant-a/project-a/chatgpt");
+
+        assertThat(repository.executionScope).isEqualTo(SCOPE);
+        assertThat(repository.savedModelCredential.scope()).isEqualTo(SCOPE);
+    }
+
+    @Test
     void rejectsUnsafeOrEmptyModelCredentialReferencesBeforeWritingSession() {
         InMemoryRepository repository = new InMemoryRepository();
         WorkerSessionService service = service(repository);
@@ -178,6 +190,15 @@ class WorkerSessionServiceTest {
             lastMembershipSubject = subject;
             lastMembershipScope = scope;
             return membershipActive;
+        }
+
+        @Override
+        public Optional<WorkerScope> resolveAuthorizedScope(String subject, WorkerScope requestedScope) {
+            lastMembershipSubject = subject;
+            lastMembershipScope = requestedScope;
+            if (!membershipActive) return Optional.empty();
+            String project = requestedScope.project().equals("project-alias") ? SCOPE.project() : requestedScope.project();
+            return Optional.of(new WorkerScope(requestedScope.tenant(), project, requestedScope.team()));
         }
 
         @Override

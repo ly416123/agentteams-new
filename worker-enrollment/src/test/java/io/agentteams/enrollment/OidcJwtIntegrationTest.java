@@ -138,8 +138,8 @@ class OidcJwtIntegrationTest {
                     created_at TIMESTAMPTZ NOT NULL
                 )
                 """);
-        jdbc.execute("CREATE TABLE tenants(id UUID PRIMARY KEY, status TEXT NOT NULL)");
-        jdbc.execute("CREATE TABLE projects(id UUID PRIMARY KEY, tenant_id TEXT NOT NULL, status TEXT NOT NULL)");
+        jdbc.execute("CREATE TABLE tenants(id UUID PRIMARY KEY, external_key TEXT NOT NULL, status TEXT NOT NULL)");
+        jdbc.execute("CREATE TABLE projects(id UUID PRIMARY KEY, tenant_id TEXT NOT NULL, name TEXT NOT NULL, status TEXT NOT NULL)");
         jdbc.execute("""
                 CREATE TABLE project_memberships(
                     tenant_id TEXT NOT NULL, project_id UUID NOT NULL, subject TEXT NOT NULL,
@@ -310,8 +310,8 @@ class OidcJwtIntegrationTest {
     }
 
     private void insertActiveProjectMembership() {
-        jdbc.update("INSERT INTO tenants(id, status) VALUES (?, 'ACTIVE')", TENANT_ID);
-        jdbc.update("INSERT INTO projects(id, tenant_id, status) VALUES (?, ?, 'ACTIVE')",
+        jdbc.update("INSERT INTO tenants(id, external_key, status) VALUES (?, 'tenant-alias', 'ACTIVE')", TENANT_ID);
+        jdbc.update("INSERT INTO projects(id, tenant_id, name, status) VALUES (?, ?, 'project-alias', 'ACTIVE')",
                 PROJECT_ID, TENANT_ID.toString());
         jdbc.update("INSERT INTO project_memberships(tenant_id, project_id, subject, role, status) "
                         + "VALUES (?, ?, ?, 'ADMIN', 'ACTIVE')",
