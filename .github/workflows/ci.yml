@@ -1,0 +1,176 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: worker-enrollment-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  worker-enrollment:
+    name: Enrollment and credential proxy (Java 21)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Build and test the slot-aware Gateway
+        run: python3 deploy/compose/build-gateway-hardening.py
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Test and package
+        run: mvn --batch-mode --no-transfer-progress -Dagentteams.gateway.test-image=agentteams-new/gateway:v0.1.5-session-bound-artifacts-0156f2c verify
+
+      - name: Require PostgreSQL integration tests to execute
+        run: |
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+
+          report = ET.parse(
+              "worker-enrollment/target/surefire-reports/TEST-io.agentteams.enrollment.JdbcWorkerSessionRepositoryPostgresTest.xml"
+          ).getroot()
+          oidc_report = ET.parse(
+              "worker-enrollment/target/surefire-reports/TEST-io.agentteams.enrollment.OidcJwtIntegrationTest.xml"
+          ).getroot()
+          gateway_report = ET.parse(
+              "worker-enrollment/target/surefire-reports/TEST-io.agentteams.enrollment.GatewaySessionHandshakeTest.xml"
+          ).getroot()
+          for name, suite, expected_count in (
+              ("repository", report, "10"),
+              ("signed OIDC to PostgreSQL", oidc_report, "8"),
+              ("slot-aware Gateway gRPC session handshake", gateway_report, "6"),
+          ):
+              assert suite.attrib["tests"] == expected_count, (name, suite.attrib)
+              assert suite.attrib["skipped"] == "0", (name, suite.attrib)
+              assert suite.attrib["failures"] == "0", (name, suite.attrib)
+              assert suite.attrib["errors"] == "0", (name, suite.attrib)
+          print("All 24 PostgreSQL, OIDC, and slot-aware Gateway integration tests executed successfully.")
+          PY
+
+      - name: Require Attempt context authorization tests to execute
+        run: |
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+
+          report = ET.parse(
+              "credential-proxy/target/surefire-reports/TEST-io.agentteams.credentialproxy.AttemptExecutionContextResolverTest.xml"
+          ).getroot()
+          assert report.attrib["tests"] == "12", report.attrib
+          assert report.attrib["skipped"] == "0", report.attrib
+          assert report.attrib["failures"] == "0", report.attrib
+          assert report.attrib["errors"] == "0", report.attrib
+          print("All 12 Attempt context authorization tests executed successfully.")
+          PY
+
+      - name: Require credential proxy database boundary tests to execute
+        run: |
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+
+          report = ET.parse(
+              "credential-proxy/target/surefire-reports/TEST-io.agentteams.credentialproxy.JdbcActiveAttemptRepositoryPostgresTest.xml"
+          ).getroot()
+          assert report.attrib["tests"] == "20", report.attrib
+          assert report.attrib["skipped"] == "0", report.attrib
+          assert report.attrib["failures"] == "0", report.attrib
+          assert report.attrib["errors"] == "0", report.attrib
+          print("All 20 PostgreSQL credential proxy boundary tests executed successfully.")
+          PY
+
+      - name: Require Attempt credential handoff endpoint tests to execute
+        run: |
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+
+          report = ET.parse(
+              "credential-proxy/target/surefire-reports/TEST-io.agentteams.credentialproxy.AttemptCredentialIssueControllerTest.xml"
+          ).getroot()
+          assert report.attrib["tests"] == "3", report.attrib
+          assert report.attrib["skipped"] == "0", report.attrib
+          assert report.attrib["failures"] == "0", report.attrib
+          assert report.attrib["errors"] == "0", report.attrib
+          print("All three Attempt credential handoff endpoint tests executed successfully.")
+          PY
+
+      - name: Require credential source security tests to execute
+        run: |
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+
+          report = ET.parse(
+              "credential-proxy/target/surefire-reports/TEST-io.agentteams.credentialproxy.FileCredentialSourceTest.xml"
+          ).getroot()
+          assert report.attrib["tests"] == "7", report.attrib
+          assert report.attrib["skipped"] == "0", report.attrib
+          assert report.attrib["failures"] == "0", report.attrib
+          assert report.attrib["errors"] == "0", report.attrib
+          print("All 7 file credential source security tests executed successfully.")
+          PY
+
+      - name: Require model proxy authorization and forwarding tests to execute
+        run: |
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+
+          for class_name, expected in (
+              ("ModelProxyServiceTest", "12"),
+              ("ModelProxyControllerTest", "3"),
+              ("LeaseGuardedInputStreamTest", "4"),
+          ):
+              report = ET.parse(
+                  f"credential-proxy/target/surefire-reports/TEST-io.agentteams.credentialproxy.{class_name}.xml"
+              ).getroot()
+              assert report.attrib["tests"] == expected, (class_name, report.attrib)
+              assert report.attrib["skipped"] == "0", (class_name, report.attrib)
+              assert report.attrib["failures"] == "0", (class_name, report.attrib)
+              assert report.attrib["errors"] == "0", (class_name, report.attrib)
+          print("All 19 model proxy authorization, lease cancellation, upstream forwarding, and HTTP streaming tests executed successfully.")
+          PY
+
+      - name: Validate Compose and shell scripts
+        run: |
+          docker pull postgres:16-alpine
+          docker pull nats:2.10-alpine
+          docker pull natsio/nats-box:0.14.0
+          docker pull alpine:3.21
+          docker compose --env-file deploy/compose/.env.example -f deploy/compose/compose.yaml config --quiet
+          bash -n deploy/compose/*.sh
+          python3 -m unittest \
+            verification.test_compose_fixed_worker_capacity \
+            verification.test_compose_worker_restart \
+            verification.test_compose_oidc_url_contract \
+            verification.test_compose_control_plane_database_roles \
+            verification.test_fixed_capacity_estimator \
+            verification.test_compose_state_recovery -v
+
+      - name: Build and test the TASK_EVENT-hardened Control Plane
+        run: python3 deploy/compose/build-control-plane-hardening.py
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and test the Attempt-isolated Worker
+        run: python3 deploy/compose/build-worker-hardening.py
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Credential Proxy container
+        run: docker build --secret id=maven_settings,src="$HOME/.m2/settings.xml" --tag agentteams-credential-proxy:ci --file credential-proxy/Dockerfile .
+
+      - name: Build Worker Enrollment container
+        run: docker build --secret id=maven_settings,src="$HOME/.m2/settings.xml" --tag agentteams-worker-enrollment:ci --file worker-enrollment/Dockerfile .

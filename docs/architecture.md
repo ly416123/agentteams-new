@@ -1,6 +1,6 @@
 # AgentTeams New 架构基线
 
-**状态：** 初始设计，供实现计划使用
+**状态：** 阶段性目标架构；Compose 基础服务已验证，真实 Worker 与多租户隔离尚未验收
 **日期：** 2026-11-04
 
 ## 1. 设计目标
@@ -28,12 +28,14 @@ NATS JetStream ──► Agent Gateway ◄─────┘ command persistence
 - PostgreSQL 保存任务、Attempt、Assignment、Lease、授权关系、Outbox 和可恢复状态，是业务事实源。
 - NATS JetStream 承载持久事件。Gateway 持久化命令并按序号、ACK 游标处理断线恢复。
 - Worker 静态部署并主动注册。控制面不接触 Docker Socket，不持有创建容器的权限。
+- 固定 Worker 的 Gateway 会话由独立 `worker-enrollment` 服务签发：调用者须通过 OIDC issuer、签名、audience 验证，并持有 `worker:session:manage` 权限；调用 scope 必须与 Agent 注册元数据中的 tenant/project/team 完全一致，且 JWT subject 在该 Tenant/Project 中必须仍有 ACTIVE 的 OWNER/ADMIN/OPERATOR Membership，Tenant 与 Project 也必须为 ACTIVE。每次签发和撤销时都实时查验当前数据库状态，因此已禁用成员不能凭未过期 JWT 管理会话。明文随机 token 只返回一次，数据库仅保存 SHA-256，TTL 限制在 1 小时至 30 天。
+- Enrollment 数据库帐号仅有必要的 Agent/Session 列权限，并通过独立 `SECURITY DEFINER` 函数检查操作者当前 Tenant/Project Membership；不能直接读取 Membership、Project 或 Tenant 表。Compose 为每个 Worker 槽位单独加载 `0600` Gateway Token 和模型代理 Token。v0.1.5 Gateway 在握手时校验 session，撤销不主动断开现有连接。
 - Matrix 是可选的人机协作适配器；不能作为调度总线或任务状态库。
 - Artifact 正文存储在隔离的对象存储命名空间，通过租户授权后的短期 URL 访问。
 
 ## 3. 固定容量与调度
 
-容量规划给出 Worker 实例数和执行槽位数，部署配置据此启动固定池。扩容由运维修改版本化配置并执行受控滚动；任务高峰超出容量时按租户配额公平排队或限流。
+容量规划给出 Worker 实例数和执行槽位数，部署配置据此启动固定池。每个 Worker Agent 绑定单一 Tenant/Project/Team；共享基础设施不允许同一 Worker 进程跨租户执行。扩容由运维修改版本化配置并执行受控滚动；任务高峰超出容量时按租户配额公平排队或限流。
 
 首期 `maxConcurrency=1`。Worker 的在线状态不代表拥有任务；只有有效 Assignment/Attempt Lease 才能执行。注册、心跳、drain、取消、租约过期与 ACK 恢复沿用现有协议，具体接口差异需在 Compose POC 前确认。
 
@@ -55,7 +57,9 @@ NATS JetStream ──► Agent Gateway ◄─────┘ command persistence
 
 ## 5. 凭证流
 
-短期兼容模式允许受信任 Worker 从容器 Secret 文件读取上游密钥，但不能称为零信任凭证隔离。目标模式由凭证代理验证短期消费令牌，检查租户、项目、Attempt、模型/工具 allowlist、过期和撤销状态，再由代理解析上游密钥并转发。模型与 MCP 分别定义适配协议；代理不可用时 fail-closed，日志/事件/Trace 不记录密钥。
+- Enrollment 可为一个 Gateway session 签发单独的模型代理 Token，数据库只存该 Token 的哈希，并绑定 Agent scope、Session 和模型凭证引用；撤销 Gateway session 会同步撤销此 Token。`credential-proxy` 已实现模型 Token 哈希鉴权、唯一活动 Assignment/Attempt/Lease 解析、租户与模型 allowlist 校验、文件凭据源及 HTTPS Responses API SSE 转发；不接受客户端自报 Task/Attempt scope，失败时 fail-closed。代理在请求发出前和流式期间复核授权，撤销或 Lease 失效会关闭上游流并释放并发名额。Provider 凭据只读挂载到代理，不进入 Worker。MCP Connector/Gateway 尚未实现，真实 Provider 与 Worker 端到端调用也尚未在 POC 验收。
+
+固定 Worker 并发为 1 时，模型代理凭据只标识 Agent 和其租户 scope；每次上游调用前，代理从 PostgreSQL 解析该 Agent 唯一的活动 Assignment/Attempt/Lease 和 Task `resource_scopes`。客户端提供的 Tenant/Task/Attempt 字段不参与授权。无活动执行、多条活动执行、租约过期或 scope 不一致均拒绝。`credential-proxy` 通过 `SECURITY DEFINER` 窄函数执行 JDBC 查询；非登录函数 owner 只读所需列，运行角色只获函数执行权。Enrollment Membership 检查同样使用独立的最小权限函数 owner。安装脚本为 [credential-proxy.sql](../credential-proxy/src/main/resources/db/credential-proxy.sql) 与 [worker-enrollment-rls.sql](../worker-enrollment/src/main/resources/db/worker-enrollment-rls.sql)，均要求共享 schema v121 已迁移。代码和隔离集成测试已覆盖代理授权与转发；POC Provider 目录和各 Worker 凭据文件尚未配置，所以真实 Worker/Provider 调用未验收。
 
 Secret Manager 负责密钥存储和轮换；数据库及消息只存引用、版本、策略与审计元数据。Higress 可作为模型代理候选，MCP 需单独评估 MCP Connector/Gateway，不能假设普通 AI Gateway 自动具备完整工具授权能力。
 
@@ -67,7 +71,7 @@ PostgreSQL、NATS、对象存储与 Matrix（启用时）都要有持久化、�
 
 ## 7. 兼容与共享代码边界
 
-新架构不另建 Task/Attempt/RBAC/Outbox 状态机，不双写事实源。外部边界使用版本化 protobuf/gRPC 与稳定公共 API。共享核心 Maven 制品已按 `0.1.1` 发布并通过独立远端消费者验证；Compose 仍须等待 Control Plane、Gateway 与 Worker 的固定版本 OCI 镜像可追溯到源 commit 和 digest。
+新架构不另建 Task/Attempt/RBAC/Outbox 状态机，不双写事实源。外部边界使用版本化 protobuf/gRPC 与稳定公共 API。共享核心 Maven 制品 `0.1.5` 已发布并通过独立远端消费者验证。Control Plane、Gateway、Worker 的 OCI 镜像来自 `agentteams-java v0.1.5`，均按 digest 固定在 `deploy/compose/.env.example`，源 commit 为 `0156f2c1fecdc868cb4a0f4f13fb068bb4162834`；发布清单见 [v0.1.5 release](https://github.com/ly416123/agentteams-java/releases/tag/v0.1.5)。
 
 Java 21 继续承载 Control Plane、Gateway、Scheduler、协议和 AgentScope Worker。Python 仅用于确实需要 Python SDK 的独立 Agent/评测/批处理；其他语言需先有可测量的性能或隔离需求。
 
