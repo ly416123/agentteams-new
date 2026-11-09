@@ -16,6 +16,7 @@ from pathlib import Path
 SOURCE_COMMIT = "0156f2c1fecdc868cb4a0f4f13fb068bb4162834"
 SOURCE_TAG = "v0.1.5"
 IMAGE_TAG = "agentteams-new/agent-worker:v0.1.5-attempt-capability-0156f2c"
+BASE_IMAGE = "dockerproxy.net/library/eclipse-temurin@sha256:0b99b3376fbb50dbf9c0af8535fdd5b8eb0d3fdfc8b1e4967f383b6919f6901a"
 REQUIRED_TESTS = {
     "io.agentteams.worker.agentscope.ConfiguredAgentScopeHarnessFactoryTest": 19,
     "io.agentteams.worker.chatgpt.AttemptCredentialTokenSourceTest": 2,
@@ -121,18 +122,7 @@ def main() -> int:
         image_context = work / "runtime-image"
         image_context.mkdir()
         shutil.copy2(boot_jar, image_context / "app.jar")
-        base_image = "eclipse-temurin:21-jre"
-        base_check = subprocess.run(
-            ["docker", "image", "inspect", base_image], capture_output=True, check=False,
-        )
-        if base_check.returncode != 0:
-            fallback_check = subprocess.run(
-                ["docker", "image", "inspect", IMAGE_TAG], capture_output=True, check=False,
-            )
-            if fallback_check.returncode != 0:
-                raise RuntimeError("no local Java 21 Worker base image is available and Docker Hub is unreachable")
-            base_image = IMAGE_TAG
-        (image_context / "Dockerfile").write_text(f"""FROM {base_image}
+        (image_context / "Dockerfile").write_text(f"""FROM {BASE_IMAGE}
 WORKDIR /app
 COPY --chown=10001:0 app.jar /app/app.jar
 USER 10001
