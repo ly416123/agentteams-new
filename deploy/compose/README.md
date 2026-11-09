@@ -58,7 +58,17 @@ Control Plane 仅绑定到 `127.0.0.1:${CONTROL_PLANE_PORT}`；PostgreSQL、NATS
 
 `WORKER_REPLICAS` 取值为 0 到 8。每个槽位使用固定且唯一的 `WORKER_N_SLOT_ID`；不要使用 `docker compose --scale`，它会复制同一个槽位身份。`WORKER_SLOT_IDS_JSON` 必须按相同顺序包含这些 UUID，启动前由 Enrollment DB setup 预置。启动脚本只选择前 N 个槽位，不会一并拉起全部 Worker。
 
-slot session 与 Attempt capability 已接入 Worker 启动配置：Worker 用 tenant-neutral slot bearer 建立 Gateway 会话；模型请求、Task execution events、Artifact prepare/complete 共享同一 Attempt capability，并在临近到期时续签。`WORKER_SLOT_SCHEDULING_ENABLED` 默认关闭，Control Plane 只有在 slot-aware Assignment、Lease 与公平队列路径完成真实闭环验收后才能开启。workspace 访问的 Attempt capability 校验和真实 A/B 共享槽位执行仍未验收。
+slot session 与 Attempt capability 已接入 Worker 启动配置：Worker 用 tenant-neutral slot bearer 建立 Gateway 会话；模型请求、Task execution events、Artifact prepare/complete 共享同一 Attempt capability，并在临近到期时续签。Control Plane 的 slot-aware Assignment 和 PostgreSQL 持久公平队列已实现：使用加权 deficit round-robin 轮转租户，保存轮转游标与租户权重，并在领取事务中强制 `max_active_attempts`。新租户缺省权重为 1、每租户最多 1 个活动 Attempt；该值可由管理员按容量策略调整。队列每轮最多选空闲固定槽位数，长任务运行期间不会抢占槽位。`WORKER_SLOT_SCHEDULING_ENABLED` 仍默认关闭，需先完成 workspace capability 校验和真实 A/B 共享槽位端到端验收，才可开启。
+
+数据库升级到 V124 后，可由管理员在受控变更中设置租户权重与活动并发上限；`tenant_id` 与 `resource_scopes.tenant_id` 一致：
+
+```sql
+UPDATE tenant_scheduler_policies
+   SET weight = 2, max_active_attempts = 2, updated_at = now()
+ WHERE tenant_id = '<tenant-id>';
+```
+
+权重只影响持续有排队任务的租户之间的相对服务份额；活动 Attempt 上限是硬配额。不要为每个 Task 单独设置策略，也不要通过增加 Worker 槽位绕过租户配额。
 
 ### 估算固定容量
 
@@ -104,9 +114,9 @@ docker compose --env-file .env -f compose.yaml ps
 ./revoke-worker-session.sh http://127.0.0.1:8090 <agent-uuid> <old-session-uuid> /secure/path/oidc-access-token
 ```
 
-撤销会阻止后续 Gateway 握手及模型请求，并使已签发的 Attempt token 在下一次认证或流式 Lease 检查时失效；v0.1.5 不会主动断开已建立的 Gateway 连接。多个固定 Worker 槽位可作为租户中立执行容量，Tenant 凭据由活动 Task scope 选择，不再绑定 Worker 槽位。任务派发目前仍需完成 Tenant-neutral Enrollment 与公平队列接线后，才能实现多租户共享运行。
+撤销会阻止后续 Gateway 握手及模型请求，并使已签发的 Attempt token 在下一次认证或流式 Lease 检查时失效；v0.1.5 不会主动断开已建立的 Gateway 连接。多个固定 Worker 槽位可作为租户中立执行容量，Tenant 凭据由活动 Task scope 选择，不再绑定 Worker 槽位。tenant-neutral Enrollment、slot-aware Assignment 和持久公平队列已接通；共享调度仍需在当前 L5 Compose 数据库上完成备份与 V124 升级验证，以及 Tenant A/B 连续执行、Artifact/workspace 拒绝和 Lease 恢复验收后，才可开启。
 
-Enrollment 提供全局 slot session 管理 API：`POST /api/v1/worker-slots/{slotId}/sessions` 与 `DELETE /api/v1/worker-slots/{slotId}/sessions/{sessionId}`。签发要求 OIDC `worker:slot:session:manage` 权限，不读取 Tenant/Project/Team claims；响应禁止缓存，数据库只存 token SHA-256。派生 Gateway 可用 slot bearer 建立 gRPC 会话，并把在线状态写到 `worker-slot:<UUID>` 独立命名空间，不创建或更新租户 Agent。Task events 与 Artifact prepare/complete 都要求匹配具体 Task/Attempt/Lease 的短期 capability；workspace 访问仍需补 capability 边界，slot 调度也继续默认关闭。
+Enrollment 提供全局 slot session 管理 API：`POST /api/v1/worker-slots/{slotId}/sessions` 与 `DELETE /api/v1/worker-slots/{slotId}/sessions/{sessionId}`。签发要求 OIDC `worker:slot:session:manage` 权限，不读取 Tenant/Project/Team claims；响应禁止缓存，数据库只存 token SHA-256。派生 Gateway 可用 slot bearer 建立 gRPC 会话，并把在线状态写到 `worker-slot:<UUID>` 独立命名空间，不创建或更新租户 Agent。Task events 与 Artifact prepare/complete 都要求匹配具体 Task/Attempt/Lease 的短期 capability；workspace 访问仍需补 capability 边界，因此 slot 调度默认关闭。
 
 ### 安全重启固定槽位
 

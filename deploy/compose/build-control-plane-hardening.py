@@ -93,8 +93,9 @@ def require_tests(source: Path) -> None:
         "io.agentteams.controlplane.quality.JdbcArtifactQualityEventRepositoryTest": 6,
         "io.agentteams.controlplane.worker.WorkerDrainLifecycleTest": 9,
         "io.agentteams.controlplane.persistence.FoundationRepositoryIT": 3,
-        "io.agentteams.controlplane.scheduling.TenantFairQueueTest": 4,
-        "io.agentteams.controlplane.service.TaskAssignmentServiceTest": 8,
+        "io.agentteams.controlplane.scheduling.TenantFairQueueTest": 5,
+        "io.agentteams.controlplane.service.TaskAssignmentSchedulerTest": 4,
+        "io.agentteams.controlplane.service.TaskAssignmentServiceTest": 11,
     }
     for class_name, expected_count in expected.items():
         report = reports / f"TEST-{class_name}.xml"
@@ -143,7 +144,7 @@ def main() -> int:
         run([
             "mvn", "--batch-mode", "--no-transfer-progress", "-P", "!colima-testcontainers",
             "-pl", "control-plane", "-am",
-            "-Dtest=ControlPlaneExecutionEventAdapterTest,JdbcTaskEventScopeGuardPostgresTest,InternalArtifactUploadControllerTest,ConfigDeploymentServiceTest,TeamDeploymentRepositoryTest,SkillControllerTest,JdbcArtifactQualityEventRepositoryTest,WorkerDrainLifecycleTest,FoundationRepositoryIT#doesNotSelectProjectWorkerWithAnActiveLease+concurrentProjectAssignmentsCannotCreateTwoActiveLeasesForOneWorker+createsTenantNeutralWorkerSlotsAndAssignmentBindingSchema,TenantFairQueueTest,TaskAssignmentServiceTest",
+            "-Dtest=ControlPlaneExecutionEventAdapterTest,JdbcTaskEventScopeGuardPostgresTest,InternalArtifactUploadControllerTest,ConfigDeploymentServiceTest,TeamDeploymentRepositoryTest,SkillControllerTest,JdbcArtifactQualityEventRepositoryTest,WorkerDrainLifecycleTest,FoundationRepositoryIT#doesNotSelectProjectWorkerWithAnActiveLease+concurrentProjectAssignmentsCannotCreateTwoActiveLeasesForOneWorker+createsTenantNeutralWorkerSlotsAndAssignmentBindingSchema,TenantFairQueueTest,TaskAssignmentSchedulerTest,TaskAssignmentServiceTest",
             "-Dsurefire.failIfNoSpecifiedTests=false", "test",
         ], cwd=source)
         run([

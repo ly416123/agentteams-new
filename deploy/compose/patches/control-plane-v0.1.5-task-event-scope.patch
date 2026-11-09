@@ -1,37 +1,106 @@
 diff --git a/control-plane/src/main/java/io/agentteams/controlplane/ControlPlaneConfiguration.java b/control-plane/src/main/java/io/agentteams/controlplane/ControlPlaneConfiguration.java
-index 3e59349..693a19f 100644
+index 3e59349..d906a4a 100644
 --- a/control-plane/src/main/java/io/agentteams/controlplane/ControlPlaneConfiguration.java
 +++ b/control-plane/src/main/java/io/agentteams/controlplane/ControlPlaneConfiguration.java
-@@ -7,0 +8 @@ import io.agentteams.controlplane.application.ControlPlaneExecutionEventAdapter;
+@@ -5,6 +5,7 @@ import io.agentteams.application.api.ConfigEventPort;
+ import io.agentteams.application.api.TaskExecutionObservationPort;
+ import io.agentteams.application.api.TaskCommandPort;
+ import io.agentteams.controlplane.application.ControlPlaneExecutionEventAdapter;
 +import io.agentteams.controlplane.application.TaskEventScopeGuard;
-@@ -723 +724,2 @@ public class ControlPlaneConfiguration {
+ import io.agentteams.controlplane.application.ControlPlaneTaskCommandAdapter;
+ import io.agentteams.controlplane.application.ControlPlaneConfigEventAdapter;
+ import io.agentteams.controlplane.outbox.EventPublisher;
+@@ -304,11 +305,12 @@ public class ControlPlaneConfiguration {
+             ObjectProvider<ControlPlaneMetrics> metrics,
+             ObjectProvider<ExecutionContextResolver> contextResolver,
+             ObjectProvider<io.agentteams.controlplane.memory.ContextAssemblyService> contextAssembly,
+-            @Value("${agentteams.scheduler.lease-duration:30s}") java.time.Duration leaseDuration) {
++            @Value("${agentteams.scheduler.lease-duration:30s}") java.time.Duration leaseDuration,
++            @Value("${agentteams.scheduler.worker-slots.enabled:false}") boolean workerSlotSchedulingEnabled) {
+         ControlPlaneMetrics available = metrics.getIfAvailable();
+         return new TaskAssignmentService(persistence, leaseDuration,
+                 available == null ? TaskMetricsPort.noop() : available,
+-                contextResolver.getIfAvailable(), contextAssembly.getIfAvailable());
++                contextResolver.getIfAvailable(), contextAssembly.getIfAvailable(), workerSlotSchedulingEnabled);
+     }
+
+     @Bean
+@@ -720,9 +722,10 @@ public class ControlPlaneConfiguration {
+     @Bean
+     @org.springframework.boot.autoconfigure.condition.ConditionalOnBean(ExecutionEventService.class)
+     ExecutionEventPort executionEventPort(ExecutionEventService executionEvents, DataSource dataSource,
 -            TaskExecutionObservationPort observations) {
 +            TaskExecutionObservationPort observations, TaskEventScopeGuard taskEventScopeGuard) {
 +        org.springframework.jdbc.core.JdbcTemplate jdbc = new org.springframework.jdbc.core.JdbcTemplate(dataSource);
-@@ -725 +727 @@ public class ControlPlaneConfiguration {
+         return new ControlPlaneExecutionEventAdapter(executionEvents,
 -                new JdbcModelCallAuditRecorder(new org.springframework.jdbc.core.JdbcTemplate(dataSource)), observations);
 +                new JdbcModelCallAuditRecorder(jdbc), observations, taskEventScopeGuard);
+     }
+
+     @Bean
+diff --git a/control-plane/src/main/java/io/agentteams/controlplane/api/AgentController.java b/control-plane/src/main/java/io/agentteams/controlplane/api/AgentController.java
+index 5955da6..fe2458e 100644
+--- a/control-plane/src/main/java/io/agentteams/controlplane/api/AgentController.java
++++ b/control-plane/src/main/java/io/agentteams/controlplane/api/AgentController.java
+@@ -91,6 +91,17 @@ public final class AgentController {
+         return ResponseEntity.accepted().body(WorkerOperationResponse.from(operation));
+     }
+
++    @PostMapping("/{id}/operations/activate")
++    public ResponseEntity<WorkerOperationResponse> requestActivate(
++            @PathVariable UUID id,
++            @RequestHeader(value = IDEMPOTENCY_HEADER, required = false) String idempotencyKey,
++            @RequestBody LifecycleRequest request, @RequestParam(required = false) String projectId) {
++        requireIdempotencyKey(idempotencyKey);
++        requireProjectScope(projectId);
++        WorkerOperation operation = operations().activate(id, expectedVersion(request), idempotencyKey);
++        return ResponseEntity.ok(WorkerOperationResponse.from(operation));
++    }
++
+     @PostMapping("/{id}/operations/rollout")
+     public ResponseEntity<WorkerOperationResponse> requestRollout(
+             @PathVariable UUID id,
 diff --git a/control-plane/src/main/java/io/agentteams/controlplane/application/ControlPlaneExecutionEventAdapter.java b/control-plane/src/main/java/io/agentteams/controlplane/application/ControlPlaneExecutionEventAdapter.java
 index dcc48ef..4568d23 100644
 --- a/control-plane/src/main/java/io/agentteams/controlplane/application/ControlPlaneExecutionEventAdapter.java
 +++ b/control-plane/src/main/java/io/agentteams/controlplane/application/ControlPlaneExecutionEventAdapter.java
-@@ -25,0 +26 @@ public final class ControlPlaneExecutionEventAdapter implements ExecutionEventPo
+@@ -23,6 +23,7 @@ public final class ControlPlaneExecutionEventAdapter implements ExecutionEventPo
+     private final ExecutionEventService executionEvents;
+     private final ModelCallAuditRecorder modelCallAudits;
+     private final TaskExecutionObservationPort observations;
 +    private final TaskEventScopeGuard taskEventScopeGuard;
-@@ -37,0 +39,6 @@ public final class ControlPlaneExecutionEventAdapter implements ExecutionEventPo
+
+     public ControlPlaneExecutionEventAdapter(ExecutionEventService executionEvents) {
+         this(executionEvents, ModelCallAuditRecorder.noop(), TaskExecutionObservationPort.noop());
+@@ -35,9 +36,16 @@ public final class ControlPlaneExecutionEventAdapter implements ExecutionEventPo
+
+     public ControlPlaneExecutionEventAdapter(ExecutionEventService executionEvents,
+             ModelCallAuditRecorder modelCallAudits, TaskExecutionObservationPort observations) {
 +        this(executionEvents, modelCallAudits, observations, TaskEventScopeGuard.rejectAll());
 +    }
 +
 +    public ControlPlaneExecutionEventAdapter(ExecutionEventService executionEvents,
 +            ModelCallAuditRecorder modelCallAudits, TaskExecutionObservationPort observations,
 +            TaskEventScopeGuard taskEventScopeGuard) {
-@@ -40,0 +48 @@ public final class ControlPlaneExecutionEventAdapter implements ExecutionEventPo
+         this.executionEvents = Objects.requireNonNull(executionEvents, "executionEvents");
+         this.modelCallAudits = Objects.requireNonNull(modelCallAudits, "modelCallAudits");
+         this.observations = Objects.requireNonNull(observations, "observations");
 +        this.taskEventScopeGuard = Objects.requireNonNull(taskEventScopeGuard, "taskEventScopeGuard");
-@@ -99,2 +107,3 @@ public final class ControlPlaneExecutionEventAdapter implements ExecutionEventPo
+     }
+
+     @Override
+@@ -96,8 +104,9 @@ public final class ControlPlaneExecutionEventAdapter implements ExecutionEventPo
+         Objects.requireNonNull(command, "command");
+         // runId 与既有 observe(...) 相同：run == attempt。白名单与范围校验
+         // 由观测适配器二次校验（不信任上游）。
 -        observations.observed(taskId, command.attemptId(), command.eventId(), command.occurredAt(),
 -                command.correlationId(), command.eventType(), command.payloadJson());
 +        taskEventScopeGuard.runIfActive(taskId, command, () -> observations.observed(taskId,
 +                command.attemptId(), command.eventId(), command.occurredAt(), command.correlationId(),
 +                command.eventType(), command.payloadJson()));
+     }
+
+     private static ArtifactRecord toRecord(UUID taskId, UUID attemptId, UUID eventId, Instant at,
 diff --git a/control-plane/src/main/java/io/agentteams/controlplane/application/JdbcTaskEventScopeGuard.java b/control-plane/src/main/java/io/agentteams/controlplane/application/JdbcTaskEventScopeGuard.java
 new file mode 100644
 index 0000000..fafe4d9
@@ -125,11 +194,381 @@ index 0000000..b563fdc
 +        return (taskId, command, projection) -> false;
 +    }
 +}
+diff --git a/control-plane/src/main/java/io/agentteams/controlplane/artifact/InternalArtifactUploadController.java b/control-plane/src/main/java/io/agentteams/controlplane/artifact/InternalArtifactUploadController.java
+index 058161d..b9c3e5d 100644
+--- a/control-plane/src/main/java/io/agentteams/controlplane/artifact/InternalArtifactUploadController.java
++++ b/control-plane/src/main/java/io/agentteams/controlplane/artifact/InternalArtifactUploadController.java
+@@ -6,6 +6,7 @@ import io.agentteams.controlplane.persistence.FoundationPersistenceService;
+ import io.agentteams.controlplane.persistence.TaskAttemptRecord;
+ import io.agentteams.controlplane.persistence.TaskAssignmentRecord;
+ import java.time.Duration;
++import java.time.Clock;
+ import java.util.Objects;
+ import java.util.UUID;
+ import org.springframework.beans.factory.annotation.Value;
+@@ -41,14 +42,16 @@ public final class InternalArtifactUploadController {
+     private final ArtifactCompletionService completion;
+     private final FoundationPersistenceService persistence;
+     private final String internalToken;
++    private final Clock clock;
+
+     public InternalArtifactUploadController(ArtifactService artifacts, ArtifactCompletionService completion,
+             FoundationPersistenceService persistence,
+-            @Value("${agentteams.quota.internal-token:}") String internalToken) {
++            @Value("${agentteams.quota.internal-token:}") String internalToken, Clock clock) {
+         this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
+         this.completion = Objects.requireNonNull(completion, "completion");
+         this.persistence = Objects.requireNonNull(persistence, "persistence");
+         this.internalToken = internalToken == null ? "" : internalToken.trim();
++        this.clock = Objects.requireNonNull(clock, "clock");
+     }
+
+     @PostMapping("/uploads")
+@@ -109,6 +112,10 @@ public final class InternalArtifactUploadController {
+                 .filter(candidate -> task.equals(candidate.taskId()))
+                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND,
+                         "task assignment does not exist for this attempt"));
++        if (record.phase() != io.agentteams.domain.task.TaskPhase.RUNNING
++                || record.leaseExpiresAt() == null || !record.leaseExpiresAt().isAfter(clock.instant())) {
++            throw new ResponseStatusException(HttpStatus.CONFLICT, "attempt lease is no longer active");
++        }
+         if (!assignment.agentId().toString().equals(agentId.trim())) {
+             throw new ResponseStatusException(HttpStatus.FORBIDDEN, "attempt is not owned by this agent");
+         }
+diff --git a/control-plane/src/main/java/io/agentteams/controlplane/persistence/AgentRepository.java b/control-plane/src/main/java/io/agentteams/controlplane/persistence/AgentRepository.java
+index 22e9fba..7530705 100644
+--- a/control-plane/src/main/java/io/agentteams/controlplane/persistence/AgentRepository.java
++++ b/control-plane/src/main/java/io/agentteams/controlplane/persistence/AgentRepository.java
+@@ -172,6 +172,14 @@ public final class AgentRepository {
+                           AND operation.status IN ('PENDING', 'RUNNING')
+                           AND operation.lease_expires_at > ?
+                    )
++                   AND NOT EXISTS (
++                       SELECT 1
++                         FROM agent_leases lease
++                        WHERE lease.agent_id = a.id
++                          AND lease.status = 'ACTIVE'
++                          AND lease.released_at IS NULL
++                          AND lease.expires_at > ?
++                   )
+                    AND NOT EXISTS (
+                        SELECT 1
+                          FROM jsonb_array_elements_text(
+@@ -185,7 +193,8 @@ public final class AgentRepository {
+                  ORDER BY a.id
+                  LIMIT 1
+                  FOR UPDATE OF a SKIP LOCKED
+-                """, this::map, taskId, JdbcSupport.timestamp(now), JdbcSupport.json(taskSpecJson),
++                """, this::map, taskId, JdbcSupport.timestamp(now), JdbcSupport.timestamp(now),
++                JdbcSupport.json(taskSpecJson),
+                 JdbcSupport.json(taskSpecJson)).stream().findFirst();
+     }
+
+diff --git a/control-plane/src/main/java/io/agentteams/controlplane/persistence/FoundationTransaction.java b/control-plane/src/main/java/io/agentteams/controlplane/persistence/FoundationTransaction.java
+index 4cd465f..a32338d 100644
+--- a/control-plane/src/main/java/io/agentteams/controlplane/persistence/FoundationTransaction.java
++++ b/control-plane/src/main/java/io/agentteams/controlplane/persistence/FoundationTransaction.java
+@@ -5,6 +5,7 @@ public final class FoundationTransaction {
+     private final org.springframework.jdbc.core.JdbcTemplate jdbc;
+     private final AgentRepository agents;
+     private final TaskRepository tasks;
++    private final TenantFairQueueRepository tenantFairQueue;
+     private final TaskAttemptRepository taskAttempts;
+     private final TaskAssignmentRepository taskAssignments;
+     private final AgentLeaseRepository agentLeases;
+@@ -28,6 +29,7 @@ public final class FoundationTransaction {
+         this.jdbc = jdbc;
+         agents = new AgentRepository(jdbc);
+         tasks = new TaskRepository(jdbc);
++        tenantFairQueue = new TenantFairQueueRepository(jdbc);
+         taskAttempts = new TaskAttemptRepository(jdbc);
+         taskAssignments = new TaskAssignmentRepository(jdbc);
+         agentLeases = new AgentLeaseRepository(jdbc);
+@@ -56,6 +58,10 @@ public final class FoundationTransaction {
+         return tasks;
+     }
+
++    public TenantFairQueueRepository tenantFairQueue() {
++        return tenantFairQueue;
++    }
++
+     public TaskAttemptRepository taskAttempts() {
+         return taskAttempts;
+     }
+@@ -165,7 +171,7 @@ public final class FoundationTransaction {
+
+     public java.util.Optional<TaskAssignmentRecord> findAssignmentByAttemptId(java.util.UUID attemptId) {
+         return jdbc.query("""
+-                SELECT id, task_id, attempt_id, agent_id, phase, assigned_at, accepted_at, released_at,
++                SELECT id, task_id, attempt_id, agent_id, worker_slot_id, phase, assigned_at, accepted_at, released_at,
+                        details::text, created_at, updated_at, version
+                   FROM task_assignments WHERE attempt_id = ?
+                   ORDER BY created_at DESC LIMIT 1
+@@ -176,6 +182,7 @@ public final class FoundationTransaction {
+                             rs.getObject("task_id", java.util.UUID.class),
+                             rs.getObject("attempt_id", java.util.UUID.class),
+                             rs.getObject("agent_id", java.util.UUID.class),
++                            rs.getObject("worker_slot_id", java.util.UUID.class),
+                             io.agentteams.domain.task.TaskPhase.valueOf(rs.getString("phase")),
+                             JdbcSupport.instant(rs, "assigned_at"),
+                             accepted == null ? null : accepted.toInstant(),
+@@ -335,7 +342,7 @@ public final class FoundationTransaction {
+
+     private java.util.Optional<TaskAssignmentRecord> findAssignmentById(java.util.UUID id) {
+         return jdbc.query("""
+-                SELECT id, task_id, attempt_id, agent_id, phase, assigned_at, accepted_at, released_at,
++                SELECT id, task_id, attempt_id, agent_id, worker_slot_id, phase, assigned_at, accepted_at, released_at,
+                        details::text, created_at, updated_at, version
+                   FROM task_assignments WHERE id = ?
+                 """, (rs, row) -> {
+@@ -345,6 +352,7 @@ public final class FoundationTransaction {
+                             rs.getObject("task_id", java.util.UUID.class),
+                             rs.getObject("attempt_id", java.util.UUID.class),
+                             rs.getObject("agent_id", java.util.UUID.class),
++                            rs.getObject("worker_slot_id", java.util.UUID.class),
+                             io.agentteams.domain.task.TaskPhase.valueOf(rs.getString("phase")),
+                             JdbcSupport.instant(rs, "assigned_at"),
+                             accepted == null ? null : accepted.toInstant(),
+diff --git a/control-plane/src/main/java/io/agentteams/controlplane/persistence/TaskAssignmentRecord.java b/control-plane/src/main/java/io/agentteams/controlplane/persistence/TaskAssignmentRecord.java
+index 492e715..1d1eb7b 100644
+--- a/control-plane/src/main/java/io/agentteams/controlplane/persistence/TaskAssignmentRecord.java
++++ b/control-plane/src/main/java/io/agentteams/controlplane/persistence/TaskAssignmentRecord.java
+@@ -10,6 +10,7 @@ public record TaskAssignmentRecord(
+         UUID taskId,
+         UUID attemptId,
+         UUID agentId,
++        UUID workerSlotId,
+         TaskPhase phase,
+         Instant assignedAt,
+         Instant acceptedAt,
+@@ -33,4 +34,11 @@ public record TaskAssignmentRecord(
+             throw new IllegalArgumentException("version must not be negative");
+         }
+     }
++
++    public TaskAssignmentRecord(UUID id, UUID taskId, UUID attemptId, UUID agentId, TaskPhase phase,
++            Instant assignedAt, Instant acceptedAt, Instant releasedAt, String detailsJson,
++            Instant createdAt, Instant updatedAt, long version) {
++        this(id, taskId, attemptId, agentId, null, phase, assignedAt, acceptedAt, releasedAt,
++                detailsJson, createdAt, updatedAt, version);
++    }
+ }
+diff --git a/control-plane/src/main/java/io/agentteams/controlplane/persistence/TaskAssignmentRepository.java b/control-plane/src/main/java/io/agentteams/controlplane/persistence/TaskAssignmentRepository.java
+index 64933a4..357b297 100644
+--- a/control-plane/src/main/java/io/agentteams/controlplane/persistence/TaskAssignmentRepository.java
++++ b/control-plane/src/main/java/io/agentteams/controlplane/persistence/TaskAssignmentRepository.java
+@@ -18,10 +18,11 @@ public final class TaskAssignmentRepository {
+     public void insert(TaskAssignmentRecord assignment) {
+         jdbc.update("""
+                 INSERT INTO task_assignments
+-                    (id, task_id, attempt_id, agent_id, phase, assigned_at, accepted_at, released_at,
++                    (id, task_id, attempt_id, agent_id, worker_slot_id, phase, assigned_at, accepted_at, released_at,
+                      details, created_at, updated_at, version)
+-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
++                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 """, assignment.id(), assignment.taskId(), assignment.attemptId(), assignment.agentId(),
++                assignment.workerSlotId(),
+                 assignment.phase().name(), JdbcSupport.timestamp(assignment.assignedAt()),
+                 nullableTimestamp(assignment.acceptedAt()), nullableTimestamp(assignment.releasedAt()),
+                 JdbcSupport.json(assignment.detailsJson()), JdbcSupport.timestamp(assignment.createdAt()),
+@@ -30,7 +31,7 @@ public final class TaskAssignmentRepository {
+
+     public Optional<TaskAssignmentRecord> findById(UUID id) {
+         return jdbc.query("""
+-                SELECT id, task_id, attempt_id, agent_id, phase, assigned_at, accepted_at, released_at,
++                SELECT id, task_id, attempt_id, agent_id, worker_slot_id, phase, assigned_at, accepted_at, released_at,
+                        details::text, created_at, updated_at, version
+                   FROM task_assignments WHERE id = ?
+                 """, this::map, id).stream().findFirst();
+@@ -38,12 +39,29 @@ public final class TaskAssignmentRepository {
+
+     public List<TaskAssignmentRecord> findByTaskId(UUID taskId) {
+         return jdbc.query("""
+-                SELECT id, task_id, attempt_id, agent_id, phase, assigned_at, accepted_at, released_at,
++                SELECT id, task_id, attempt_id, agent_id, worker_slot_id, phase, assigned_at, accepted_at, released_at,
+                        details::text, created_at, updated_at, version
+                   FROM task_assignments WHERE task_id = ? ORDER BY created_at DESC, id DESC
+                 """, this::map, taskId);
+     }
+
++    public Optional<UUID> lockNextAvailableWorkerSlot() {
++        return jdbc.query("""
++                SELECT slot.id
++                  FROM worker_slots slot
++                 WHERE slot.status = 'ACTIVE'
++                   AND NOT EXISTS (
++                       SELECT 1 FROM task_assignments assignment
++                        WHERE assignment.worker_slot_id = slot.id
++                          AND assignment.phase IN ('ASSIGNED', 'ACCEPTED', 'RUNNING')
++                          AND assignment.released_at IS NULL
++                   )
++                 ORDER BY slot.created_at, slot.id
++                 FOR UPDATE OF slot SKIP LOCKED
++                 LIMIT 1
++                """, (rs, row) -> rs.getObject(1, UUID.class)).stream().findFirst();
++    }
++
+     public long count() {
+         Long count = jdbc.queryForObject("SELECT count(*) FROM task_assignments", Long.class);
+         return count == null ? 0 : count;
+@@ -75,6 +93,7 @@ public final class TaskAssignmentRepository {
+         java.sql.Timestamp released = rs.getTimestamp("released_at");
+         return new TaskAssignmentRecord(rs.getObject("id", UUID.class), rs.getObject("task_id", UUID.class),
+                 rs.getObject("attempt_id", UUID.class), rs.getObject("agent_id", UUID.class),
++                rs.getObject("worker_slot_id", UUID.class),
+                 TaskPhase.valueOf(rs.getString("phase")), JdbcSupport.instant(rs, "assigned_at"),
+                 accepted == null ? null : accepted.toInstant(), released == null ? null : released.toInstant(),
+                 rs.getString("details"), JdbcSupport.instant(rs, "created_at"),
+diff --git a/control-plane/src/main/java/io/agentteams/controlplane/persistence/TenantFairQueueRepository.java b/control-plane/src/main/java/io/agentteams/controlplane/persistence/TenantFairQueueRepository.java
+new file mode 100644
+index 0000000..99ddcf0
+--- /dev/null
++++ b/control-plane/src/main/java/io/agentteams/controlplane/persistence/TenantFairQueueRepository.java
+@@ -0,0 +1,136 @@
++package io.agentteams.controlplane.persistence;
++
++import io.agentteams.controlplane.scheduling.TenantFairQueue;
++import java.time.Instant;
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.UUID;
++import org.springframework.jdbc.core.JdbcTemplate;
++
++/** Persists weighted tenant turns and per-tenant concurrency limits in PostgreSQL. */
++public final class TenantFairQueueRepository {
++    private static final String SCHEDULER = "task-assignment";
++    private final JdbcTemplate jdbc;
++
++    public TenantFairQueueRepository(JdbcTemplate jdbc) {
++        this.jdbc = java.util.Objects.requireNonNull(jdbc, "jdbc");
++    }
++
++    public List<UUID> selectQueuedTaskIds(Instant now, int limit) {
++        if (now == null) throw new IllegalArgumentException("now must not be null");
++        if (limit <= 0 || limit > 1000) throw new IllegalArgumentException("limit must be between 1 and 1000");
++        int availableSlots = availableWorkerSlots();
++        if (availableSlots == 0) return List.of();
++
++        jdbc.update("""
++                INSERT INTO tenant_scheduler_policies(tenant_id)
++                SELECT DISTINCT scope.tenant_id
++                  FROM resource_scopes scope JOIN tasks task ON task.id = scope.resource_id
++                 WHERE scope.resource_type = 'TASK' AND task.phase = 'QUEUED'
++                ON CONFLICT (tenant_id) DO NOTHING
++                """);
++        jdbc.update("""
++                UPDATE tenant_scheduler_policies policy SET deficit = 0, updated_at = ?
++                 WHERE NOT EXISTS (
++                       SELECT 1 FROM resource_scopes scope JOIN tasks task ON task.id = scope.resource_id
++                        WHERE scope.resource_type = 'TASK' AND scope.tenant_id = policy.tenant_id
++                          AND task.phase = 'QUEUED')
++                """, JdbcSupport.timestamp(now));
++        String nextTenant = jdbc.queryForObject("""
++                SELECT next_tenant_id FROM task_scheduler_fair_cursors
++                 WHERE scheduler_name = ? FOR UPDATE
++                """, String.class, SCHEDULER);
++
++        List<PolicyState> policies = jdbc.query("""
++                SELECT policy.tenant_id, policy.weight, policy.max_active_attempts, policy.deficit,
++                       (SELECT count(*) FROM task_assignments assignment
++                         JOIN resource_scopes active_scope
++                           ON active_scope.resource_type = 'TASK' AND active_scope.resource_id = assignment.task_id
++                        WHERE active_scope.tenant_id = policy.tenant_id
++                          AND assignment.phase IN ('ASSIGNED', 'ACCEPTED', 'RUNNING')
++                          AND assignment.released_at IS NULL) AS active_attempts
++                  FROM tenant_scheduler_policies policy
++                 WHERE EXISTS (
++                       SELECT 1 FROM resource_scopes scope JOIN tasks task ON task.id = scope.resource_id
++                        WHERE scope.resource_type = 'TASK' AND scope.tenant_id = policy.tenant_id
++                          AND task.phase = 'QUEUED'
++                          AND NOT EXISTS (SELECT 1 FROM task_recovery_states recovery
++                                           WHERE recovery.task_id = task.id
++                                             AND recovery.status = 'READY'
++                                             AND recovery.next_attempt_at > ?))
++                 ORDER BY policy.tenant_id
++                 FOR UPDATE OF policy
++                """, (rs, row) -> new PolicyState(rs.getString("tenant_id"), rs.getInt("weight"),
++                rs.getInt("max_active_attempts"), rs.getInt("deficit"), rs.getInt("active_attempts")),
++                JdbcSupport.timestamp(now));
++
++        List<TenantFairQueue.TenantQueue> queues = new ArrayList<>();
++        Map<String, PolicyState> byTenant = new HashMap<>();
++        for (PolicyState policy : policies) {
++            List<UUID> taskIds = jdbc.query("""
++                    SELECT task.id FROM tasks task
++                      JOIN resource_scopes scope ON scope.resource_type = 'TASK' AND scope.resource_id = task.id
++                     WHERE scope.tenant_id = ? AND task.phase = 'QUEUED'
++                       AND NOT EXISTS (SELECT 1 FROM task_recovery_states recovery
++                                        WHERE recovery.task_id = task.id AND recovery.status = 'READY'
++                                          AND recovery.next_attempt_at > ?)
++                     ORDER BY task.priority DESC, task.created_at ASC, task.id ASC
++                     LIMIT ?
++                    """, (rs, row) -> rs.getObject("id", UUID.class), policy.tenantId(),
++                    JdbcSupport.timestamp(now), Math.max(limit, availableSlots));
++            queues.add(new TenantFairQueue.TenantQueue(policy.tenantId(), policy.weight(), policy.activeAttempts(),
++                    policy.maxActiveAttempts(), taskIds));
++            byTenant.put(policy.tenantId(), policy);
++        }
++
++        TenantFairQueue selector = new TenantFairQueue(policies.stream().collect(
++                java.util.stream.Collectors.toMap(PolicyState::tenantId, PolicyState::deficit)), nextTenant);
++        List<TenantFairQueue.Candidate> selected = selector.selectCandidates(queues, Math.min(limit, availableSlots));
++        TenantFairQueue.Snapshot snapshot = selector.snapshot();
++        for (PolicyState policy : policies) {
++            jdbc.update("UPDATE tenant_scheduler_policies SET deficit = ?, updated_at = ? WHERE tenant_id = ?",
++                    snapshot.deficits().getOrDefault(policy.tenantId(), 0), JdbcSupport.timestamp(now),
++                    policy.tenantId());
++        }
++        jdbc.update("UPDATE task_scheduler_fair_cursors SET next_tenant_id = ?, updated_at = ? WHERE scheduler_name = ?",
++                snapshot.nextTenant(), JdbcSupport.timestamp(now), SCHEDULER);
++        return selected.stream().map(TenantFairQueue.Candidate::taskId).toList();
++    }
++
++    public boolean hasCapacityForTask(UUID taskId) {
++        String tenantId = jdbc.query("""
++                SELECT tenant_id FROM resource_scopes WHERE resource_type = 'TASK' AND resource_id = ?
++                """, (rs, row) -> rs.getString(1), taskId).stream().findFirst().orElse(null);
++        if (tenantId == null || tenantId.isBlank()) return false;
++        jdbc.update("INSERT INTO tenant_scheduler_policies(tenant_id) VALUES (?) ON CONFLICT (tenant_id) DO NOTHING",
++                tenantId);
++        Integer maximum = jdbc.queryForObject(
++                "SELECT max_active_attempts FROM tenant_scheduler_policies WHERE tenant_id = ? FOR UPDATE", Integer.class,
++                tenantId);
++        Integer active = jdbc.queryForObject("""
++                SELECT count(*) FROM task_assignments assignment
++                  JOIN resource_scopes scope ON scope.resource_type = 'TASK' AND scope.resource_id = assignment.task_id
++                 WHERE scope.tenant_id = ? AND assignment.phase IN ('ASSIGNED', 'ACCEPTED', 'RUNNING')
++                   AND assignment.released_at IS NULL
++                """, Integer.class, tenantId);
++        return active != null && maximum != null && active < maximum;
++    }
++
++    private int availableWorkerSlots() {
++        Integer available = jdbc.queryForObject("""
++                SELECT count(*) FROM worker_slots slot
++                 WHERE slot.status = 'ACTIVE'
++                   AND NOT EXISTS (
++                       SELECT 1 FROM task_assignments assignment
++                        WHERE assignment.worker_slot_id = slot.id
++                          AND assignment.phase IN ('ASSIGNED', 'ACCEPTED', 'RUNNING')
++                          AND assignment.released_at IS NULL)
++                """, Integer.class);
++        return available == null ? 0 : available;
++    }
++
++    private record PolicyState(String tenantId, int weight, int maxActiveAttempts, int deficit,
++            int activeAttempts) { }
++}
 diff --git a/control-plane/src/main/java/io/agentteams/controlplane/quality/JdbcArtifactQualityEventRepository.java b/control-plane/src/main/java/io/agentteams/controlplane/quality/JdbcArtifactQualityEventRepository.java
 index 12310d6..b348df9 100644
 --- a/control-plane/src/main/java/io/agentteams/controlplane/quality/JdbcArtifactQualityEventRepository.java
 +++ b/control-plane/src/main/java/io/agentteams/controlplane/quality/JdbcArtifactQualityEventRepository.java
-@@ -38,0 +39,21 @@ public class JdbcArtifactQualityEventRepository implements ArtifactQualityEventR
+@@ -36,6 +36,27 @@ public class JdbcArtifactQualityEventRepository implements ArtifactQualityEventR
+                 || !context.tenantId().equals(event.tenantId()) || !projectId.equals(event.projectId())) {
+             throw new IllegalArgumentException("event scope must match trusted execution context");
+         }
 +        if (event.taskId() != null) {
 +            Boolean taskRunMatches = jdbc.queryForObject("""
 +                    SELECT EXISTS (
@@ -151,24 +590,520 @@ index 12310d6..b348df9 100644
 +                throw new IllegalArgumentException("event task/run must belong to trusted execution scope");
 +            }
 +        }
+         return jdbc.update("""
+                 INSERT INTO artifact_quality_events
+                     (id, organization_id, tenant_id, project_id, task_id, run_id, sequence, event_type,
+diff --git a/control-plane/src/main/java/io/agentteams/controlplane/scheduling/TenantFairQueue.java b/control-plane/src/main/java/io/agentteams/controlplane/scheduling/TenantFairQueue.java
+new file mode 100644
+index 0000000..28aa448
+--- /dev/null
++++ b/control-plane/src/main/java/io/agentteams/controlplane/scheduling/TenantFairQueue.java
+@@ -0,0 +1,100 @@
++package io.agentteams.controlplane.scheduling;
++
++import java.util.ArrayList;
++import java.util.Comparator;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Objects;
++import java.util.UUID;
++
++/** Persistent-state friendly weighted-deficit selection for a fixed number of Worker slots. */
++public final class TenantFairQueue {
++    private final Map<String, Integer> deficitByTenant;
++    private String nextTenant;
++
++    public TenantFairQueue() {
++        this(Map.of(), null);
++    }
++
++    public TenantFairQueue(Map<String, Integer> deficits, String nextTenant) {
++        this.deficitByTenant = new HashMap<>(Objects.requireNonNull(deficits, "deficits"));
++        this.nextTenant = nextTenant;
++    }
++
++    public synchronized List<String> select(List<TenantQueue> queues, int globalSlots) {
++        return selectCandidates(queues, globalSlots).stream().map(Candidate::tenantId).toList();
++    }
++
++    public synchronized List<Candidate> selectCandidates(List<TenantQueue> queues, int globalSlots) {
++        Objects.requireNonNull(queues, "queues");
++        if (globalSlots < 0) throw new IllegalArgumentException("globalSlots must not be negative");
++        List<TenantQueue> ordered = queues.stream().sorted(Comparator.comparing(TenantQueue::tenantId)).toList();
++        Map<String, TenantQueue> byTenant = new HashMap<>();
++        for (TenantQueue queue : ordered) {
++            if (byTenant.put(queue.tenantId(), queue) != null) {
++                throw new IllegalArgumentException("tenant queue must be unique");
++            }
++        }
++        deficitByTenant.keySet().retainAll(byTenant.keySet());
++        if (ordered.isEmpty()) {
++            nextTenant = null;
++            return List.of();
++        }
++        if (nextTenant == null || !byTenant.containsKey(nextTenant)) nextTenant = ordered.get(0).tenantId();
++        List<Candidate> selected = new ArrayList<>(globalSlots);
++        int cursor = indexOf(ordered, nextTenant);
++        int idleVisits = 0;
++        while (selected.size() < globalSlots && idleVisits < ordered.size()) {
++            TenantQueue queue = ordered.get(cursor);
++            if (queue.tasks().isEmpty() || queue.activeAttempts() + selectedCount(selected, queue.tenantId())
++                    >= queue.maxActiveAttempts()) {
++                deficitByTenant.put(queue.tenantId(), 0);
++                cursor = (cursor + 1) % ordered.size();
++                nextTenant = ordered.get(cursor).tenantId();
++                idleVisits++;
++                continue;
++            }
++            int deficit = deficitByTenant.getOrDefault(queue.tenantId(), 0);
++            if (deficit == 0) deficit = queue.weight();
++            selected.add(new Candidate(queue.tenantId(), queue.tasks().remove(0)));
++            deficitByTenant.put(queue.tenantId(), deficit - 1);
++            if (deficit - 1 == 0) {
++                cursor = (cursor + 1) % ordered.size();
++                nextTenant = ordered.get(cursor).tenantId();
++            }
++            idleVisits = selected.isEmpty() ? idleVisits + 1 : 0;
++        }
++        return List.copyOf(selected);
++    }
++
++    public synchronized Snapshot snapshot() {
++        return new Snapshot(Map.copyOf(deficitByTenant), nextTenant);
++    }
++
++    private static int indexOf(List<TenantQueue> queues, String tenantId) {
++        for (int i = 0; i < queues.size(); i++) if (queues.get(i).tenantId().equals(tenantId)) return i;
++        return 0;
++    }
++
++    private static long selectedCount(List<Candidate> selected, String tenantId) {
++        return selected.stream().filter(candidate -> tenantId.equals(candidate.tenantId())).count();
++    }
++
++    public record TenantQueue(String tenantId, int weight, int activeAttempts, int maxActiveAttempts,
++            List<UUID> tasks) {
++        public TenantQueue {
++            Objects.requireNonNull(tenantId, "tenantId");
++            Objects.requireNonNull(tasks, "tasks");
++            if (tenantId.isBlank()) throw new IllegalArgumentException("tenantId must not be blank");
++            if (weight < 1 || weight > 100) throw new IllegalArgumentException("weight must be 1..100");
++            if (activeAttempts < 0 || maxActiveAttempts < 1 || activeAttempts > maxActiveAttempts) {
++                throw new IllegalArgumentException("invalid tenant active attempt quota");
++            }
++            tasks = new ArrayList<>(tasks);
++        }
++    }
++
++    public record Candidate(String tenantId, UUID taskId) { }
++    public record Snapshot(Map<String, Integer> deficits, String nextTenant) { }
++}
+diff --git a/control-plane/src/main/java/io/agentteams/controlplane/service/TaskAssignmentScheduler.java b/control-plane/src/main/java/io/agentteams/controlplane/service/TaskAssignmentScheduler.java
+index 73c38be..9589f24 100644
+--- a/control-plane/src/main/java/io/agentteams/controlplane/service/TaskAssignmentScheduler.java
++++ b/control-plane/src/main/java/io/agentteams/controlplane/service/TaskAssignmentScheduler.java
+@@ -67,7 +67,9 @@ public final class TaskAssignmentScheduler {
+             }
+             int assigned = 0;
+             int unavailable = 0;
+-            java.util.List<UUID> queuedTaskIds = assignments.queuedTaskIds(batchSize, now, queuedTaskOffset);
++            java.util.List<UUID> queuedTaskIds = assignments.workerSlotSchedulingEnabled()
++                    ? assignments.fairQueuedTaskIds(batchSize, now)
++                    : assignments.queuedTaskIds(batchSize, now, queuedTaskOffset);
+             for (UUID taskId : queuedTaskIds) {
+                 try {
+                     assignments.queueReadyTask(taskId, clock.instant());
+@@ -83,7 +85,9 @@ public final class TaskAssignmentScheduler {
+             }
+             // Keep scanning past an older page when its tasks have no eligible agent. Without
+             // rotation, the first batch can remain QUEUED forever and starve later arrivals.
+-            queuedTaskOffset = queuedTaskIds.size() < batchSize ? 0 : queuedTaskOffset + queuedTaskIds.size();
++            if (!assignments.workerSlotSchedulingEnabled()) {
++                queuedTaskOffset = queuedTaskIds.size() < batchSize ? 0 : queuedTaskOffset + queuedTaskIds.size();
++            }
+             return new RunResult(recovered, assigned, unavailable, gated);
+         }).valueOr(new RunResult(0, 0, 0, 0));
+     }
+diff --git a/control-plane/src/main/java/io/agentteams/controlplane/service/TaskAssignmentService.java b/control-plane/src/main/java/io/agentteams/controlplane/service/TaskAssignmentService.java
+index 1d09b4a..91c4230 100644
+--- a/control-plane/src/main/java/io/agentteams/controlplane/service/TaskAssignmentService.java
++++ b/control-plane/src/main/java/io/agentteams/controlplane/service/TaskAssignmentService.java
+@@ -39,22 +39,40 @@ public final class TaskAssignmentService {
+     private final Duration leaseDuration;
+     private final TaskMetricsPort metrics;
+     private final TaskMemoryContextAssembler memoryContexts;
++    private final boolean workerSlotSchedulingEnabled;
+
+     public TaskAssignmentService(FoundationPersistenceService persistence, Duration leaseDuration) {
+-        this(persistence, leaseDuration, TaskMetricsPort.noop());
++        this(persistence, leaseDuration, TaskMetricsPort.noop(), false);
+     }
+
+     public TaskAssignmentService(FoundationPersistenceService persistence, Duration leaseDuration,
+             TaskMetricsPort metrics) {
+-        this(persistence, leaseDuration, metrics, null, null);
++        this(persistence, leaseDuration, metrics, false);
++    }
++
++    public TaskAssignmentService(FoundationPersistenceService persistence, Duration leaseDuration,
++            boolean workerSlotSchedulingEnabled) {
++        this(persistence, leaseDuration, TaskMetricsPort.noop(), workerSlotSchedulingEnabled);
++    }
++
++    private TaskAssignmentService(FoundationPersistenceService persistence, Duration leaseDuration,
++            TaskMetricsPort metrics, boolean workerSlotSchedulingEnabled) {
++        this(persistence, leaseDuration, metrics, null, null, workerSlotSchedulingEnabled);
+     }
+
+     public TaskAssignmentService(FoundationPersistenceService persistence, Duration leaseDuration,
+             TaskMetricsPort metrics, ExecutionContextResolver contextResolver,
+             ContextAssemblyService contextAssembly) {
++        this(persistence, leaseDuration, metrics, contextResolver, contextAssembly, false);
++    }
++
++    public TaskAssignmentService(FoundationPersistenceService persistence, Duration leaseDuration,
++            TaskMetricsPort metrics, ExecutionContextResolver contextResolver,
++            ContextAssemblyService contextAssembly, boolean workerSlotSchedulingEnabled) {
+         this.persistence = Objects.requireNonNull(persistence, "persistence");
+         this.leaseDuration = Objects.requireNonNull(leaseDuration, "leaseDuration");
+         this.metrics = Objects.requireNonNull(metrics, "metrics");
++        this.workerSlotSchedulingEnabled = workerSlotSchedulingEnabled;
+         this.memoryContexts = contextResolver == null || contextAssembly == null ? null
+                 : new TaskMemoryContextAssembler(contextAssembly, contextResolver);
+         if (leaseDuration.isZero() || leaseDuration.isNegative()) {
+@@ -83,8 +101,15 @@ public final class TaskAssignmentService {
+                     throw new IllegalStateException("task recovery backoff is active until " + state.nextAttemptAt());
+                 }
+             });
++            if (workerSlotSchedulingEnabled && !tx.tenantFairQueue().hasCapacityForTask(taskId)) {
++                throw new IllegalStateException("tenant active attempt quota is full or task has no tenant scope");
++            }
+             AgentRecord agent = matchingAgent(tx, queued, now)
+                     .orElseThrow(() -> new IllegalStateException("no READY agent matches task capabilities"));
++            UUID workerSlotId = workerSlotSchedulingEnabled
++                    ? tx.taskAssignments().lockNextAvailableWorkerSlot()
++                            .orElseThrow(() -> new IllegalStateException("no ACTIVE worker slot is available"))
++                    : null;
+
+             UUID attemptId = UUID.randomUUID();
+             UUID assignmentId = UUID.randomUUID();
+@@ -97,7 +122,7 @@ public final class TaskAssignmentService {
+             TaskAttemptRecord attempt = new TaskAttemptRecord(attemptId, taskId, leaseId, TaskPhase.ASSIGNED,
+                     expiresAt, null, "scheduler", "control-plane", null, null, now, now, assignedVersion);
+             TaskAssignmentRecord assignment = new TaskAssignmentRecord(assignmentId, taskId, attemptId, agent.id(),
+-                    TaskPhase.ASSIGNED, now, null, null, "{}", now, now, 0);
++                    workerSlotId, TaskPhase.ASSIGNED, now, null, null, "{}", now, now, 0);
+             AgentLeaseRecord lease = new AgentLeaseRecord(leaseId, agent.id(), attemptId, now, expiresAt, null,
+                     "ACTIVE", now, now, 0);
+
+@@ -240,6 +265,19 @@ public final class TaskAssignmentService {
+         return recovered;
+     }
+
++    public boolean workerSlotSchedulingEnabled() {
++        return workerSlotSchedulingEnabled;
++    }
++
++    public java.util.List<UUID> fairQueuedTaskIds(int limit, Instant now) {
++        if (!workerSlotSchedulingEnabled) {
++            throw new IllegalStateException("tenant fair dispatch requires Worker slot scheduling");
++        }
++        if (limit <= 0 || limit > 1000) throw new IllegalArgumentException("limit must be between 1 and 1000");
++        Objects.requireNonNull(now, "now");
++        return persistence.inTransaction(tx -> tx.tenantFairQueue().selectQueuedTaskIds(now, limit));
++    }
++
+     public java.util.List<UUID> queuedTaskIds(int limit) {
+         return queuedTaskIds(limit, null);
+     }
+@@ -270,6 +308,9 @@ public final class TaskAssignmentService {
+             ObjectNode payload = OBJECT_MAPPER.createObjectNode();
+             payload.put("taskId", task.id().toString());
+             payload.put("agentId", agent.id().toString());
++            if (assignment.workerSlotId() != null) {
++                payload.put("workerSlotId", assignment.workerSlotId().toString());
++            }
+             payload.put("attemptId", attempt.id().toString());
+             payload.put("assignmentId", assignment.id().toString());
+             payload.put("leaseId", lease.id().toString());
 diff --git a/control-plane/src/main/java/io/agentteams/controlplane/skill/SkillController.java b/control-plane/src/main/java/io/agentteams/controlplane/skill/SkillController.java
 index 13de114..83fc603 100644
 --- a/control-plane/src/main/java/io/agentteams/controlplane/skill/SkillController.java
 +++ b/control-plane/src/main/java/io/agentteams/controlplane/skill/SkillController.java
-@@ -89,0 +90 @@ public final class SkillController {
+@@ -87,6 +87,7 @@ public final class SkillController {
+     @PostMapping("/{skillId}/versions/{versionId}/package/upload")
+     public PackageUploadResponse preparePackageUpload(@PathVariable UUID skillId, @PathVariable UUID versionId,
+             @RequestBody PackageUploadRequest request) {
 +        service.getSkill(skillId);
-@@ -100,0 +102 @@ public final class SkillController {
+         requirePackageStorage();
+         requireRequest(request);
+         SkillPackageStorageService.SkillPackageUpload upload = packageStorage.prepareUpload(skillId, versionId,
+@@ -98,12 +99,14 @@ public final class SkillController {
+
+     @PostMapping("/{skillId}/versions/{versionId}/package/complete")
+     public SkillVersionResponse completePackageUpload(@PathVariable UUID skillId, @PathVariable UUID versionId) {
 +        service.getSkill(skillId);
-@@ -106,0 +109 @@ public final class SkillController {
+         requirePackageStorage();
+         return SkillVersionResponse.from(packageStorage.completeUpload(skillId, versionId), objectMapper);
+     }
+
+     @GetMapping("/{skillId}/versions/{versionId}/package/download")
+     public PackageDownloadResponse downloadPackage(@PathVariable UUID skillId, @PathVariable UUID versionId) {
 +        service.getSkill(skillId);
+         requirePackageStorage();
+         return new PackageDownloadResponse(packageStorage.prepareDownload(skillId, versionId, Duration.ofMinutes(15)));
+     }
+diff --git a/control-plane/src/main/java/io/agentteams/controlplane/worker/WorkerOperationRepository.java b/control-plane/src/main/java/io/agentteams/controlplane/worker/WorkerOperationRepository.java
+index 350907b..0f16d4f 100644
+--- a/control-plane/src/main/java/io/agentteams/controlplane/worker/WorkerOperationRepository.java
++++ b/control-plane/src/main/java/io/agentteams/controlplane/worker/WorkerOperationRepository.java
+@@ -108,6 +108,30 @@ public final class WorkerOperationRepository {
+                 this::map, agentId).stream().findFirst();
+     }
+
++    public List<UUID> findPendingDrainAgentIds() {
++        return jdbc.query("SELECT agent_id FROM worker_operations WHERE type = 'DRAIN' "
++                + "AND status IN ('PENDING', 'RUNNING') ORDER BY agent_id, created_at, id",
++                (rs, row) -> rs.getObject(1, UUID.class));
++    }
++
++    public Optional<WorkerOperation> findPendingDrainForUpdate(UUID agentId) {
++        return jdbc.query(select() + " WHERE agent_id = ? AND type = 'DRAIN' "
++                + "AND status IN ('PENDING', 'RUNNING') ORDER BY created_at DESC, id DESC LIMIT 1 FOR UPDATE",
++                this::map, agentId).stream().findFirst();
++    }
++
++    public Optional<WorkerOperation> findLatestDrain(UUID agentId) {
++        return jdbc.query(select() + " WHERE agent_id = ? AND type = 'DRAIN' "
++                + "ORDER BY created_at DESC, id DESC LIMIT 1", this::map, agentId).stream().findFirst();
++    }
++
++    public boolean isGatewayOnline(UUID agentId, Instant since) {
++        return !jdbc.queryForList("SELECT connection_id FROM gateway_agent_state "
++                + "WHERE agent_id = ? AND presence = 'ONLINE' AND connection_id IS NOT NULL "
++                + "AND last_seen_at >= ? FOR UPDATE", UUID.class, agentId.toString(),
++                JdbcSupport.timestamp(since)).isEmpty();
++    }
++
+     public Optional<WorkerOperation> findActiveByAgentForUpdate(UUID agentId, Instant now) {
+         return jdbc.query(select() + " WHERE agent_id = ? AND status IN ('PENDING', 'RUNNING')"
+                         + " AND lease_expires_at > ? ORDER BY created_at, id LIMIT 1 FOR UPDATE",
+@@ -125,7 +149,7 @@ public final class WorkerOperationRepository {
+     public Optional<WorkerOperation> findActiveLifecycleByAgent(UUID agentId, Instant now) {
+         return jdbc.query(select() + " WHERE agent_id = ?"
+                         + " AND status IN ('PENDING', 'RUNNING')"
+-                        + " AND lease_expires_at > ? ORDER BY created_at, id LIMIT 1",
++                        + " AND (type = 'DRAIN' OR lease_expires_at > ?) ORDER BY created_at, id LIMIT 1",
+                 this::map, agentId, JdbcSupport.timestamp(now)).stream().findFirst();
+     }
+
+@@ -137,7 +161,8 @@ public final class WorkerOperationRepository {
+
+     public List<WorkerOperation> findExpiredForUpdate(Instant now) {
+         return jdbc.query(select() + " WHERE status IN ('PENDING', 'RUNNING')"
+-                        + " AND lease_expires_at <= ? ORDER BY lease_expires_at, id FOR UPDATE SKIP LOCKED",
++                        + " AND type <> 'DRAIN' AND lease_expires_at <= ? "
++                        + "ORDER BY lease_expires_at, id FOR UPDATE SKIP LOCKED",
+                 this::map, JdbcSupport.timestamp(now));
+     }
+
+diff --git a/control-plane/src/main/java/io/agentteams/controlplane/worker/WorkerOperationService.java b/control-plane/src/main/java/io/agentteams/controlplane/worker/WorkerOperationService.java
+index 35f2f06..efb4dea 100644
+--- a/control-plane/src/main/java/io/agentteams/controlplane/worker/WorkerOperationService.java
++++ b/control-plane/src/main/java/io/agentteams/controlplane/worker/WorkerOperationService.java
+@@ -61,6 +61,62 @@ public final class WorkerOperationService {
+                 correlationOrRandom());
+     }
+
++    /** Re-enables a drained, still registered worker after the Gateway reconnects. */
++    public WorkerOperation activate(UUID agentId, long expectedAgentVersion, String idempotencyKey) {
++        Objects.requireNonNull(agentId, "agentId");
++        requireKey(idempotencyKey);
++        requireVisible(agentId);
++        Instant now = clock.instant();
++        return persistence.inTransaction(tx -> {
++            var existing = tx.workerOperations().findByAgentAndIdempotencyKey(agentId, idempotencyKey);
++            if (existing.isPresent()) {
++                assertSameActivation(existing.get(), expectedAgentVersion);
++                return existing.get();
++            }
++            AgentRecord current = tx.agents().findByIdForUpdate(agentId)
++                    .orElseThrow(() -> new ResourceNotFoundException("agent", agentId));
++            existing = tx.workerOperations().findByAgentAndIdempotencyKey(agentId, idempotencyKey);
++            if (existing.isPresent()) {
++                assertSameActivation(existing.get(), expectedAgentVersion);
++                return existing.get();
++            }
++            if (current.version() != expectedAgentVersion) {
++                throw new io.agentteams.controlplane.persistence.OptimisticLockFailure(
++                        "agent", agentId, expectedAgentVersion, current.version());
++            }
++            if (current.phase() != AgentPhase.DRAINING) {
++                throw new WorkerLifecycleConflictException("WORKER_NOT_DRAINING");
++            }
++            if (tx.agentLeases().countActiveForAgent(agentId) > 0) {
++                throw new WorkerLifecycleConflictException("WORKER_HAS_ACTIVE_TASKS");
++            }
++            WorkerOperation drain = tx.workerOperations().findLatestDrain(agentId)
++                    .orElseThrow(() -> new WorkerLifecycleConflictException("WORKER_NOT_DRAINED"));
++            if (drain.status() != WorkerOperationStatus.DRAINED) {
++                throw new WorkerLifecycleConflictException("WORKER_NOT_DRAINED");
++            }
++            if (!tx.workerOperations().isGatewayOnline(agentId, now.minusSeconds(30))) {
++                throw new WorkerLifecycleConflictException("WORKER_NOT_ONLINE");
++            }
++            tx.agents().updatePhase(agentId, AgentPhase.READY, expectedAgentVersion, now);
++            WorkerOperation activated = new WorkerOperation(UUID.randomUUID(), agentId, WorkerOperationType.ACTIVATE,
++                    WorkerOperationStatus.SUCCEEDED, null, null, null, null, "{}", idempotencyKey,
++                    expectedAgentVersion, PrincipalContext.actorOr("control-plane"), null, null,
++                    correlationOrRandom(), now, now, 0);
++            tx.workerOperations().insert(activated);
++            FoundationPersistenceService.appendEvent(tx, "agent", agentId, "WorkerActivated",
++                    "{\"operationId\":\"" + activated.id() + "\"}", now, expectedAgentVersion + 1);
++            return activated;
++        });
++    }
++
++    private static void assertSameActivation(WorkerOperation operation, long expectedAgentVersion) {
++        if (operation.type() != WorkerOperationType.ACTIVATE
++                || operation.expectedAgentVersion() != expectedAgentVersion) {
++            throw new IdempotencyConflictException(operation.idempotencyKey(), "worker activation");
++        }
++    }
++
+     public WorkerOperation rollout(UUID agentId, WorkerRolloutRequest request) {
+         Objects.requireNonNull(request, "request");
+         return request(agentId, WorkerOperationType.ROLLOUT, request.expectedAgentVersion(),
+@@ -349,7 +405,8 @@ public final class WorkerOperationService {
+             var active = tx.workerOperations().findActiveByAgentForUpdate(agentId);
+             if (active.isPresent()) {
+                 WorkerOperation inProgress = active.get();
+-                if (inProgress.leaseExpiresAt() != null && !now.isBefore(inProgress.leaseExpiresAt())) {
++                if (inProgress.type() != WorkerOperationType.DRAIN && inProgress.leaseExpiresAt() != null
++                        && !now.isBefore(inProgress.leaseExpiresAt())) {
+                     WorkerOperation expired = tx.workerOperations().updateStatus(inProgress.id(),
+                             WorkerOperationStatus.FAILED, "OPERATION_LEASE_EXPIRED", inProgress.version(), now);
+                     FoundationPersistenceService.appendEvent(tx, "worker_operation", expired.id(),
+@@ -450,6 +507,19 @@ public final class WorkerOperationService {
+     public static int recoverExpiredOperations(
+             io.agentteams.controlplane.persistence.FoundationTransaction tx, Instant now) {
+         int recovered = 0;
++        for (UUID agentId : tx.workerOperations().findPendingDrainAgentIds()) {
++            AgentRecord agent = tx.agents().findByIdForUpdate(agentId).orElse(null);
++            if (agent == null || agent.phase() != AgentPhase.DRAINING
++                    || tx.agentLeases().countActiveForAgent(agentId) > 0) continue;
++            WorkerOperation drain = tx.workerOperations().findPendingDrainForUpdate(agentId).orElse(null);
++            if (drain == null) continue;
++            WorkerOperation drained = tx.workerOperations().updateStatus(drain.id(), WorkerOperationStatus.DRAINED,
++                    null, drain.version(), now);
++            FoundationPersistenceService.appendEvent(tx, "worker_operation", drained.id(),
++                    "WorkerOperationDrained", "{\"operationId\":\"" + drained.id() + "\"}", now,
++                    drained.version());
++            recovered++;
++        }
+         for (WorkerOperation expired : tx.workerOperations().findExpiredForUpdate(now)) {
+             WorkerOperation failed = tx.workerOperations().updateStatus(expired.id(), WorkerOperationStatus.FAILED,
+                     "OPERATION_LEASE_EXPIRED", expired.version(), now);
+diff --git a/control-plane/src/main/java/io/agentteams/controlplane/worker/WorkerOperationType.java b/control-plane/src/main/java/io/agentteams/controlplane/worker/WorkerOperationType.java
+index 8ee9740..9ffc3fe 100644
+--- a/control-plane/src/main/java/io/agentteams/controlplane/worker/WorkerOperationType.java
++++ b/control-plane/src/main/java/io/agentteams/controlplane/worker/WorkerOperationType.java
+@@ -2,6 +2,7 @@ package io.agentteams.controlplane.worker;
+
+ public enum WorkerOperationType {
+     DRAIN,
++    ACTIVATE,
+     ROLLOUT,
+     ROLLBACK,
+     TERMINATE
+diff --git a/control-plane/src/main/resources/db/migration/V122__compose_worker_drain_activate.sql b/control-plane/src/main/resources/db/migration/V122__compose_worker_drain_activate.sql
+new file mode 100644
+index 0000000..62da7a1
+--- /dev/null
++++ b/control-plane/src/main/resources/db/migration/V122__compose_worker_drain_activate.sql
+@@ -0,0 +1,12 @@
++ALTER TABLE worker_operations DROP CONSTRAINT worker_operations_type_check;
++ALTER TABLE worker_operations ADD CONSTRAINT worker_operations_type_check
++    CHECK (type IN ('DRAIN', 'ACTIVATE', 'ROLLOUT', 'ROLLBACK', 'TERMINATE'));
++
++ALTER TABLE worker_operations DROP CONSTRAINT worker_operations_type_status_check;
++ALTER TABLE worker_operations ADD CONSTRAINT worker_operations_type_status_check CHECK (
++    (type = 'DRAIN' AND status IN ('PENDING', 'RUNNING', 'DRAINED', 'FAILED'))
++    OR (type = 'ACTIVATE' AND status = 'SUCCEEDED')
++    OR (type = 'ROLLOUT' AND status IN ('PENDING', 'RUNNING', 'SUCCEEDED', 'FAILED', 'ROLLED_BACK'))
++    OR (type = 'ROLLBACK' AND status IN ('SUCCEEDED', 'FAILED'))
++    OR (type = 'TERMINATE' AND status IN ('PENDING', 'RUNNING', 'SUCCEEDED', 'FAILED'))
++);
+diff --git a/control-plane/src/main/resources/db/migration/V123__worker_slot_assignment_binding.sql b/control-plane/src/main/resources/db/migration/V123__worker_slot_assignment_binding.sql
+new file mode 100644
+index 0000000..1c76e22
+--- /dev/null
++++ b/control-plane/src/main/resources/db/migration/V123__worker_slot_assignment_binding.sql
+@@ -0,0 +1,17 @@
++-- Tenant-neutral fixed execution slots are distinct from tenant-scoped Agents.
++CREATE TABLE IF NOT EXISTS worker_slots (
++    id UUID PRIMARY KEY,
++    status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'DRAINING', 'DISABLED')),
++    created_at TIMESTAMPTZ NOT NULL DEFAULT statement_timestamp(),
++    updated_at TIMESTAMPTZ NOT NULL DEFAULT statement_timestamp()
++);
++
++ALTER TABLE task_assignments
++    ADD COLUMN worker_slot_id UUID REFERENCES worker_slots(id) ON DELETE RESTRICT;
++
++CREATE INDEX task_assignments_worker_slot_idx ON task_assignments(worker_slot_id);
++CREATE UNIQUE INDEX task_assignments_active_worker_slot_unique
++    ON task_assignments(worker_slot_id)
++    WHERE worker_slot_id IS NOT NULL
++      AND phase IN ('ASSIGNED', 'ACCEPTED', 'RUNNING')
++      AND released_at IS NULL;
+diff --git a/control-plane/src/main/resources/db/migration/V124__tenant_fair_scheduler_state.sql b/control-plane/src/main/resources/db/migration/V124__tenant_fair_scheduler_state.sql
+new file mode 100644
+index 0000000..87e561c
+--- /dev/null
++++ b/control-plane/src/main/resources/db/migration/V124__tenant_fair_scheduler_state.sql
+@@ -0,0 +1,23 @@
++CREATE TABLE tenant_scheduler_policies (
++    tenant_id TEXT PRIMARY KEY,
++    weight SMALLINT NOT NULL DEFAULT 1 CHECK (weight BETWEEN 1 AND 100),
++    max_active_attempts SMALLINT NOT NULL DEFAULT 1 CHECK (max_active_attempts BETWEEN 1 AND 1000),
++    deficit SMALLINT NOT NULL DEFAULT 0 CHECK (deficit BETWEEN 0 AND 100),
++    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
++    CONSTRAINT tenant_scheduler_policy_tenant_not_blank CHECK (length(btrim(tenant_id)) > 0)
++);
++
++CREATE TABLE task_scheduler_fair_cursors (
++    scheduler_name TEXT PRIMARY KEY,
++    next_tenant_id TEXT,
++    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
++    CONSTRAINT task_scheduler_fair_cursor_name_not_blank CHECK (length(btrim(scheduler_name)) > 0)
++);
++
++INSERT INTO task_scheduler_fair_cursors(scheduler_name, next_tenant_id)
++VALUES ('task-assignment', NULL)
++ON CONFLICT (scheduler_name) DO NOTHING;
++
++INSERT INTO tenant_scheduler_policies(tenant_id)
++SELECT DISTINCT tenant_id FROM resource_scopes WHERE resource_type = 'TASK'
++ON CONFLICT (tenant_id) DO NOTHING;
 diff --git a/control-plane/src/test/java/io/agentteams/controlplane/application/ControlPlaneExecutionEventAdapterTest.java b/control-plane/src/test/java/io/agentteams/controlplane/application/ControlPlaneExecutionEventAdapterTest.java
 index b576d6e..22dd0b4 100644
 --- a/control-plane/src/test/java/io/agentteams/controlplane/application/ControlPlaneExecutionEventAdapterTest.java
 +++ b/control-plane/src/test/java/io/agentteams/controlplane/application/ControlPlaneExecutionEventAdapterTest.java
-@@ -6,0 +7,2 @@ import static org.mockito.Mockito.verify;
+@@ -4,6 +4,8 @@ import static org.mockito.ArgumentMatchers.any;
+ import static org.mockito.ArgumentMatchers.eq;
+ import static org.mockito.Mockito.mock;
+ import static org.mockito.Mockito.verify;
 +import static org.mockito.Mockito.never;
 +import static org.mockito.Mockito.when;
-@@ -17,0 +20,38 @@ class ControlPlaneExecutionEventAdapterTest {
+
+ import io.agentteams.application.api.ExecutionEventPort;
+ import io.agentteams.application.api.TaskExecutionObservationPort;
+@@ -15,6 +17,44 @@ import java.util.UUID;
+ import org.junit.jupiter.api.Test;
+
+ class ControlPlaneExecutionEventAdapterTest {
 +    @Test
 +    void dropsTaskEventWhenActiveExecutionScopeDoesNotMatch() {
 +        UUID taskId = UUID.randomUUID();
@@ -207,13 +1142,20 @@ index b576d6e..22dd0b4 100644
 +                eq(command.payloadJson()));
 +    }
 +
-@@ -41,0 +82,6 @@ class ControlPlaneExecutionEventAdapterTest {
+     @Test
+     void publishesTerminalSuccessToTheTaskExecutionObservationProjection() {
+         UUID taskId = UUID.randomUUID();
+@@ -39,4 +79,10 @@ class ControlPlaneExecutionEventAdapterTest {
+         verify(observations).completed(eq(taskId), eq(attemptId), eq(eventId), eq(occurredAt), eq("corr-1"),
+                 eq(""), eq(List.of(artifact)));
+     }
 +
 +    private static ExecutionEventPort.TaskEventReportCommand taskEventCommand() {
 +        return new ExecutionEventPort.TaskEventReportCommand(UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID(),
 +                Instant.parse("2026-09-07T00:00:00Z"), UUID.randomUUID().toString(), "tool.started", "{}", 1,
 +                "corr-1");
 +    }
+ }
 diff --git a/control-plane/src/test/java/io/agentteams/controlplane/application/JdbcTaskEventScopeGuardPostgresTest.java b/control-plane/src/test/java/io/agentteams/controlplane/application/JdbcTaskEventScopeGuardPostgresTest.java
 new file mode 100644
 index 0000000..da9d31b
@@ -355,11 +1297,61 @@ index 0000000..da9d31b
 +        return dataSource;
 +    }
 +}
+diff --git a/control-plane/src/test/java/io/agentteams/controlplane/artifact/InternalArtifactUploadControllerTest.java b/control-plane/src/test/java/io/agentteams/controlplane/artifact/InternalArtifactUploadControllerTest.java
+index bedefbb..cfd5da0 100644
+--- a/control-plane/src/test/java/io/agentteams/controlplane/artifact/InternalArtifactUploadControllerTest.java
++++ b/control-plane/src/test/java/io/agentteams/controlplane/artifact/InternalArtifactUploadControllerTest.java
+@@ -54,7 +54,8 @@ class InternalArtifactUploadControllerTest {
+         ArtifactCompletionService completion = new ArtifactCompletionService(persistence, artifacts,
+                 Clock.systemUTC());
+         mockMvc = MockMvcBuilders.standaloneSetup(
+-                        new InternalArtifactUploadController(artifacts, completion, persistence, "secret"))
++                        new InternalArtifactUploadController(artifacts, completion, persistence, "secret",
++                                Clock.fixed(Instant.parse("2026-11-06T00:00:00Z"), java.time.ZoneOffset.UTC)))
+                 .build();
+         org.mockito.Mockito.lenient().when(persistence.findTaskAssignmentByAttemptId(ATTEMPT_ID))
+                 .thenReturn(Optional.of(assignment(AGENT_ID)));
+@@ -110,6 +111,18 @@ class InternalArtifactUploadControllerTest {
+                 .andExpect(status().isForbidden());
+     }
+
++    @Test
++    void rejectsPrepareForExpiredAttemptLease() throws Exception {
++        when(persistence.findTaskAttempt(ATTEMPT_ID)).thenReturn(Optional.of(attempt("scheduler",
++                Instant.parse("2026-11-05T23:59:59Z"))));
++
++        mockMvc.perform(post("/internal/v1/artifacts/uploads")
++                        .header(InternalArtifactUploadController.TOKEN_HEADER, "secret")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(prepareBody(AGENT_ID)))
++                .andExpect(status().isConflict());
++    }
++
+     @Test
+     void rejectsCompletionWhenStorageKeyDoesNotMatchTheAttempt() throws Exception {
+         when(persistence.findTaskAttempt(ATTEMPT_ID)).thenReturn(Optional.of(attempt("scheduler")));
+@@ -177,8 +190,12 @@ class InternalArtifactUploadControllerTest {
+     }
+
+     private static TaskAttemptRecord attempt(String actor) {
++        return attempt(actor, Instant.parse("2026-11-07T00:00:00Z"));
++    }
++
++    private static TaskAttemptRecord attempt(String actor, Instant leaseExpiresAt) {
+         return new TaskAttemptRecord(ATTEMPT_ID, TASK_ID, UUID.randomUUID(), TaskPhase.RUNNING,
+-                Instant.EPOCH.plusSeconds(3600), null, actor, "leader", "", "",
++                leaseExpiresAt, null, actor, "leader", "", "",
+                 Instant.EPOCH, Instant.EPOCH, 0);
+     }
+
 diff --git a/control-plane/src/test/java/io/agentteams/controlplane/config/ConfigDeploymentServiceTest.java b/control-plane/src/test/java/io/agentteams/controlplane/config/ConfigDeploymentServiceTest.java
 index e27b905..de37996 100644
 --- a/control-plane/src/test/java/io/agentteams/controlplane/config/ConfigDeploymentServiceTest.java
 +++ b/control-plane/src/test/java/io/agentteams/controlplane/config/ConfigDeploymentServiceTest.java
-@@ -243,0 +244,34 @@ class ConfigDeploymentServiceTest {
+@@ -241,6 +241,40 @@ class ConfigDeploymentServiceTest {
+                         && result.resourceId().equals("skill-a") && result.status().equals("APPLIED")));
+     }
+
 +    @Test
 +    void rejectsConfigAppliedAckWhenAuthenticatedAgentDoesNotOwnTheBinding() {
 +        FoundationPersistenceService persistence = mock(FoundationPersistenceService.class);
@@ -394,15 +1386,155 @@ index e27b905..de37996 100644
 +        org.mockito.Mockito.verify(lifecycle, org.mockito.Mockito.never()).recordResourceApply(any());
 +    }
 +
+     private static String retryHash(UUID bindingId, ConfigSnapshot snapshot) {
+         try {
+             return java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256")
+diff --git a/control-plane/src/test/java/io/agentteams/controlplane/persistence/FoundationRepositoryIT.java b/control-plane/src/test/java/io/agentteams/controlplane/persistence/FoundationRepositoryIT.java
+index 5249f8e..b049263 100644
+--- a/control-plane/src/test/java/io/agentteams/controlplane/persistence/FoundationRepositoryIT.java
++++ b/control-plane/src/test/java/io/agentteams/controlplane/persistence/FoundationRepositoryIT.java
+@@ -77,6 +77,12 @@ class FoundationRepositoryIT {
+         persistence = new FoundationPersistenceService(dataSource);
+     }
+
++    @Test
++    void createsTenantNeutralWorkerSlotsAndAssignmentBindingSchema() {
++        assertThat(jdbc.queryForList("SELECT id FROM worker_slots WHERE false")).isEmpty();
++        assertThat(jdbc.queryForList("SELECT worker_slot_id FROM task_assignments WHERE false")).isEmpty();
++    }
++
+     @Test
+     void pagesQueuedTaskIdsWithAnOffset() {
+         Instant now = Instant.parse("2026-10-07T00:00:00Z");
+@@ -846,6 +852,104 @@ class FoundationRepositoryIT {
+                 .isEqualTo(matchingAgent.id());
+     }
+
++    @Test
++    void doesNotSelectProjectWorkerWithAnActiveLease() {
++        Instant now = Instant.parse("2026-11-06T00:00:00Z");
++        UUID agentId = UUID.randomUUID();
++        UUID taskId = UUID.randomUUID();
++        UUID attemptId = UUID.randomUUID();
++        UUID leaseId = UUID.randomUUID();
++        AgentRecord agent = AgentRecord.create(agentId, "leased-project-worker", AgentPhase.READY,
++                "agentscope", "{\"agentscope\":\"true\"}", now);
++        TaskRecord task = TaskRecord.draft(taskId, "active lease task", "description", "actor", "test", now);
++        TaskAttemptRecord attempt = TaskAttemptRecord.fromDomain(new TaskAttempt(
++                attemptId, taskId, leaseId, TaskPhase.ASSIGNED, now, now, now.plusSeconds(60), null,
++                "scheduler", "test", null, null, 0));
++        TaskAssignmentRecord assignment = new TaskAssignmentRecord(UUID.randomUUID(), taskId, attemptId, agentId,
++                TaskPhase.ASSIGNED, now, null, null, "{}", now, now, 0);
++        AgentLeaseRecord lease = new AgentLeaseRecord(leaseId, agentId, attemptId, now,
++                now.plusSeconds(60), null, "ACTIVE", now, now, 0);
++        persistence.createFoundation(agent, task, attempt, assignment, lease, now);
++        insertScope("WORKER", agentId, "tenant-a", "project-a");
++        insertScope("TASK", taskId, "tenant-a", "project-a");
++
++        assertThat(new AgentRepository(jdbc).findReadyMatchingInTaskProject(
++                "{\"requiredCapabilities\":[\"agentscope\"]}", taskId, now))
++                .as("one fixed Worker slot cannot receive a second active Attempt")
++                .isEmpty();
++
++        jdbc.update("UPDATE agent_leases SET status = 'RELEASED', released_at = ?, updated_at = ? WHERE id = ?",
++                Timestamp.from(now.plusSeconds(1)), Timestamp.from(now.plusSeconds(1)), leaseId);
++        assertThat(new AgentRepository(jdbc).findReadyMatchingInTaskProject(
++                "{\"requiredCapabilities\":[\"agentscope\"]}", taskId, now.plusSeconds(2)))
++                .as("a Worker slot becomes selectable after its lease is released")
++                .get()
++                .extracting(AgentRecord::id)
++                .isEqualTo(agentId);
++    }
++
++    @Test
++    void concurrentProjectAssignmentsCannotCreateTwoActiveLeasesForOneWorker() throws Exception {
++        Instant now = Instant.parse("2026-11-06T00:00:00Z");
++        UUID agentId = UUID.randomUUID();
++        AgentRecord agent = AgentRecord.create(agentId, "contended-project-worker", AgentPhase.READY,
++                "agentscope", "{}", now);
++        persistence.createAgent(agent);
++
++        UUID taskA = insertQueuedScopedTask(now, "tenant-a", "project-a");
++        UUID taskB = insertQueuedScopedTask(now, "tenant-a", "project-a");
++        insertScope("WORKER", agentId, "tenant-a", "project-a");
++
++        CountDownLatch bothTransactionsStarted = new CountDownLatch(2);
++        CountDownLatch startAssignments = new CountDownLatch(1);
++        ExecutorService executor = Executors.newFixedThreadPool(2);
++        try {
++            Callable<Boolean> assignment = () -> {
++                bothTransactionsStarted.countDown();
++                if (!startAssignments.await(5, TimeUnit.SECONDS)) {
++                    throw new IllegalStateException("assignment concurrency test timed out");
++                }
++                UUID taskId = Thread.currentThread().getName().endsWith("1") ? taskA : taskB;
++                try {
++                    new io.agentteams.controlplane.service.TaskAssignmentService(persistence, Duration.ofMinutes(2))
++                            .queueReadyTask(taskId, now);
++                    return true;
++                } catch (IllegalStateException noWorkerAvailable) {
++                    if (!"no READY agent matches task capabilities".equals(noWorkerAvailable.getMessage())) {
++                        throw noWorkerAvailable;
++                    }
++                    return false;
++                }
++            };
++            Future<Boolean> first = executor.submit(assignment);
++            Future<Boolean> second = executor.submit(assignment);
++            assertThat(bothTransactionsStarted.await(5, TimeUnit.SECONDS)).isTrue();
++            startAssignments.countDown();
++
++            assertThat(List.of(first.get(15, TimeUnit.SECONDS), second.get(15, TimeUnit.SECONDS)))
++                    .as("exactly one queued task can claim the fixed Worker slot")
++                    .containsExactlyInAnyOrder(true, false);
++            assertThat(jdbc.queryForObject("SELECT count(*) FROM agent_leases WHERE agent_id = ? "
++                    + "AND status = 'ACTIVE' AND released_at IS NULL", Long.class, agentId)).isEqualTo(1L);
++            assertThat(jdbc.queryForObject("SELECT count(*) FROM tasks WHERE id IN (?, ?) AND phase = 'ASSIGNED'",
++                    Long.class, taskA, taskB)).isEqualTo(1L);
++        } finally {
++            startAssignments.countDown();
++            executor.shutdownNow();
++        }
++    }
++
++    private UUID insertQueuedScopedTask(Instant now, String tenant, String project) {
++        UUID taskId = UUID.randomUUID();
++        persistence.inTransaction(tx -> {
++            tx.tasks().insert(new TaskRecord(taskId, "queued-" + taskId, "", TaskPhase.QUEUED, 0,
++                    "{}", "actor", "test", null, null, now, now, 0));
++            return null;
++        });
++        insertScope("TASK", taskId, tenant, project);
++        return taskId;
++    }
++
+     private void insertScope(String resourceType, UUID resourceId, String tenant, String project) {
+         jdbc.update("""
+                 INSERT INTO resource_scopes(resource_type, resource_id, tenant_id, project_id, team, created_at, updated_at)
 diff --git a/control-plane/src/test/java/io/agentteams/controlplane/quality/JdbcArtifactQualityEventRepositoryTest.java b/control-plane/src/test/java/io/agentteams/controlplane/quality/JdbcArtifactQualityEventRepositoryTest.java
 index b9002de..f0cf253 100644
 --- a/control-plane/src/test/java/io/agentteams/controlplane/quality/JdbcArtifactQualityEventRepositoryTest.java
 +++ b/control-plane/src/test/java/io/agentteams/controlplane/quality/JdbcArtifactQualityEventRepositoryTest.java
-@@ -5,0 +6 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
+@@ -3,6 +3,7 @@ package io.agentteams.controlplane.quality;
+ import static org.junit.jupiter.api.Assertions.assertEquals;
+ import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+ import static org.junit.jupiter.api.Assertions.assertFalse;
 +import static org.junit.jupiter.api.Assertions.assertThrows;
-@@ -48,0 +50 @@ final class JdbcArtifactQualityEventRepositoryTest {
+ import static org.junit.jupiter.api.Assertions.assertTrue;
+
+ import io.agentteams.controlplane.security.ExecutionContext;
+@@ -46,6 +47,7 @@ final class JdbcArtifactQualityEventRepositoryTest {
+         jdbc.update("DELETE FROM projects");
+         jdbc.update("INSERT INTO projects(id, tenant_id, name, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, now(), now())",
+                 projectId, "tenant", "ledger", "test");
 +        seedTask(taskId, runId, "org", "tenant", projectId);
-@@ -79,0 +82,28 @@ final class JdbcArtifactQualityEventRepositoryTest {
+         repository = new JdbcArtifactQualityEventRepository(jdbc);
+         outbox = new JdbcArtifactQualityEventOutboxRepository(jdbc, new ObjectMapper().findAndRegisterModules());
+     }
+@@ -77,6 +79,34 @@ final class JdbcArtifactQualityEventRepositoryTest {
+         assertEquals(0, repository.find(other, new ArtifactQualityEventFilter(null, null, null, null, null, null, null, 0, 20)).total());
+     }
+
 +    @Test
 +    void rejectsEventWhoseTaskBelongsToAnotherTenantAndProject() {
 +        UUID foreignProject = UUID.randomUUID();
@@ -431,7 +1563,13 @@ index b9002de..f0cf253 100644
 +        assertThrows(IllegalArgumentException.class, () -> repository.append(context, forged));
 +    }
 +
-@@ -120,0 +151,9 @@ final class JdbcArtifactQualityEventRepositoryTest {
+     @Test
+     void supportsTheClassBasedTransactionProxyUsedByL5() {
+         assertDoesNotThrow(() -> {
+@@ -118,6 +148,15 @@ final class JdbcArtifactQualityEventRepositoryTest {
+                 null, null, "PDF artifact missing", "LIVE", "runtime:evaluation:" + runId, "HIGH", key, at);
+     }
+
 +    private void seedTask(UUID seededTaskId, UUID seededRunId, String organization, String tenant, UUID project) {
 +        jdbc.update("INSERT INTO tasks(id, title, description, phase, priority, spec, actor, source, created_at, updated_at) "
 +                + "VALUES (?, 'test', '', 'QUEUED', 0, '{}'::jsonb, 'test', 'test', now(), now())", seededTaskId);
@@ -441,17 +1579,379 @@ index b9002de..f0cf253 100644
 +                + "VALUES ('TASK', ?, ?, ?, 'team', now(), now())", seededTaskId, tenant, project.toString());
 +    }
 +
+     private static javax.sql.DataSource dataSource() {
+         org.postgresql.ds.PGSimpleDataSource source = new org.postgresql.ds.PGSimpleDataSource();
+         source.setURL(POSTGRES.getJdbcUrl());
+diff --git a/control-plane/src/test/java/io/agentteams/controlplane/scheduling/TenantFairQueueTest.java b/control-plane/src/test/java/io/agentteams/controlplane/scheduling/TenantFairQueueTest.java
+new file mode 100644
+index 0000000..c3c1d5c
+--- /dev/null
++++ b/control-plane/src/test/java/io/agentteams/controlplane/scheduling/TenantFairQueueTest.java
+@@ -0,0 +1,65 @@
++package io.agentteams.controlplane.scheduling;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++
++import java.util.ArrayList;
++import java.util.List;
++import java.util.UUID;
++import org.junit.jupiter.api.Test;
++
++class TenantFairQueueTest {
++    private static final UUID TENANT_A = UUID.fromString("00000000-0000-0000-0000-000000000001");
++    private static final UUID TENANT_B = UUID.fromString("00000000-0000-0000-0000-000000000002");
++
++    @Test
++    void weightedDeficitRoundRobinPreservesLongTermTenantWeights() {
++        TenantFairQueue queue = new TenantFairQueue();
++        List<String> selected = new ArrayList<>();
++        for (int i = 0; i < 30; i++) {
++            selected.addAll(queue.select(List.of(tenant(TENANT_A, 2, 0, 100, 30),
++                    tenant(TENANT_B, 1, 0, 100, 30)), 1));
++        }
++        assertThat(selected).filteredOn(TENANT_A.toString()::equals).hasSize(20);
++        assertThat(selected).filteredOn(TENANT_B.toString()::equals).hasSize(10);
++    }
++
++    @Test
++    void activeQuotaAndGlobalSlotsBoundEachSelection() {
++        TenantFairQueue queue = new TenantFairQueue();
++        assertThat(queue.select(List.of(tenant(TENANT_A, 10, 2, 2, 10),
++                tenant(TENANT_B, 1, 0, 1, 10)), 2)).containsExactly(TENANT_B.toString());
++    }
++
++    @Test
++    void skipsEmptyAndQuotaBlockedTenantsWithoutLosingOtherTenantCapacity() {
++        TenantFairQueue queue = new TenantFairQueue();
++        assertThat(queue.select(List.of(tenant(TENANT_A, 1, 0, 2, 0),
++                tenant(TENANT_B, 1, 2, 2, 5)), 3)).isEmpty();
++        assertThat(queue.select(List.of(tenant(TENANT_B, 1, 0, 2, 5)), 2))
++                .containsExactly(TENANT_B.toString(), TENANT_B.toString());
++    }
++
++    @Test
++    void snapshotRestoresWeightedCursorAcrossSchedulerInstances() {
++        TenantFairQueue first = new TenantFairQueue();
++        List<TenantFairQueue.TenantQueue> queues = List.of(tenant(TENANT_A, 1, 0, 10, 10),
++                tenant(TENANT_B, 1, 0, 10, 10));
++        assertThat(first.select(queues, 1)).containsExactly(TENANT_A.toString());
++        TenantFairQueue restarted = new TenantFairQueue(first.snapshot().deficits(), first.snapshot().nextTenant());
++        assertThat(restarted.select(List.of(tenant(TENANT_A, 1, 0, 10, 10),
++                tenant(TENANT_B, 1, 0, 10, 10)), 1)).containsExactly(TENANT_B.toString());
++    }
++
++    @Test
++    void validatesTenantWeightsAndQuotaInputs() {
++        assertThatThrownBy(() -> tenant(TENANT_A, 0, 0, 1, 1)).isInstanceOf(IllegalArgumentException.class);
++        assertThatThrownBy(() -> tenant(TENANT_A, 1, 2, 1, 1)).isInstanceOf(IllegalArgumentException.class);
++    }
++
++    private static TenantFairQueue.TenantQueue tenant(UUID id, int weight, int active, int maximum, int queued) {
++        List<UUID> tasks = new ArrayList<>();
++        for (int i = 0; i < queued; i++) tasks.add(UUID.nameUUIDFromBytes((id + ":" + i).getBytes()));
++        return new TenantFairQueue.TenantQueue(id.toString(), weight, active, maximum, tasks);
++    }
++}
+diff --git a/control-plane/src/test/java/io/agentteams/controlplane/service/TaskAssignmentSchedulerTest.java b/control-plane/src/test/java/io/agentteams/controlplane/service/TaskAssignmentSchedulerTest.java
+index e9c77d5..0f94274 100644
+--- a/control-plane/src/test/java/io/agentteams/controlplane/service/TaskAssignmentSchedulerTest.java
++++ b/control-plane/src/test/java/io/agentteams/controlplane/service/TaskAssignmentSchedulerTest.java
+@@ -38,6 +38,27 @@ class TaskAssignmentSchedulerTest {
+         verify(repository).release("task-assignment", "cp-1", NOW);
+     }
+
++    @Test
++    void usesPersistentTenantFairQueueWhenWorkerSlotsAreEnabled() {
++        SchedulerLeaseRepository repository = org.mockito.Mockito.mock(SchedulerLeaseRepository.class);
++        TaskAssignmentService assignments = org.mockito.Mockito.mock(TaskAssignmentService.class);
++        SubtaskGateService gate = org.mockito.Mockito.mock(SubtaskGateService.class);
++        when(repository.tryAcquire("task-assignment", "cp-fair", NOW, Duration.ofSeconds(30))).thenReturn(true);
++        when(assignments.workerSlotSchedulingEnabled()).thenReturn(true);
++        UUID taskId = UUID.randomUUID();
++        when(assignments.fairQueuedTaskIds(4, NOW)).thenReturn(List.of(taskId));
++        when(gate.tick(4)).thenReturn(0);
++
++        TaskAssignmentScheduler scheduler = new TaskAssignmentScheduler(assignments, gate,
++                new SchedulerLeaseService(repository), Clock.fixed(NOW, ZoneOffset.UTC), "cp-fair",
++                Duration.ofSeconds(30), 4);
++
++        assertThat(scheduler.runOnce()).isEqualTo(new TaskAssignmentScheduler.RunResult(0, 1, 0, 0));
++        verify(assignments).fairQueuedTaskIds(4, NOW);
++        org.mockito.Mockito.verify(assignments, org.mockito.Mockito.never()).queuedTaskIds(4, NOW, 0L);
++        verify(assignments).queueReadyTask(taskId, NOW);
++    }
++
+     @Test
+     void skipsWorkWhenAnotherReplicaOwnsTheLease() {
+         SchedulerLeaseRepository repository = org.mockito.Mockito.mock(SchedulerLeaseRepository.class);
+diff --git a/control-plane/src/test/java/io/agentteams/controlplane/service/TaskAssignmentServiceTest.java b/control-plane/src/test/java/io/agentteams/controlplane/service/TaskAssignmentServiceTest.java
+index 2b0e1df..aff59de 100644
+--- a/control-plane/src/test/java/io/agentteams/controlplane/service/TaskAssignmentServiceTest.java
++++ b/control-plane/src/test/java/io/agentteams/controlplane/service/TaskAssignmentServiceTest.java
+@@ -13,6 +13,7 @@ import io.agentteams.domain.task.TaskPhase;
+ import java.time.Duration;
+ import java.time.Instant;
+ import java.util.UUID;
++import org.springframework.jdbc.core.JdbcTemplate;
+ import org.flywaydb.core.Flyway;
+ import org.junit.jupiter.api.BeforeEach;
+ import org.junit.jupiter.api.Test;
+@@ -114,6 +115,97 @@ class TaskAssignmentServiceTest {
+         assertThat(result.agent().id()).isEqualTo(sameProjectDifferentTeam.id());
+     }
+
++    @Test
++    void atomicallyBindsAnAvailableWorkerSlotAndRoutesItInTaskAssignedOutbox() {
++        UUID taskId = UUID.randomUUID();
++        UUID slotId = UUID.fromString("00000000-0000-0000-0000-000000000010");
++        AgentRecord ready = agent(UUID.randomUUID(), "tenant-agent", AgentPhase.READY, "{}");
++        TaskRecord queued = queuedTask(taskId, "{}");
++        insert(ready, queued);
++        new JdbcTemplate(dataSource).update("INSERT INTO worker_slots(id, status) VALUES (?, 'ACTIVE')", slotId);
++
++        TaskAssignmentService.AssignmentResult result = new TaskAssignmentService(
++                persistence, LEASE_DURATION, true).queueReadyTask(taskId, START);
++
++        assertThat(new JdbcTemplate(dataSource).queryForObject(
++                "SELECT worker_slot_id FROM task_assignments WHERE id = ?", UUID.class, result.assignment().id()))
++                .isEqualTo(slotId);
++        var outboxEvent = persistence.inTransaction(tx -> tx.outboxEvents().findByEventId(result.eventId()));
++        assertThat(outboxEvent)
++                .get().satisfies(event -> assertThat(event.payloadJson())
++                        .contains("\"workerSlotId\": \"" + slotId + "\""));
++    }
++
++    @Test
++    void leavesTaskQueuedWhenFixedWorkerCapacityIsExhausted() {
++        UUID taskId = UUID.randomUUID();
++        AgentRecord ready = agent(UUID.randomUUID(), "tenant-agent", AgentPhase.READY, "{}");
++        insert(ready, queuedTask(taskId, "{}"));
++
++        org.assertj.core.api.Assertions.assertThatThrownBy(() -> new TaskAssignmentService(
++                persistence, LEASE_DURATION, true).queueReadyTask(taskId, START))
++                .isInstanceOf(IllegalStateException.class)
++                .hasMessageContaining("worker slot");
++
++        assertThat(persistence.findTask(taskId)).get().extracting(TaskRecord::phase).isEqualTo(TaskPhase.QUEUED);
++        persistence.inTransaction(tx -> {
++            assertThat(tx.taskAttempts().count()).isZero();
++            assertThat(tx.taskAssignments().count()).isZero();
++            assertThat(tx.agentLeases().count()).isZero();
++            return null;
++        });
++    }
++
++    @Test
++    void concurrentTasksCannotReserveTheSameWorkerSlot() throws Exception {
++        UUID taskA = UUID.randomUUID();
++        UUID taskB = UUID.randomUUID();
++        AgentRecord firstAgent = agent(UUID.randomUUID(), "slot-agent-a", AgentPhase.READY, "{}");
++        AgentRecord secondAgent = agent(UUID.randomUUID(), "slot-agent-b", AgentPhase.READY, "{}");
++        insert(firstAgent, queuedTask(taskA, "{}"));
++        insert(secondAgent, queuedTask(taskB, "{}"));
++        UUID slotId = UUID.randomUUID();
++        new JdbcTemplate(dataSource).update("INSERT INTO worker_slots(id, status) VALUES (?, 'ACTIVE')", slotId);
++        new JdbcTemplate(dataSource).update("""
++                INSERT INTO tenant_scheduler_policies(tenant_id, max_active_attempts)
++                VALUES ('tenant-test', 2)
++                ON CONFLICT (tenant_id) DO UPDATE SET max_active_attempts = 2
++                """);
++
++        var pool = java.util.concurrent.Executors.newFixedThreadPool(2);
++        var start = new java.util.concurrent.CountDownLatch(1);
++        try {
++            var first = pool.submit(() -> {
++                start.await();
++                return new TaskAssignmentService(persistence, LEASE_DURATION, true).queueReadyTask(taskA, START);
++            });
++            var second = pool.submit(() -> {
++                start.await();
++                return new TaskAssignmentService(persistence, LEASE_DURATION, true).queueReadyTask(taskB, START);
++            });
++            start.countDown();
++            int assigned = 0;
++            int exhausted = 0;
++            for (var future : java.util.List.of(first, second)) {
++                try {
++                    assertThat(future.get().assignment().workerSlotId()).isEqualTo(slotId);
++                    assigned++;
++                } catch (java.util.concurrent.ExecutionException failure) {
++                    assertThat(failure.getCause()).isInstanceOf(IllegalStateException.class)
++                            .hasMessageContaining("worker slot");
++                    exhausted++;
++                }
++            }
++            assertThat(assigned).isEqualTo(1);
++            assertThat(exhausted).isEqualTo(1);
++        } finally {
++            pool.shutdownNow();
++        }
++        assertThat(new JdbcTemplate(dataSource).queryForObject(
++                "SELECT count(*) FROM task_assignments WHERE worker_slot_id = ? AND phase IN ('ASSIGNED','ACCEPTED','RUNNING') AND released_at IS NULL",
++                Integer.class, slotId)).isEqualTo(1);
++    }
++
+     @Test
+     void expiresLeaseReleasesAssignmentQueuesTaskAndAllowsASecondAssignment() {
+         UUID taskId = UUID.randomUUID();
+@@ -224,15 +316,19 @@ class TaskAssignmentServiceTest {
+         // 会导致 A 的回收被一起回滚。
+         UUID taskA = UUID.randomUUID();
+         UUID taskB = UUID.randomUUID();
+-        AgentRecord agent = agent(UUID.randomUUID(), "fault-tolerant-agent", AgentPhase.READY,
++        AgentRecord agent = agent(UUID.randomUUID(), "fault-tolerant-agent-a", AgentPhase.READY,
++                "{\"python\":true}");
++        AgentRecord secondAgent = agent(UUID.randomUUID(), "fault-tolerant-agent-b", AgentPhase.READY,
+                 "{\"python\":true}");
+         TaskRecord queuedA = queuedTask(taskA, "{\"requiredCapabilities\":[\"python\"]}");
+         TaskRecord queuedB = queuedTask(taskB, "{\"requiredCapabilities\":[\"python\"]}");
+         persistence.inTransaction(tx -> {
+             tx.agents().insert(agent);
++            tx.agents().insert(secondAgent);
+             tx.tasks().insert(queuedA);
+             tx.tasks().insert(queuedB);
+             tx.insertResourceScope("WORKER", agent.id(), "tenant-test", "project-test", "team-test", START);
++            tx.insertResourceScope("WORKER", secondAgent.id(), "tenant-test", "project-test", "team-test", START);
+             tx.insertResourceScope("TASK", taskA, "tenant-test", "project-test", "team-test", START);
+             tx.insertResourceScope("TASK", taskB, "tenant-test", "project-test", "team-test", START);
+             return null;
+@@ -279,6 +375,109 @@ class TaskAssignmentServiceTest {
+                 .isEqualTo(TaskPhase.ASSIGNED);
+     }
+
++    @Test
++    void fairQueueCursorPersistsAcrossServiceRecreationAndAlternatesTenants() {
++        UUID taskA = UUID.randomUUID();
++        UUID taskB = UUID.randomUUID();
++        UUID slotId = UUID.randomUUID();
++        persistence.inTransaction(tx -> {
++            tx.tasks().insert(queuedTask(taskA, "{}"));
++            tx.tasks().insert(queuedTask(taskB, "{}"));
++            tx.insertResourceScope("TASK", taskA, "tenant-a", "project-a", "team-a", START);
++            tx.insertResourceScope("TASK", taskB, "tenant-b", "project-b", "team-b", START);
++            return null;
++        });
++        new JdbcTemplate(dataSource).update("INSERT INTO worker_slots(id, status) VALUES (?, 'ACTIVE')", slotId);
++
++        TaskAssignmentService firstService = new TaskAssignmentService(persistence, LEASE_DURATION, true);
++        UUID first = firstService.fairQueuedTaskIds(10, START).get(0);
++        TaskAssignmentService restartedService = new TaskAssignmentService(persistence, LEASE_DURATION, true);
++        UUID second = restartedService.fairQueuedTaskIds(10, START).get(0);
++
++        assertThat(first).isEqualTo(taskA);
++        assertThat(second).isEqualTo(taskB);
++    }
++
++    @Test
++    void concurrentAssignmentsCannotExceedTenantActiveAttemptQuota() throws Exception {
++        UUID taskA = UUID.randomUUID();
++        UUID taskB = UUID.randomUUID();
++        AgentRecord firstAgent = agent(UUID.randomUUID(), "quota-worker-a", AgentPhase.READY, "{}");
++        AgentRecord secondAgent = agent(UUID.randomUUID(), "quota-worker-b", AgentPhase.READY, "{}");
++        persistence.inTransaction(tx -> {
++            tx.agents().insert(firstAgent);
++            tx.agents().insert(secondAgent);
++            tx.tasks().insert(queuedTask(taskA, "{}"));
++            tx.tasks().insert(queuedTask(taskB, "{}"));
++            tx.insertResourceScope("WORKER", firstAgent.id(), "tenant-quota", "project-a", "team-a", START);
++            tx.insertResourceScope("WORKER", secondAgent.id(), "tenant-quota", "project-a", "team-a", START);
++            tx.insertResourceScope("TASK", taskA, "tenant-quota", "project-a", "team-a", START);
++            tx.insertResourceScope("TASK", taskB, "tenant-quota", "project-a", "team-a", START);
++            return null;
++        });
++        JdbcTemplate jdbc = new JdbcTemplate(dataSource);
++        jdbc.update("INSERT INTO worker_slots(id, status) VALUES (?, 'ACTIVE')", UUID.randomUUID());
++        jdbc.update("INSERT INTO worker_slots(id, status) VALUES (?, 'ACTIVE')", UUID.randomUUID());
++        jdbc.update("INSERT INTO tenant_scheduler_policies(tenant_id, max_active_attempts) VALUES ('tenant-quota', 1)");
++        TaskAssignmentService service = new TaskAssignmentService(persistence, LEASE_DURATION, true);
++        var pool = java.util.concurrent.Executors.newFixedThreadPool(2);
++        var start = new java.util.concurrent.CountDownLatch(1);
++        try {
++            var first = pool.submit(() -> { start.await(); return service.queueReadyTask(taskA, START); });
++            var second = pool.submit(() -> { start.await(); return service.queueReadyTask(taskB, START); });
++            start.countDown();
++            int assigned = 0;
++            int quotaDenied = 0;
++            for (var future : java.util.List.of(first, second)) {
++                try {
++                    future.get();
++                    assigned++;
++                } catch (java.util.concurrent.ExecutionException failure) {
++                    assertThat(failure.getCause()).isInstanceOf(IllegalStateException.class)
++                            .hasMessageContaining("tenant active attempt quota");
++                    quotaDenied++;
++                }
++            }
++            assertThat(assigned).isEqualTo(1);
++            assertThat(quotaDenied).isEqualTo(1);
++        } finally {
++            pool.shutdownNow();
++        }
++        assertThat(jdbc.queryForObject("SELECT count(*) FROM task_assignments WHERE phase = 'ASSIGNED' "
++                + "AND released_at IS NULL", Integer.class)).isEqualTo(1);
++    }
++
++    @Test
++    void fairQueueSkipsTenantAtActiveQuotaAndSelectsAnotherTenant() {
++        UUID activeTask = UUID.randomUUID();
++        UUID queuedTenantATask = UUID.randomUUID();
++        UUID queuedTenantBTask = UUID.randomUUID();
++        AgentRecord tenantAWorker = agent(UUID.randomUUID(), "tenant-a-worker", AgentPhase.READY, "{}");
++        AgentRecord tenantBWorker = agent(UUID.randomUUID(), "tenant-b-worker", AgentPhase.READY, "{}");
++        persistence.inTransaction(tx -> {
++            tx.agents().insert(tenantAWorker);
++            tx.agents().insert(tenantBWorker);
++            tx.tasks().insert(queuedTask(activeTask, "{}"));
++            tx.tasks().insert(queuedTask(queuedTenantATask, "{}"));
++            tx.tasks().insert(queuedTask(queuedTenantBTask, "{}"));
++            tx.insertResourceScope("WORKER", tenantAWorker.id(), "tenant-a", "project-a", "team-a", START);
++            tx.insertResourceScope("WORKER", tenantBWorker.id(), "tenant-b", "project-b", "team-b", START);
++            tx.insertResourceScope("TASK", activeTask, "tenant-a", "project-a", "team-a", START);
++            tx.insertResourceScope("TASK", queuedTenantATask, "tenant-a", "project-a", "team-a", START);
++            tx.insertResourceScope("TASK", queuedTenantBTask, "tenant-b", "project-b", "team-b", START);
++            return null;
++        });
++        JdbcTemplate jdbc = new JdbcTemplate(dataSource);
++        jdbc.update("INSERT INTO worker_slots(id, status) VALUES (?, 'ACTIVE')", UUID.randomUUID());
++        jdbc.update("INSERT INTO worker_slots(id, status) VALUES (?, 'ACTIVE')", UUID.randomUUID());
++        TaskAssignmentService service = new TaskAssignmentService(persistence, LEASE_DURATION, true);
++        service.queueReadyTask(activeTask, START);
++
++        assertThat(service.fairQueuedTaskIds(10, START)).containsExactly(queuedTenantBTask);
++        org.assertj.core.api.Assertions.assertThatThrownBy(() -> service.queueReadyTask(queuedTenantATask, START))
++                .isInstanceOf(IllegalStateException.class).hasMessageContaining("tenant active attempt quota");
++    }
++
+     private void insert(AgentRecord... agents) {
+         persistence.inTransaction(tx -> {
+             for (AgentRecord agent : agents) {
 diff --git a/control-plane/src/test/java/io/agentteams/controlplane/skill/SkillControllerTest.java b/control-plane/src/test/java/io/agentteams/controlplane/skill/SkillControllerTest.java
 index f33c0c2..bea83c1 100644
 --- a/control-plane/src/test/java/io/agentteams/controlplane/skill/SkillControllerTest.java
 +++ b/control-plane/src/test/java/io/agentteams/controlplane/skill/SkillControllerTest.java
-@@ -4,0 +5,3 @@ import static org.mockito.ArgumentMatchers.eq;
+@@ -2,6 +2,9 @@ package io.agentteams.controlplane.skill;
+
+ import static org.mockito.ArgumentMatchers.any;
+ import static org.mockito.ArgumentMatchers.eq;
 +import static org.mockito.Mockito.doThrow;
 +import static org.mockito.Mockito.verify;
 +import static org.mockito.Mockito.verifyNoInteractions;
-@@ -12,0 +16 @@ import io.agentteams.controlplane.api.ApiErrorHandler;
+ import static org.mockito.Mockito.when;
+ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+@@ -10,6 +13,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
+
+ import com.fasterxml.jackson.databind.ObjectMapper;
+ import io.agentteams.controlplane.api.ApiErrorHandler;
 +import io.agentteams.controlplane.security.AuthorizationException;
-@@ -164,0 +169,25 @@ class SkillControllerTest {
+ import java.time.Instant;
+ import java.net.URL;
+ import java.util.List;
+@@ -162,4 +166,29 @@ class SkillControllerTest {
+                 .andExpect(status().isOk())
+                 .andExpect(jsonPath("$.id").value(versionId.toString()));
+     }
 +
 +    @Test
 +    void rejectsCrossScopePackageUploadCompletionAndDownloadBeforeIssuingStorageUrls() throws Exception {
@@ -477,11 +1977,15 @@ index f33c0c2..bea83c1 100644
 +        verify(service, org.mockito.Mockito.times(3)).getSkill(skillId);
 +        verifyNoInteractions(packageStorage);
 +    }
+ }
 diff --git a/control-plane/src/test/java/io/agentteams/controlplane/team/TeamDeploymentRepositoryTest.java b/control-plane/src/test/java/io/agentteams/controlplane/team/TeamDeploymentRepositoryTest.java
 index 97a0dbc..729b5d3 100644
 --- a/control-plane/src/test/java/io/agentteams/controlplane/team/TeamDeploymentRepositoryTest.java
 +++ b/control-plane/src/test/java/io/agentteams/controlplane/team/TeamDeploymentRepositoryTest.java
-@@ -83,0 +84,15 @@ class TeamDeploymentRepositoryTest {
+@@ -81,6 +81,21 @@ class TeamDeploymentRepositoryTest {
+         assertThat(repository.find(second).orElseThrow().status()).isEqualTo("SUCCEEDED");
+     }
+
 +    @Test
 +    void doesNotAdvanceDeploymentWhenAcknowledgementAgentDoesNotOwnTheBinding() {
 +        UUID deploymentId = deploy("deployment-forged-agent-ack");
@@ -497,23 +2001,332 @@ index 97a0dbc..729b5d3 100644
 +                .extracting(TeamDeployment.Member::status).isEqualTo("PENDING");
 +    }
 +
+     @Test
+     void convergesMemberWhenApplyCompletedBeforeBindingWasRecorded() {
+         UUID deploymentId = UUID.randomUUID();
+diff --git a/control-plane/src/test/java/io/agentteams/controlplane/worker/WorkerDrainLifecycleTest.java b/control-plane/src/test/java/io/agentteams/controlplane/worker/WorkerDrainLifecycleTest.java
+new file mode 100644
+index 0000000..7ddd714
+--- /dev/null
++++ b/control-plane/src/test/java/io/agentteams/controlplane/worker/WorkerDrainLifecycleTest.java
+@@ -0,0 +1,281 @@
++package io.agentteams.controlplane.worker;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++
++import io.agentteams.controlplane.persistence.AgentLeaseRecord;
++import io.agentteams.controlplane.persistence.AgentRecord;
++import io.agentteams.controlplane.persistence.FoundationPersistenceService;
++import io.agentteams.controlplane.persistence.TaskAttemptRecord;
++import io.agentteams.controlplane.persistence.TaskRecord;
++import io.agentteams.controlplane.service.WorkerLifecycleConflictException;
++import io.agentteams.controlplane.service.TaskAssignmentService;
++import io.agentteams.controlplane.security.AuthorizationException;
++import io.agentteams.controlplane.security.AuthorizationService;
++import io.agentteams.controlplane.security.Principal;
++import io.agentteams.controlplane.security.PrincipalContext;
++import io.agentteams.controlplane.security.ResourceScopeRepository;
++import io.agentteams.domain.agent.AgentPhase;
++import io.agentteams.domain.task.TaskPhase;
++import java.lang.reflect.InvocationTargetException;
++import java.time.Duration;
++import java.time.Instant;
++import java.util.UUID;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.TimeUnit;
++import org.flywaydb.core.Flyway;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.jdbc.core.JdbcTemplate;
++import org.testcontainers.containers.PostgreSQLContainer;
++import org.testcontainers.junit.jupiter.Container;
++import org.testcontainers.junit.jupiter.Testcontainers;
++
++@Testcontainers(disabledWithoutDocker = true)
++class WorkerDrainLifecycleTest {
++    private static final Instant NOW = Instant.parse("2026-11-06T00:00:00Z");
++
++    @Container
++    static final PostgreSQLContainer<?> POSTGRES = new PostgreSQLContainer<>("postgres:16-alpine");
++
++    private FoundationPersistenceService persistence;
++    private JdbcTemplate jdbc;
++    private WorkerOperationService operations;
++
++    @BeforeEach
++    void resetDatabase() {
++        Flyway.configure().locations("filesystem:src/main/resources/db/migration")
++                .dataSource(POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword())
++                .cleanDisabled(false).load().clean();
++        Flyway.configure().locations("filesystem:src/main/resources/db/migration")
++                .dataSource(POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword()).load().migrate();
++        org.postgresql.ds.PGSimpleDataSource dataSource = new org.postgresql.ds.PGSimpleDataSource();
++        dataSource.setURL(POSTGRES.getJdbcUrl());
++        dataSource.setUser(POSTGRES.getUsername());
++        dataSource.setPassword(POSTGRES.getPassword());
++        persistence = new FoundationPersistenceService(dataSource);
++        jdbc = new JdbcTemplate(dataSource);
++        operations = new WorkerOperationService(persistence, java.time.Clock.fixed(NOW, java.time.ZoneOffset.UTC),
++                Duration.ofMinutes(2));
++    }
++
++    @Test
++    void marksDrainCompleteOnceTheFinalLeaseIsReleased() {
++        UUID agentId = readyAgent();
++        WorkerOperation drain = operations.drain(agentId, 0, "drain-complete-1");
++
++        recover(NOW);
++
++        assertThat(operations.get(agentId, drain.id()).status()).isEqualTo(WorkerOperationStatus.DRAINED);
++        assertThat(persistence.findAgent(agentId)).get().extracting(AgentRecord::phase)
++                .isEqualTo(AgentPhase.DRAINING);
++    }
++
++    @Test
++    void leavesDrainPendingWhileAnAttemptLeaseIsActive() {
++        UUID agentId = readyAgent();
++        insertActiveLease(agentId);
++        WorkerOperation drain = operations.drain(agentId, 0, "drain-active-lease-1");
++
++        recover(NOW.plusSeconds(180));
++
++        assertThat(operations.get(agentId, drain.id()).status()).isEqualTo(WorkerOperationStatus.PENDING);
++    }
++
++    @Test
++    void canActivateTheSameWorkerAfterGatewayReconnectAndDrain() {
++        UUID agentId = readyAgent();
++        WorkerOperation drain = operations.drain(agentId, 0, "drain-before-activate-1");
++        recover(NOW.plusSeconds(180));
++        insertGatewayOnline(agentId);
++
++        WorkerOperation activate = invokeActivate(agentId, 1, "activate-1");
++        WorkerOperation repeated = invokeActivate(agentId, 1, "activate-1");
++
++        assertThat(activate.type().name()).isEqualTo("ACTIVATE");
++        assertThat(activate.status()).isEqualTo(WorkerOperationStatus.SUCCEEDED);
++        assertThat(repeated.id()).isEqualTo(activate.id());
++        assertThat(operations.get(agentId, drain.id()).status()).isEqualTo(WorkerOperationStatus.DRAINED);
++        assertThat(persistence.findAgent(agentId)).get().extracting(AgentRecord::phase).isEqualTo(AgentPhase.READY);
++    }
++
++    @Test
++    void refusesActivationUntilGatewayHasReconnected() {
++        UUID agentId = readyAgent();
++        operations.drain(agentId, 0, "drain-offline-activate-1");
++        recover(NOW);
++
++        assertThatThrownBy(() -> invokeActivate(agentId, 1, "activate-offline-1"))
++                .isInstanceOf(WorkerLifecycleConflictException.class)
++                .hasMessage("WORKER_NOT_ONLINE");
++        assertThat(persistence.findAgent(agentId)).get().extracting(AgentRecord::phase)
++                .isEqualTo(AgentPhase.DRAINING);
++    }
++
++    @Test
++    void refusesActivationWhileAnAttemptLeaseRemainsActive() {
++        UUID agentId = readyAgent();
++        insertActiveLease(agentId);
++        operations.drain(agentId, 0, "drain-active-activate-1");
++        insertGatewayOnline(agentId);
++
++        assertThatThrownBy(() -> invokeActivate(agentId, 1, "activate-active-1"))
++                .isInstanceOf(WorkerLifecycleConflictException.class)
++                .hasMessage("WORKER_HAS_ACTIVE_TASKS");
++        assertThat(persistence.findAgent(agentId)).get().extracting(AgentRecord::phase)
++                .isEqualTo(AgentPhase.DRAINING);
++    }
++
++    @Test
++    void refusesActivationWhenTheDrainOperationHasNotReachedDrained() {
++        UUID agentId = readyAgent();
++        operations.drain(agentId, 0, "drain-not-ready-1");
++        insertGatewayOnline(agentId);
++        assertThatThrownBy(() -> invokeActivate(agentId, 1, "activate-not-drained-1"))
++                .isInstanceOf(WorkerLifecycleConflictException.class)
++                .hasMessage("WORKER_NOT_DRAINED");
++    }
++
++    @Test
++    void drainingWorkerCannotReceiveAnotherTaskAssignment() {
++        UUID agentId = readyAgent();
++        UUID taskId = UUID.randomUUID();
++        operations.drain(agentId, 0, "drain-before-assignment-1");
++        persistence.inTransaction(tx -> {
++            tx.tasks().insert(new TaskRecord(taskId, "queued", "", TaskPhase.QUEUED, 0, "{}", "actor", "test",
++                    null, null, NOW, NOW, 0));
++            return null;
++        });
++
++        assertThatThrownBy(() -> new TaskAssignmentService(persistence, Duration.ofMinutes(2))
++                .queueReadyTask(taskId, NOW))
++                .isInstanceOf(IllegalStateException.class)
++                .hasMessage("no READY agent matches task capabilities");
++        assertThat(persistence.findTask(taskId)).get().extracting(TaskRecord::phase).isEqualTo(TaskPhase.QUEUED);
++    }
++
++    @Test
++    void taskDispatchSkipsWorkerWhileActivationHoldsItsRowLock() throws Exception {
++        UUID agentId = readyAgent();
++        operations.drain(agentId, 0, "drain-before-concurrent-activation-1");
++        recover(NOW);
++        insertGatewayOnline(agentId);
++        UUID taskId = UUID.randomUUID();
++        persistence.inTransaction(tx -> {
++            tx.tasks().insert(new TaskRecord(taskId, "queued", "", TaskPhase.QUEUED, 0, "{}", "actor", "test",
++                    null, null, NOW, NOW, 0));
++            return null;
++        });
++
++        CountDownLatch activationHasLockedWorker = new CountDownLatch(1);
++        CountDownLatch finishActivation = new CountDownLatch(1);
++        ExecutorService executor = Executors.newSingleThreadExecutor();
++        try {
++            var activation = executor.submit(() -> persistence.inTransaction(tx -> {
++                tx.agents().findByIdForUpdate(agentId).orElseThrow();
++                tx.agents().updatePhase(agentId, AgentPhase.READY, 1, NOW);
++                activationHasLockedWorker.countDown();
++                try {
++                    if (!finishActivation.await(5, TimeUnit.SECONDS)) {
++                        throw new IllegalStateException("activation lock test timed out");
++                    }
++                } catch (InterruptedException interrupted) {
++                    Thread.currentThread().interrupt();
++                    throw new IllegalStateException("activation lock test interrupted", interrupted);
++                }
++                return null;
++            }));
++            assertThat(activationHasLockedWorker.await(5, TimeUnit.SECONDS)).isTrue();
++
++            java.util.Optional<AgentRecord> match = persistence.inTransaction(tx -> tx.agents()
++                    .findReadyMatchingInTaskProject("{}", taskId, NOW));
++            assertThat(match).isEmpty();
++
++            finishActivation.countDown();
++            activation.get(5, TimeUnit.SECONDS);
++            new TaskAssignmentService(persistence, Duration.ofMinutes(2)).queueReadyTask(taskId, NOW);
++            assertThat(persistence.findTask(taskId)).get().extracting(TaskRecord::phase)
++                    .isEqualTo(TaskPhase.ASSIGNED);
++        } finally {
++            finishActivation.countDown();
++            executor.shutdownNow();
++        }
++    }
++
++    @Test
++    void refusesActivationWhenCallerCannotSeeTheWorkerTenantScope() {
++        UUID agentId = UUID.randomUUID();
++        ResourceScopeRepository scopes = org.mockito.Mockito.mock(ResourceScopeRepository.class);
++        org.mockito.Mockito.doThrow(new AuthorizationException("resource is outside caller project"))
++                .when(scopes).requireVisible("WORKER", agentId);
++        WorkerOperationService scoped = new WorkerOperationService(persistence,
++                java.time.Clock.fixed(NOW, java.time.ZoneOffset.UTC), Duration.ofMinutes(2), scopes);
++        PrincipalContext.set(new Principal("tenant-b-user",
++                new AuthorizationService.Scope("tenant-b", "project-b", "team-b"), java.util.Set.of()));
++        try {
++            assertThatThrownBy(() -> scoped.activate(agentId, 1, "cross-tenant-activate-1"))
++                    .isInstanceOf(AuthorizationException.class)
++                    .hasMessage("resource is outside caller project");
++            org.mockito.Mockito.verify(scopes).requireVisible("WORKER", agentId);
++        } finally {
++            PrincipalContext.clear();
++        }
++    }
++
++    private UUID readyAgent() {
++        UUID id = UUID.randomUUID();
++        persistence.inTransaction(tx -> {
++            tx.agents().insert(AgentRecord.create(id, "worker-" + id, AgentPhase.READY,
++                    "agentscope", "{}", NOW));
++            return null;
++        });
++        return id;
++    }
++
++    private void recover(Instant at) {
++        persistence.inTransaction(tx -> WorkerOperationService.recoverExpiredOperations(tx, at));
++    }
++
++    private void insertActiveLease(UUID agentId) {
++        UUID taskId = UUID.randomUUID();
++        UUID attemptId = UUID.randomUUID();
++        UUID leaseId = UUID.randomUUID();
++        Instant expiresAt = NOW.plusSeconds(60);
++        persistence.inTransaction(tx -> {
++            tx.tasks().insert(new TaskRecord(taskId, "task", "", TaskPhase.ASSIGNED, 0, "{}", "actor", "test",
++                    null, null, NOW, NOW, 1));
++            tx.taskAttempts().insert(new TaskAttemptRecord(attemptId, taskId, leaseId, TaskPhase.ASSIGNED,
++                    expiresAt, null, "scheduler", "control-plane", null, null, NOW, NOW, 1));
++            tx.agentLeases().insert(new AgentLeaseRecord(leaseId, agentId, attemptId, NOW, expiresAt, null,
++                    "ACTIVE", NOW, NOW, 0));
++            return null;
++        });
++    }
++
++    private void insertGatewayOnline(UUID agentId) {
++        jdbc.update("""
++                INSERT INTO gateway_agent_state
++                    (agent_id, connection_id, presence, phase, runtime, runtime_version, capabilities,
++                     connected_at, last_seen_at, disconnected_at, updated_at)
++                VALUES (?, ?, 'ONLINE', 'READY', 'agentscope', 'v0.1.5', '{}'::jsonb, ?, ?, NULL, ?)
++                """, agentId.toString(), UUID.randomUUID(), java.sql.Timestamp.from(NOW),
++                java.sql.Timestamp.from(NOW), java.sql.Timestamp.from(NOW));
++    }
++
++    private WorkerOperation invokeActivate(UUID agentId, long expectedVersion, String idempotencyKey) {
++        try {
++            return (WorkerOperation) WorkerOperationService.class
++                    .getMethod("activate", UUID.class, long.class, String.class)
++                    .invoke(operations, agentId, expectedVersion, idempotencyKey);
++        } catch (NoSuchMethodException missing) {
++            throw new AssertionError("missing WorkerOperationService.activate lifecycle API", missing);
++        } catch (IllegalAccessException impossible) {
++            throw new AssertionError("activate lifecycle API must be public", impossible);
++        } catch (InvocationTargetException wrapped) {
++            if (wrapped.getCause() instanceof RuntimeException runtime) throw runtime;
++            throw new AssertionError("activate lifecycle API failed", wrapped.getCause());
++        }
++    }
++}
 diff --git a/deploy/docker/control-plane.Dockerfile b/deploy/docker/control-plane.Dockerfile
 index 66e64ff..4981640 100644
 --- a/deploy/docker/control-plane.Dockerfile
 +++ b/deploy/docker/control-plane.Dockerfile
-@@ -3 +3 @@
+@@ -1,13 +1,13 @@
+ # Java bytecode is platform independent; compile on BUILDPLATFORM and keep
+ # only the runtime image on TARGETPLATFORM.
 -FROM --platform=$BUILDPLATFORM maven:3.9.16-eclipse-temurin-21 AS build
 +FROM --platform=$BUILDPLATFORM dockerproxy.net/library/maven@sha256:99e61abcff91a9b1333463bd8451fb18495d6eba9250ac66a338b518f8278320 AS build
-@@ -10 +10 @@ RUN mvn -q -pl control-plane -DskipTests package spring-boot:repackage
+ WORKDIR /workspace
+ COPY deploy/docker/maven-settings.xml /root/.m2/settings.xml
+ COPY . .
+ RUN mvn -q -pl control-plane -am -DskipTests install
+ RUN mvn -q -pl control-plane -DskipTests package spring-boot:repackage
+
 -FROM eclipse-temurin:21-jre
 +FROM dockerproxy.net/library/eclipse-temurin@sha256:0b99b3376fbb50dbf9c0af8535fdd5b8eb0d3fdfc8b1e4967f383b6919f6901a
+ WORKDIR /app
+ COPY --from=build /workspace/control-plane/target/agentteams-control-plane-0.1.0-SNAPSHOT.jar /app/app.jar
+ USER 10001
 diff --git a/integration-tests/src/test/java/io/agentteams/it/FakeAgent.java b/integration-tests/src/test/java/io/agentteams/it/FakeAgent.java
 index 60c40b6..23e1a46 100644
 --- a/integration-tests/src/test/java/io/agentteams/it/FakeAgent.java
 +++ b/integration-tests/src/test/java/io/agentteams/it/FakeAgent.java
-@@ -19,0 +20 @@ import io.agentteams.contracts.v1.TaskProgress;
+@@ -17,6 +17,7 @@ import io.agentteams.contracts.v1.TaskAssigned;
+ import io.agentteams.contracts.v1.TaskCompleted;
+ import io.agentteams.contracts.v1.TaskHeartbeat;
+ import io.agentteams.contracts.v1.TaskProgress;
 +import io.agentteams.contracts.v1.TaskEventReport;
-@@ -156,0 +158,13 @@ final class FakeAgent implements AutoCloseable {
+ import io.agentteams.gateway.SequencedCommand;
+ import io.grpc.ManagedChannel;
+ import io.grpc.ManagedChannelBuilder;
+@@ -154,6 +155,19 @@ final class FakeAgent implements AutoCloseable {
+                 .build()).build());
+     }
+
 +    void reportTaskEventForTask(TaskAssigned assignment, String targetTaskId, String eventId) {
 +        EventMetadata metadata = taskMetadata(assignment, eventId, 6).toBuilder()
 +                .setTaskId(targetTaskId)
@@ -527,6 +2340,9 @@ index 60c40b6..23e1a46 100644
 +                .build()).build());
 +    }
 +
+     void complete(TaskAssigned assignment, String name, String storageKey, String sha256, long sizeBytes) {
+         requests.onNext(AgentMessage.newBuilder().setTaskCompleted(TaskCompleted.newBuilder()
+                 .setMetadata(taskMetadata(assignment, UUID.randomUUID().toString(), 5))
 diff --git a/integration-tests/src/test/java/io/agentteams/it/TaskEventScopeEndToEndIT.java b/integration-tests/src/test/java/io/agentteams/it/TaskEventScopeEndToEndIT.java
 new file mode 100644
 index 0000000..5e15346
@@ -879,1067 +2695,3 @@ index 0000000..5e15346
 +        return java.util.HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(value));
 +    }
 +}
-diff --git a/control-plane/src/test/java/io/agentteams/controlplane/worker/WorkerDrainLifecycleTest.java b/control-plane/src/test/java/io/agentteams/controlplane/worker/WorkerDrainLifecycleTest.java
-new file mode 100644
---- /dev/null
-+++ b/control-plane/src/test/java/io/agentteams/controlplane/worker/WorkerDrainLifecycleTest.java
-@@ -0,0 +1,281 @@
-+package io.agentteams.controlplane.worker;
-+
-+import static org.assertj.core.api.Assertions.assertThat;
-+import static org.assertj.core.api.Assertions.assertThatThrownBy;
-+
-+import io.agentteams.controlplane.persistence.AgentLeaseRecord;
-+import io.agentteams.controlplane.persistence.AgentRecord;
-+import io.agentteams.controlplane.persistence.FoundationPersistenceService;
-+import io.agentteams.controlplane.persistence.TaskAttemptRecord;
-+import io.agentteams.controlplane.persistence.TaskRecord;
-+import io.agentteams.controlplane.service.WorkerLifecycleConflictException;
-+import io.agentteams.controlplane.service.TaskAssignmentService;
-+import io.agentteams.controlplane.security.AuthorizationException;
-+import io.agentteams.controlplane.security.AuthorizationService;
-+import io.agentteams.controlplane.security.Principal;
-+import io.agentteams.controlplane.security.PrincipalContext;
-+import io.agentteams.controlplane.security.ResourceScopeRepository;
-+import io.agentteams.domain.agent.AgentPhase;
-+import io.agentteams.domain.task.TaskPhase;
-+import java.lang.reflect.InvocationTargetException;
-+import java.time.Duration;
-+import java.time.Instant;
-+import java.util.UUID;
-+import java.util.concurrent.CountDownLatch;
-+import java.util.concurrent.ExecutorService;
-+import java.util.concurrent.Executors;
-+import java.util.concurrent.TimeUnit;
-+import org.flywaydb.core.Flyway;
-+import org.junit.jupiter.api.BeforeEach;
-+import org.junit.jupiter.api.Test;
-+import org.springframework.jdbc.core.JdbcTemplate;
-+import org.testcontainers.containers.PostgreSQLContainer;
-+import org.testcontainers.junit.jupiter.Container;
-+import org.testcontainers.junit.jupiter.Testcontainers;
-+
-+@Testcontainers(disabledWithoutDocker = true)
-+class WorkerDrainLifecycleTest {
-+    private static final Instant NOW = Instant.parse("2026-11-06T00:00:00Z");
-+
-+    @Container
-+    static final PostgreSQLContainer<?> POSTGRES = new PostgreSQLContainer<>("postgres:16-alpine");
-+
-+    private FoundationPersistenceService persistence;
-+    private JdbcTemplate jdbc;
-+    private WorkerOperationService operations;
-+
-+    @BeforeEach
-+    void resetDatabase() {
-+        Flyway.configure().locations("filesystem:src/main/resources/db/migration")
-+                .dataSource(POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword())
-+                .cleanDisabled(false).load().clean();
-+        Flyway.configure().locations("filesystem:src/main/resources/db/migration")
-+                .dataSource(POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword()).load().migrate();
-+        org.postgresql.ds.PGSimpleDataSource dataSource = new org.postgresql.ds.PGSimpleDataSource();
-+        dataSource.setURL(POSTGRES.getJdbcUrl());
-+        dataSource.setUser(POSTGRES.getUsername());
-+        dataSource.setPassword(POSTGRES.getPassword());
-+        persistence = new FoundationPersistenceService(dataSource);
-+        jdbc = new JdbcTemplate(dataSource);
-+        operations = new WorkerOperationService(persistence, java.time.Clock.fixed(NOW, java.time.ZoneOffset.UTC),
-+                Duration.ofMinutes(2));
-+    }
-+
-+    @Test
-+    void marksDrainCompleteOnceTheFinalLeaseIsReleased() {
-+        UUID agentId = readyAgent();
-+        WorkerOperation drain = operations.drain(agentId, 0, "drain-complete-1");
-+
-+        recover(NOW);
-+
-+        assertThat(operations.get(agentId, drain.id()).status()).isEqualTo(WorkerOperationStatus.DRAINED);
-+        assertThat(persistence.findAgent(agentId)).get().extracting(AgentRecord::phase)
-+                .isEqualTo(AgentPhase.DRAINING);
-+    }
-+
-+    @Test
-+    void leavesDrainPendingWhileAnAttemptLeaseIsActive() {
-+        UUID agentId = readyAgent();
-+        insertActiveLease(agentId);
-+        WorkerOperation drain = operations.drain(agentId, 0, "drain-active-lease-1");
-+
-+        recover(NOW.plusSeconds(180));
-+
-+        assertThat(operations.get(agentId, drain.id()).status()).isEqualTo(WorkerOperationStatus.PENDING);
-+    }
-+
-+    @Test
-+    void canActivateTheSameWorkerAfterGatewayReconnectAndDrain() {
-+        UUID agentId = readyAgent();
-+        WorkerOperation drain = operations.drain(agentId, 0, "drain-before-activate-1");
-+        recover(NOW.plusSeconds(180));
-+        insertGatewayOnline(agentId);
-+
-+        WorkerOperation activate = invokeActivate(agentId, 1, "activate-1");
-+        WorkerOperation repeated = invokeActivate(agentId, 1, "activate-1");
-+
-+        assertThat(activate.type().name()).isEqualTo("ACTIVATE");
-+        assertThat(activate.status()).isEqualTo(WorkerOperationStatus.SUCCEEDED);
-+        assertThat(repeated.id()).isEqualTo(activate.id());
-+        assertThat(operations.get(agentId, drain.id()).status()).isEqualTo(WorkerOperationStatus.DRAINED);
-+        assertThat(persistence.findAgent(agentId)).get().extracting(AgentRecord::phase).isEqualTo(AgentPhase.READY);
-+    }
-+
-+    @Test
-+    void refusesActivationUntilGatewayHasReconnected() {
-+        UUID agentId = readyAgent();
-+        operations.drain(agentId, 0, "drain-offline-activate-1");
-+        recover(NOW);
-+
-+        assertThatThrownBy(() -> invokeActivate(agentId, 1, "activate-offline-1"))
-+                .isInstanceOf(WorkerLifecycleConflictException.class)
-+                .hasMessage("WORKER_NOT_ONLINE");
-+        assertThat(persistence.findAgent(agentId)).get().extracting(AgentRecord::phase)
-+                .isEqualTo(AgentPhase.DRAINING);
-+    }
-+
-+    @Test
-+    void refusesActivationWhileAnAttemptLeaseRemainsActive() {
-+        UUID agentId = readyAgent();
-+        insertActiveLease(agentId);
-+        operations.drain(agentId, 0, "drain-active-activate-1");
-+        insertGatewayOnline(agentId);
-+
-+        assertThatThrownBy(() -> invokeActivate(agentId, 1, "activate-active-1"))
-+                .isInstanceOf(WorkerLifecycleConflictException.class)
-+                .hasMessage("WORKER_HAS_ACTIVE_TASKS");
-+        assertThat(persistence.findAgent(agentId)).get().extracting(AgentRecord::phase)
-+                .isEqualTo(AgentPhase.DRAINING);
-+    }
-+
-+    @Test
-+    void refusesActivationWhenTheDrainOperationHasNotReachedDrained() {
-+        UUID agentId = readyAgent();
-+        operations.drain(agentId, 0, "drain-not-ready-1");
-+        insertGatewayOnline(agentId);
-+        assertThatThrownBy(() -> invokeActivate(agentId, 1, "activate-not-drained-1"))
-+                .isInstanceOf(WorkerLifecycleConflictException.class)
-+                .hasMessage("WORKER_NOT_DRAINED");
-+    }
-+
-+    @Test
-+    void drainingWorkerCannotReceiveAnotherTaskAssignment() {
-+        UUID agentId = readyAgent();
-+        UUID taskId = UUID.randomUUID();
-+        operations.drain(agentId, 0, "drain-before-assignment-1");
-+        persistence.inTransaction(tx -> {
-+            tx.tasks().insert(new TaskRecord(taskId, "queued", "", TaskPhase.QUEUED, 0, "{}", "actor", "test",
-+                    null, null, NOW, NOW, 0));
-+            return null;
-+        });
-+
-+        assertThatThrownBy(() -> new TaskAssignmentService(persistence, Duration.ofMinutes(2))
-+                .queueReadyTask(taskId, NOW))
-+                .isInstanceOf(IllegalStateException.class)
-+                .hasMessage("no READY agent matches task capabilities");
-+        assertThat(persistence.findTask(taskId)).get().extracting(TaskRecord::phase).isEqualTo(TaskPhase.QUEUED);
-+    }
-+
-+    @Test
-+    void taskDispatchSkipsWorkerWhileActivationHoldsItsRowLock() throws Exception {
-+        UUID agentId = readyAgent();
-+        operations.drain(agentId, 0, "drain-before-concurrent-activation-1");
-+        recover(NOW);
-+        insertGatewayOnline(agentId);
-+        UUID taskId = UUID.randomUUID();
-+        persistence.inTransaction(tx -> {
-+            tx.tasks().insert(new TaskRecord(taskId, "queued", "", TaskPhase.QUEUED, 0, "{}", "actor", "test",
-+                    null, null, NOW, NOW, 0));
-+            return null;
-+        });
-+
-+        CountDownLatch activationHasLockedWorker = new CountDownLatch(1);
-+        CountDownLatch finishActivation = new CountDownLatch(1);
-+        ExecutorService executor = Executors.newSingleThreadExecutor();
-+        try {
-+            var activation = executor.submit(() -> persistence.inTransaction(tx -> {
-+                tx.agents().findByIdForUpdate(agentId).orElseThrow();
-+                tx.agents().updatePhase(agentId, AgentPhase.READY, 1, NOW);
-+                activationHasLockedWorker.countDown();
-+                try {
-+                    if (!finishActivation.await(5, TimeUnit.SECONDS)) {
-+                        throw new IllegalStateException("activation lock test timed out");
-+                    }
-+                } catch (InterruptedException interrupted) {
-+                    Thread.currentThread().interrupt();
-+                    throw new IllegalStateException("activation lock test interrupted", interrupted);
-+                }
-+                return null;
-+            }));
-+            assertThat(activationHasLockedWorker.await(5, TimeUnit.SECONDS)).isTrue();
-+
-+            java.util.Optional<AgentRecord> match = persistence.inTransaction(tx -> tx.agents()
-+                    .findReadyMatchingInTaskProject("{}", taskId, NOW));
-+            assertThat(match).isEmpty();
-+
-+            finishActivation.countDown();
-+            activation.get(5, TimeUnit.SECONDS);
-+            new TaskAssignmentService(persistence, Duration.ofMinutes(2)).queueReadyTask(taskId, NOW);
-+            assertThat(persistence.findTask(taskId)).get().extracting(TaskRecord::phase)
-+                    .isEqualTo(TaskPhase.ASSIGNED);
-+        } finally {
-+            finishActivation.countDown();
-+            executor.shutdownNow();
-+        }
-+    }
-+
-+    @Test
-+    void refusesActivationWhenCallerCannotSeeTheWorkerTenantScope() {
-+        UUID agentId = UUID.randomUUID();
-+        ResourceScopeRepository scopes = org.mockito.Mockito.mock(ResourceScopeRepository.class);
-+        org.mockito.Mockito.doThrow(new AuthorizationException("resource is outside caller project"))
-+                .when(scopes).requireVisible("WORKER", agentId);
-+        WorkerOperationService scoped = new WorkerOperationService(persistence,
-+                java.time.Clock.fixed(NOW, java.time.ZoneOffset.UTC), Duration.ofMinutes(2), scopes);
-+        PrincipalContext.set(new Principal("tenant-b-user",
-+                new AuthorizationService.Scope("tenant-b", "project-b", "team-b"), java.util.Set.of()));
-+        try {
-+            assertThatThrownBy(() -> scoped.activate(agentId, 1, "cross-tenant-activate-1"))
-+                    .isInstanceOf(AuthorizationException.class)
-+                    .hasMessage("resource is outside caller project");
-+            org.mockito.Mockito.verify(scopes).requireVisible("WORKER", agentId);
-+        } finally {
-+            PrincipalContext.clear();
-+        }
-+    }
-+
-+    private UUID readyAgent() {
-+        UUID id = UUID.randomUUID();
-+        persistence.inTransaction(tx -> {
-+            tx.agents().insert(AgentRecord.create(id, "worker-" + id, AgentPhase.READY,
-+                    "agentscope", "{}", NOW));
-+            return null;
-+        });
-+        return id;
-+    }
-+
-+    private void recover(Instant at) {
-+        persistence.inTransaction(tx -> WorkerOperationService.recoverExpiredOperations(tx, at));
-+    }
-+
-+    private void insertActiveLease(UUID agentId) {
-+        UUID taskId = UUID.randomUUID();
-+        UUID attemptId = UUID.randomUUID();
-+        UUID leaseId = UUID.randomUUID();
-+        Instant expiresAt = NOW.plusSeconds(60);
-+        persistence.inTransaction(tx -> {
-+            tx.tasks().insert(new TaskRecord(taskId, "task", "", TaskPhase.ASSIGNED, 0, "{}", "actor", "test",
-+                    null, null, NOW, NOW, 1));
-+            tx.taskAttempts().insert(new TaskAttemptRecord(attemptId, taskId, leaseId, TaskPhase.ASSIGNED,
-+                    expiresAt, null, "scheduler", "control-plane", null, null, NOW, NOW, 1));
-+            tx.agentLeases().insert(new AgentLeaseRecord(leaseId, agentId, attemptId, NOW, expiresAt, null,
-+                    "ACTIVE", NOW, NOW, 0));
-+            return null;
-+        });
-+    }
-+
-+    private void insertGatewayOnline(UUID agentId) {
-+        jdbc.update("""
-+                INSERT INTO gateway_agent_state
-+                    (agent_id, connection_id, presence, phase, runtime, runtime_version, capabilities,
-+                     connected_at, last_seen_at, disconnected_at, updated_at)
-+                VALUES (?, ?, 'ONLINE', 'READY', 'agentscope', 'v0.1.5', '{}'::jsonb, ?, ?, NULL, ?)
-+                """, agentId.toString(), UUID.randomUUID(), java.sql.Timestamp.from(NOW),
-+                java.sql.Timestamp.from(NOW), java.sql.Timestamp.from(NOW));
-+    }
-+
-+    private WorkerOperation invokeActivate(UUID agentId, long expectedVersion, String idempotencyKey) {
-+        try {
-+            return (WorkerOperation) WorkerOperationService.class
-+                    .getMethod("activate", UUID.class, long.class, String.class)
-+                    .invoke(operations, agentId, expectedVersion, idempotencyKey);
-+        } catch (NoSuchMethodException missing) {
-+            throw new AssertionError("missing WorkerOperationService.activate lifecycle API", missing);
-+        } catch (IllegalAccessException impossible) {
-+            throw new AssertionError("activate lifecycle API must be public", impossible);
-+        } catch (InvocationTargetException wrapped) {
-+            if (wrapped.getCause() instanceof RuntimeException runtime) throw runtime;
-+            throw new AssertionError("activate lifecycle API failed", wrapped.getCause());
-+        }
-+    }
-+}
-diff --git a/control-plane/src/main/java/io/agentteams/controlplane/api/AgentController.java b/control-plane/src/main/java/io/agentteams/controlplane/api/AgentController.java
-index 5955da6..fe2458e 100644
---- a/control-plane/src/main/java/io/agentteams/controlplane/api/AgentController.java
-+++ b/control-plane/src/main/java/io/agentteams/controlplane/api/AgentController.java
-@@ -91,6 +91,17 @@ public final class AgentController {
-         return ResponseEntity.accepted().body(WorkerOperationResponse.from(operation));
-     }
-
-+    @PostMapping("/{id}/operations/activate")
-+    public ResponseEntity<WorkerOperationResponse> requestActivate(
-+            @PathVariable UUID id,
-+            @RequestHeader(value = IDEMPOTENCY_HEADER, required = false) String idempotencyKey,
-+            @RequestBody LifecycleRequest request, @RequestParam(required = false) String projectId) {
-+        requireIdempotencyKey(idempotencyKey);
-+        requireProjectScope(projectId);
-+        WorkerOperation operation = operations().activate(id, expectedVersion(request), idempotencyKey);
-+        return ResponseEntity.ok(WorkerOperationResponse.from(operation));
-+    }
-+
-     @PostMapping("/{id}/operations/rollout")
-     public ResponseEntity<WorkerOperationResponse> requestRollout(
-             @PathVariable UUID id,
-diff --git a/control-plane/src/main/java/io/agentteams/controlplane/worker/WorkerOperationRepository.java b/control-plane/src/main/java/io/agentteams/controlplane/worker/WorkerOperationRepository.java
-index 350907b..0f16d4f 100644
---- a/control-plane/src/main/java/io/agentteams/controlplane/worker/WorkerOperationRepository.java
-+++ b/control-plane/src/main/java/io/agentteams/controlplane/worker/WorkerOperationRepository.java
-@@ -108,6 +108,30 @@ public final class WorkerOperationRepository {
-                 this::map, agentId).stream().findFirst();
-     }
-
-+    public List<UUID> findPendingDrainAgentIds() {
-+        return jdbc.query("SELECT agent_id FROM worker_operations WHERE type = 'DRAIN' "
-+                + "AND status IN ('PENDING', 'RUNNING') ORDER BY agent_id, created_at, id",
-+                (rs, row) -> rs.getObject(1, UUID.class));
-+    }
-+
-+    public Optional<WorkerOperation> findPendingDrainForUpdate(UUID agentId) {
-+        return jdbc.query(select() + " WHERE agent_id = ? AND type = 'DRAIN' "
-+                + "AND status IN ('PENDING', 'RUNNING') ORDER BY created_at DESC, id DESC LIMIT 1 FOR UPDATE",
-+                this::map, agentId).stream().findFirst();
-+    }
-+
-+    public Optional<WorkerOperation> findLatestDrain(UUID agentId) {
-+        return jdbc.query(select() + " WHERE agent_id = ? AND type = 'DRAIN' "
-+                + "ORDER BY created_at DESC, id DESC LIMIT 1", this::map, agentId).stream().findFirst();
-+    }
-+
-+    public boolean isGatewayOnline(UUID agentId, Instant since) {
-+        return !jdbc.queryForList("SELECT connection_id FROM gateway_agent_state "
-+                + "WHERE agent_id = ? AND presence = 'ONLINE' AND connection_id IS NOT NULL "
-+                + "AND last_seen_at >= ? FOR UPDATE", UUID.class, agentId.toString(),
-+                JdbcSupport.timestamp(since)).isEmpty();
-+    }
-+
-     public Optional<WorkerOperation> findActiveByAgentForUpdate(UUID agentId, Instant now) {
-         return jdbc.query(select() + " WHERE agent_id = ? AND status IN ('PENDING', 'RUNNING')"
-                         + " AND lease_expires_at > ? ORDER BY created_at, id LIMIT 1 FOR UPDATE",
-@@ -125,7 +149,7 @@ public final class WorkerOperationRepository {
-     public Optional<WorkerOperation> findActiveLifecycleByAgent(UUID agentId, Instant now) {
-         return jdbc.query(select() + " WHERE agent_id = ?"
-                         + " AND status IN ('PENDING', 'RUNNING')"
--                        + " AND lease_expires_at > ? ORDER BY created_at, id LIMIT 1",
-+                        + " AND (type = 'DRAIN' OR lease_expires_at > ?) ORDER BY created_at, id LIMIT 1",
-                 this::map, agentId, JdbcSupport.timestamp(now)).stream().findFirst();
-     }
-
-@@ -137,7 +161,8 @@ public final class WorkerOperationRepository {
-
-     public List<WorkerOperation> findExpiredForUpdate(Instant now) {
-         return jdbc.query(select() + " WHERE status IN ('PENDING', 'RUNNING')"
--                        + " AND lease_expires_at <= ? ORDER BY lease_expires_at, id FOR UPDATE SKIP LOCKED",
-+                        + " AND type <> 'DRAIN' AND lease_expires_at <= ? "
-+                        + "ORDER BY lease_expires_at, id FOR UPDATE SKIP LOCKED",
-                 this::map, JdbcSupport.timestamp(now));
-     }
-
-diff --git a/control-plane/src/main/java/io/agentteams/controlplane/worker/WorkerOperationService.java b/control-plane/src/main/java/io/agentteams/controlplane/worker/WorkerOperationService.java
-index 35f2f06..efb4dea 100644
---- a/control-plane/src/main/java/io/agentteams/controlplane/worker/WorkerOperationService.java
-+++ b/control-plane/src/main/java/io/agentteams/controlplane/worker/WorkerOperationService.java
-@@ -61,6 +61,62 @@ public final class WorkerOperationService {
-                 correlationOrRandom());
-     }
-
-+    /** Re-enables a drained, still registered worker after the Gateway reconnects. */
-+    public WorkerOperation activate(UUID agentId, long expectedAgentVersion, String idempotencyKey) {
-+        Objects.requireNonNull(agentId, "agentId");
-+        requireKey(idempotencyKey);
-+        requireVisible(agentId);
-+        Instant now = clock.instant();
-+        return persistence.inTransaction(tx -> {
-+            var existing = tx.workerOperations().findByAgentAndIdempotencyKey(agentId, idempotencyKey);
-+            if (existing.isPresent()) {
-+                assertSameActivation(existing.get(), expectedAgentVersion);
-+                return existing.get();
-+            }
-+            AgentRecord current = tx.agents().findByIdForUpdate(agentId)
-+                    .orElseThrow(() -> new ResourceNotFoundException("agent", agentId));
-+            existing = tx.workerOperations().findByAgentAndIdempotencyKey(agentId, idempotencyKey);
-+            if (existing.isPresent()) {
-+                assertSameActivation(existing.get(), expectedAgentVersion);
-+                return existing.get();
-+            }
-+            if (current.version() != expectedAgentVersion) {
-+                throw new io.agentteams.controlplane.persistence.OptimisticLockFailure(
-+                        "agent", agentId, expectedAgentVersion, current.version());
-+            }
-+            if (current.phase() != AgentPhase.DRAINING) {
-+                throw new WorkerLifecycleConflictException("WORKER_NOT_DRAINING");
-+            }
-+            if (tx.agentLeases().countActiveForAgent(agentId) > 0) {
-+                throw new WorkerLifecycleConflictException("WORKER_HAS_ACTIVE_TASKS");
-+            }
-+            WorkerOperation drain = tx.workerOperations().findLatestDrain(agentId)
-+                    .orElseThrow(() -> new WorkerLifecycleConflictException("WORKER_NOT_DRAINED"));
-+            if (drain.status() != WorkerOperationStatus.DRAINED) {
-+                throw new WorkerLifecycleConflictException("WORKER_NOT_DRAINED");
-+            }
-+            if (!tx.workerOperations().isGatewayOnline(agentId, now.minusSeconds(30))) {
-+                throw new WorkerLifecycleConflictException("WORKER_NOT_ONLINE");
-+            }
-+            tx.agents().updatePhase(agentId, AgentPhase.READY, expectedAgentVersion, now);
-+            WorkerOperation activated = new WorkerOperation(UUID.randomUUID(), agentId, WorkerOperationType.ACTIVATE,
-+                    WorkerOperationStatus.SUCCEEDED, null, null, null, null, "{}", idempotencyKey,
-+                    expectedAgentVersion, PrincipalContext.actorOr("control-plane"), null, null,
-+                    correlationOrRandom(), now, now, 0);
-+            tx.workerOperations().insert(activated);
-+            FoundationPersistenceService.appendEvent(tx, "agent", agentId, "WorkerActivated",
-+                    "{\"operationId\":\"" + activated.id() + "\"}", now, expectedAgentVersion + 1);
-+            return activated;
-+        });
-+    }
-+
-+    private static void assertSameActivation(WorkerOperation operation, long expectedAgentVersion) {
-+        if (operation.type() != WorkerOperationType.ACTIVATE
-+                || operation.expectedAgentVersion() != expectedAgentVersion) {
-+            throw new IdempotencyConflictException(operation.idempotencyKey(), "worker activation");
-+        }
-+    }
-+
-     public WorkerOperation rollout(UUID agentId, WorkerRolloutRequest request) {
-         Objects.requireNonNull(request, "request");
-         return request(agentId, WorkerOperationType.ROLLOUT, request.expectedAgentVersion(),
-@@ -349,7 +405,8 @@ public final class WorkerOperationService {
-             var active = tx.workerOperations().findActiveByAgentForUpdate(agentId);
-             if (active.isPresent()) {
-                 WorkerOperation inProgress = active.get();
--                if (inProgress.leaseExpiresAt() != null && !now.isBefore(inProgress.leaseExpiresAt())) {
-+                if (inProgress.type() != WorkerOperationType.DRAIN && inProgress.leaseExpiresAt() != null
-+                        && !now.isBefore(inProgress.leaseExpiresAt())) {
-                     WorkerOperation expired = tx.workerOperations().updateStatus(inProgress.id(),
-                             WorkerOperationStatus.FAILED, "OPERATION_LEASE_EXPIRED", inProgress.version(), now);
-                     FoundationPersistenceService.appendEvent(tx, "worker_operation", expired.id(),
-@@ -450,6 +507,19 @@ public final class WorkerOperationService {
-     public static int recoverExpiredOperations(
-             io.agentteams.controlplane.persistence.FoundationTransaction tx, Instant now) {
-         int recovered = 0;
-+        for (UUID agentId : tx.workerOperations().findPendingDrainAgentIds()) {
-+            AgentRecord agent = tx.agents().findByIdForUpdate(agentId).orElse(null);
-+            if (agent == null || agent.phase() != AgentPhase.DRAINING
-+                    || tx.agentLeases().countActiveForAgent(agentId) > 0) continue;
-+            WorkerOperation drain = tx.workerOperations().findPendingDrainForUpdate(agentId).orElse(null);
-+            if (drain == null) continue;
-+            WorkerOperation drained = tx.workerOperations().updateStatus(drain.id(), WorkerOperationStatus.DRAINED,
-+                    null, drain.version(), now);
-+            FoundationPersistenceService.appendEvent(tx, "worker_operation", drained.id(),
-+                    "WorkerOperationDrained", "{\"operationId\":\"" + drained.id() + "\"}", now,
-+                    drained.version());
-+            recovered++;
-+        }
-         for (WorkerOperation expired : tx.workerOperations().findExpiredForUpdate(now)) {
-             WorkerOperation failed = tx.workerOperations().updateStatus(expired.id(), WorkerOperationStatus.FAILED,
-                     "OPERATION_LEASE_EXPIRED", expired.version(), now);
-diff --git a/control-plane/src/main/java/io/agentteams/controlplane/worker/WorkerOperationType.java b/control-plane/src/main/java/io/agentteams/controlplane/worker/WorkerOperationType.java
-index 8ee9740..9ffc3fe 100644
---- a/control-plane/src/main/java/io/agentteams/controlplane/worker/WorkerOperationType.java
-+++ b/control-plane/src/main/java/io/agentteams/controlplane/worker/WorkerOperationType.java
-@@ -2,6 +2,7 @@ package io.agentteams.controlplane.worker;
-
- public enum WorkerOperationType {
-     DRAIN,
-+    ACTIVATE,
-     ROLLOUT,
-     ROLLBACK,
-     TERMINATE
-diff --git a/control-plane/src/main/resources/db/migration/V122__compose_worker_drain_activate.sql b/control-plane/src/main/resources/db/migration/V122__compose_worker_drain_activate.sql
-new file mode 100644
-index 0000000..62da7a1
---- /dev/null
-+++ b/control-plane/src/main/resources/db/migration/V122__compose_worker_drain_activate.sql
-@@ -0,0 +1,12 @@
-+ALTER TABLE worker_operations DROP CONSTRAINT worker_operations_type_check;
-+ALTER TABLE worker_operations ADD CONSTRAINT worker_operations_type_check
-+    CHECK (type IN ('DRAIN', 'ACTIVATE', 'ROLLOUT', 'ROLLBACK', 'TERMINATE'));
-+
-+ALTER TABLE worker_operations DROP CONSTRAINT worker_operations_type_status_check;
-+ALTER TABLE worker_operations ADD CONSTRAINT worker_operations_type_status_check CHECK (
-+    (type = 'DRAIN' AND status IN ('PENDING', 'RUNNING', 'DRAINED', 'FAILED'))
-+    OR (type = 'ACTIVATE' AND status = 'SUCCEEDED')
-+    OR (type = 'ROLLOUT' AND status IN ('PENDING', 'RUNNING', 'SUCCEEDED', 'FAILED', 'ROLLED_BACK'))
-+    OR (type = 'ROLLBACK' AND status IN ('SUCCEEDED', 'FAILED'))
-+    OR (type = 'TERMINATE' AND status IN ('PENDING', 'RUNNING', 'SUCCEEDED', 'FAILED'))
-+);
---- a/control-plane/src/main/java/io/agentteams/controlplane/persistence/AgentRepository.java
-+++ b/control-plane/src/main/java/io/agentteams/controlplane/persistence/AgentRepository.java
-@@ -174,6 +174,14 @@
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1
-+                         FROM agent_leases lease
-+                        WHERE lease.agent_id = a.id
-+                          AND lease.status = 'ACTIVE'
-+                          AND lease.released_at IS NULL
-+                          AND lease.expires_at > ?
-+                   )
-+                   AND NOT EXISTS (
-+                       SELECT 1
-                          FROM jsonb_array_elements_text(
-                               CASE
-                                   WHEN jsonb_typeof(CAST(? AS jsonb)->'requiredCapabilities') = 'array'
-@@ -185,7 +193,8 @@
-                  ORDER BY a.id
-                  LIMIT 1
-                  FOR UPDATE OF a SKIP LOCKED
--                """, this::map, taskId, JdbcSupport.timestamp(now), JdbcSupport.json(taskSpecJson),
-+                """, this::map, taskId, JdbcSupport.timestamp(now), JdbcSupport.timestamp(now),
-+                JdbcSupport.json(taskSpecJson),
-                 JdbcSupport.json(taskSpecJson)).stream().findFirst();
-     }
-
---- a/control-plane/src/test/java/io/agentteams/controlplane/persistence/FoundationRepositoryIT.java
-+++ b/control-plane/src/test/java/io/agentteams/controlplane/persistence/FoundationRepositoryIT.java
-@@ -846,6 +846,104 @@
-                 .isEqualTo(matchingAgent.id());
-     }
-
-+    @Test
-+    void doesNotSelectProjectWorkerWithAnActiveLease() {
-+        Instant now = Instant.parse("2026-11-06T00:00:00Z");
-+        UUID agentId = UUID.randomUUID();
-+        UUID taskId = UUID.randomUUID();
-+        UUID attemptId = UUID.randomUUID();
-+        UUID leaseId = UUID.randomUUID();
-+        AgentRecord agent = AgentRecord.create(agentId, "leased-project-worker", AgentPhase.READY,
-+                "agentscope", "{\"agentscope\":\"true\"}", now);
-+        TaskRecord task = TaskRecord.draft(taskId, "active lease task", "description", "actor", "test", now);
-+        TaskAttemptRecord attempt = TaskAttemptRecord.fromDomain(new TaskAttempt(
-+                attemptId, taskId, leaseId, TaskPhase.ASSIGNED, now, now, now.plusSeconds(60), null,
-+                "scheduler", "test", null, null, 0));
-+        TaskAssignmentRecord assignment = new TaskAssignmentRecord(UUID.randomUUID(), taskId, attemptId, agentId,
-+                TaskPhase.ASSIGNED, now, null, null, "{}", now, now, 0);
-+        AgentLeaseRecord lease = new AgentLeaseRecord(leaseId, agentId, attemptId, now,
-+                now.plusSeconds(60), null, "ACTIVE", now, now, 0);
-+        persistence.createFoundation(agent, task, attempt, assignment, lease, now);
-+        insertScope("WORKER", agentId, "tenant-a", "project-a");
-+        insertScope("TASK", taskId, "tenant-a", "project-a");
-+
-+        assertThat(new AgentRepository(jdbc).findReadyMatchingInTaskProject(
-+                "{\"requiredCapabilities\":[\"agentscope\"]}", taskId, now))
-+                .as("one fixed Worker slot cannot receive a second active Attempt")
-+                .isEmpty();
-+
-+        jdbc.update("UPDATE agent_leases SET status = 'RELEASED', released_at = ?, updated_at = ? WHERE id = ?",
-+                Timestamp.from(now.plusSeconds(1)), Timestamp.from(now.plusSeconds(1)), leaseId);
-+        assertThat(new AgentRepository(jdbc).findReadyMatchingInTaskProject(
-+                "{\"requiredCapabilities\":[\"agentscope\"]}", taskId, now.plusSeconds(2)))
-+                .as("a Worker slot becomes selectable after its lease is released")
-+                .get()
-+                .extracting(AgentRecord::id)
-+                .isEqualTo(agentId);
-+    }
-+
-+    @Test
-+    void concurrentProjectAssignmentsCannotCreateTwoActiveLeasesForOneWorker() throws Exception {
-+        Instant now = Instant.parse("2026-11-06T00:00:00Z");
-+        UUID agentId = UUID.randomUUID();
-+        AgentRecord agent = AgentRecord.create(agentId, "contended-project-worker", AgentPhase.READY,
-+                "agentscope", "{}", now);
-+        persistence.createAgent(agent);
-+
-+        UUID taskA = insertQueuedScopedTask(now, "tenant-a", "project-a");
-+        UUID taskB = insertQueuedScopedTask(now, "tenant-a", "project-a");
-+        insertScope("WORKER", agentId, "tenant-a", "project-a");
-+
-+        CountDownLatch bothTransactionsStarted = new CountDownLatch(2);
-+        CountDownLatch startAssignments = new CountDownLatch(1);
-+        ExecutorService executor = Executors.newFixedThreadPool(2);
-+        try {
-+            Callable<Boolean> assignment = () -> {
-+                bothTransactionsStarted.countDown();
-+                if (!startAssignments.await(5, TimeUnit.SECONDS)) {
-+                    throw new IllegalStateException("assignment concurrency test timed out");
-+                }
-+                UUID taskId = Thread.currentThread().getName().endsWith("1") ? taskA : taskB;
-+                try {
-+                    new io.agentteams.controlplane.service.TaskAssignmentService(persistence, Duration.ofMinutes(2))
-+                            .queueReadyTask(taskId, now);
-+                    return true;
-+                } catch (IllegalStateException noWorkerAvailable) {
-+                    if (!"no READY agent matches task capabilities".equals(noWorkerAvailable.getMessage())) {
-+                        throw noWorkerAvailable;
-+                    }
-+                    return false;
-+                }
-+            };
-+            Future<Boolean> first = executor.submit(assignment);
-+            Future<Boolean> second = executor.submit(assignment);
-+            assertThat(bothTransactionsStarted.await(5, TimeUnit.SECONDS)).isTrue();
-+            startAssignments.countDown();
-+
-+            assertThat(List.of(first.get(15, TimeUnit.SECONDS), second.get(15, TimeUnit.SECONDS)))
-+                    .as("exactly one queued task can claim the fixed Worker slot")
-+                    .containsExactlyInAnyOrder(true, false);
-+            assertThat(jdbc.queryForObject("SELECT count(*) FROM agent_leases WHERE agent_id = ? "
-+                    + "AND status = 'ACTIVE' AND released_at IS NULL", Long.class, agentId)).isEqualTo(1L);
-+            assertThat(jdbc.queryForObject("SELECT count(*) FROM tasks WHERE id IN (?, ?) AND phase = 'ASSIGNED'",
-+                    Long.class, taskA, taskB)).isEqualTo(1L);
-+        } finally {
-+            startAssignments.countDown();
-+            executor.shutdownNow();
-+        }
-+    }
-+
-+    private UUID insertQueuedScopedTask(Instant now, String tenant, String project) {
-+        UUID taskId = UUID.randomUUID();
-+        persistence.inTransaction(tx -> {
-+            tx.tasks().insert(new TaskRecord(taskId, "queued-" + taskId, "", TaskPhase.QUEUED, 0,
-+                    "{}", "actor", "test", null, null, now, now, 0));
-+            return null;
-+        });
-+        insertScope("TASK", taskId, tenant, project);
-+        return taskId;
-+    }
-+
-     private void insertScope(String resourceType, UUID resourceId, String tenant, String project) {
-         jdbc.update("""
-                 INSERT INTO resource_scopes(resource_type, resource_id, tenant_id, project_id, team, created_at, updated_at)
---- /dev/null
-+++ b/control-plane/src/main/java/io/agentteams/controlplane/scheduling/TenantFairQueue.java
-@@ -0,0 +1,80 @@
-+package io.agentteams.controlplane.scheduling;
-+
-+import java.util.ArrayList;
-+import java.util.Comparator;
-+import java.util.HashMap;
-+import java.util.List;
-+import java.util.Map;
-+import java.util.Objects;
-+import java.util.UUID;
-+
-+/** Deterministic weighted-deficit selection across tenant queues for a fixed number of Worker slots. */
-+public final class TenantFairQueue {
-+    private final Map<UUID, Integer> deficitByTenant = new HashMap<>();
-+    private UUID nextTenant;
-+
-+    public synchronized List<UUID> select(List<TenantQueue> queues, int globalSlots) {
-+        Objects.requireNonNull(queues, "queues");
-+        if (globalSlots < 0) throw new IllegalArgumentException("globalSlots must not be negative");
-+        List<TenantQueue> ordered = queues.stream().sorted(Comparator.comparing(TenantQueue::tenantId)).toList();
-+        Map<UUID, TenantQueue> byTenant = new HashMap<>();
-+        for (TenantQueue queue : ordered) {
-+            if (byTenant.put(queue.tenantId(), queue) != null) {
-+                throw new IllegalArgumentException("tenant queue must be unique");
-+            }
-+        }
-+        deficitByTenant.keySet().retainAll(byTenant.keySet());
-+        if (ordered.isEmpty()) {
-+            nextTenant = null;
-+            return List.of();
-+        }
-+        if (nextTenant == null || !byTenant.containsKey(nextTenant)) nextTenant = ordered.get(0).tenantId();
-+        List<UUID> selected = new ArrayList<>(globalSlots);
-+        int cursor = indexOf(ordered, nextTenant);
-+        int idleVisits = 0;
-+        while (selected.size() < globalSlots && idleVisits < ordered.size()) {
-+            TenantQueue queue = ordered.get(cursor);
-+            if (queue.tasks().isEmpty() || queue.activeAttempts() + selectedCount(selected, queue.tenantId())
-+                    >= queue.maxActiveAttempts()) {
-+                deficitByTenant.put(queue.tenantId(), 0);
-+                cursor = (cursor + 1) % ordered.size();
-+                nextTenant = ordered.get(cursor).tenantId();
-+                idleVisits++;
-+                continue;
-+            }
-+            int deficit = deficitByTenant.getOrDefault(queue.tenantId(), 0);
-+            if (deficit == 0) deficit = queue.weight();
-+            selected.add(queue.tenantId());
-+            queue.tasks().remove(0);
-+            deficitByTenant.put(queue.tenantId(), deficit - 1);
-+            if (deficit - 1 == 0) {
-+                cursor = (cursor + 1) % ordered.size();
-+                nextTenant = ordered.get(cursor).tenantId();
-+            }
-+            idleVisits = selected.isEmpty() ? idleVisits + 1 : 0;
-+        }
-+        return List.copyOf(selected);
-+    }
-+
-+    private static int indexOf(List<TenantQueue> queues, UUID tenantId) {
-+        for (int i = 0; i < queues.size(); i++) if (queues.get(i).tenantId().equals(tenantId)) return i;
-+        return 0;
-+    }
-+
-+    private static long selectedCount(List<UUID> selected, UUID tenantId) {
-+        return selected.stream().filter(tenantId::equals).count();
-+    }
-+
-+    public record TenantQueue(UUID tenantId, int weight, int activeAttempts, int maxActiveAttempts,
-+            List<UUID> tasks) {
-+        public TenantQueue {
-+            Objects.requireNonNull(tenantId, "tenantId");
-+            Objects.requireNonNull(tasks, "tasks");
-+            if (weight < 1 || weight > 100) throw new IllegalArgumentException("weight must be 1..100");
-+            if (activeAttempts < 0 || maxActiveAttempts < 1 || activeAttempts > maxActiveAttempts) {
-+                throw new IllegalArgumentException("invalid tenant active attempt quota");
-+            }
-+            tasks = new ArrayList<>(tasks);
-+        }
-+    }
-+}
---- /dev/null
-+++ b/control-plane/src/test/java/io/agentteams/controlplane/scheduling/TenantFairQueueTest.java
-@@ -0,0 +1,54 @@
-+package io.agentteams.controlplane.scheduling;
-+
-+import static org.assertj.core.api.Assertions.assertThat;
-+import static org.assertj.core.api.Assertions.assertThatThrownBy;
-+
-+import java.util.ArrayList;
-+import java.util.List;
-+import java.util.UUID;
-+import org.junit.jupiter.api.Test;
-+
-+class TenantFairQueueTest {
-+    private static final UUID TENANT_A = UUID.fromString("00000000-0000-0000-0000-000000000001");
-+    private static final UUID TENANT_B = UUID.fromString("00000000-0000-0000-0000-000000000002");
-+
-+    @Test
-+    void weightedDeficitRoundRobinPreservesLongTermTenantWeights() {
-+        TenantFairQueue queue = new TenantFairQueue();
-+        List<UUID> selected = new ArrayList<>();
-+        for (int i = 0; i < 30; i++) {
-+            selected.addAll(queue.select(List.of(tenant(TENANT_A, 2, 0, 100, 30),
-+                    tenant(TENANT_B, 1, 0, 100, 30)), 1));
-+        }
-+        assertThat(selected).filteredOn(TENANT_A::equals).hasSize(20);
-+        assertThat(selected).filteredOn(TENANT_B::equals).hasSize(10);
-+    }
-+
-+    @Test
-+    void activeQuotaAndGlobalSlotsBoundEachSelection() {
-+        TenantFairQueue queue = new TenantFairQueue();
-+        assertThat(queue.select(List.of(tenant(TENANT_A, 10, 2, 2, 10),
-+                tenant(TENANT_B, 1, 0, 1, 10)), 2)).containsExactly(TENANT_B);
-+    }
-+
-+    @Test
-+    void skipsEmptyAndQuotaBlockedTenantsWithoutLosingOtherTenantCapacity() {
-+        TenantFairQueue queue = new TenantFairQueue();
-+        assertThat(queue.select(List.of(tenant(TENANT_A, 1, 0, 2, 0),
-+                tenant(TENANT_B, 1, 2, 2, 5)), 3)).isEmpty();
-+        assertThat(queue.select(List.of(tenant(TENANT_B, 1, 0, 2, 5)), 2))
-+                .containsExactly(TENANT_B, TENANT_B);
-+    }
-+
-+    @Test
-+    void validatesTenantWeightsAndQuotaInputs() {
-+        assertThatThrownBy(() -> tenant(TENANT_A, 0, 0, 1, 1)).isInstanceOf(IllegalArgumentException.class);
-+        assertThatThrownBy(() -> tenant(TENANT_A, 1, 2, 1, 1)).isInstanceOf(IllegalArgumentException.class);
-+    }
-+
-+    private static TenantFairQueue.TenantQueue tenant(UUID id, int weight, int active, int maximum, int queued) {
-+        List<UUID> tasks = new ArrayList<>();
-+        for (int i = 0; i < queued; i++) tasks.add(UUID.nameUUIDFromBytes((id + ":" + i).getBytes()));
-+        return new TenantFairQueue.TenantQueue(id, weight, active, maximum, tasks);
-+    }
-+}
-diff --git a/control-plane/src/main/java/io/agentteams/controlplane/artifact/InternalArtifactUploadController.java b/control-plane/src/main/java/io/agentteams/controlplane/artifact/InternalArtifactUploadController.java
---- a/control-plane/src/main/java/io/agentteams/controlplane/artifact/InternalArtifactUploadController.java
-+++ b/control-plane/src/main/java/io/agentteams/controlplane/artifact/InternalArtifactUploadController.java
-@@ -8,0 +9 @@
-+import java.time.Clock;
-@@ -43,0 +45 @@
-+    private final Clock clock;
-@@ -47 +49 @@
--            @Value("${agentteams.quota.internal-token:}") String internalToken) {
-+            @Value("${agentteams.quota.internal-token:}") String internalToken, Clock clock) {
-@@ -51,0 +54 @@
-+        this.clock = Objects.requireNonNull(clock, "clock");
-@@ -111,0 +115,4 @@
-+        if (record.phase() != io.agentteams.domain.task.TaskPhase.RUNNING
-+                || record.leaseExpiresAt() == null || !record.leaseExpiresAt().isAfter(clock.instant())) {
-+            throw new ResponseStatusException(HttpStatus.CONFLICT, "attempt lease is no longer active");
-+        }
-diff --git a/control-plane/src/test/java/io/agentteams/controlplane/artifact/InternalArtifactUploadControllerTest.java b/control-plane/src/test/java/io/agentteams/controlplane/artifact/InternalArtifactUploadControllerTest.java
---- a/control-plane/src/test/java/io/agentteams/controlplane/artifact/InternalArtifactUploadControllerTest.java
-+++ b/control-plane/src/test/java/io/agentteams/controlplane/artifact/InternalArtifactUploadControllerTest.java
-@@ -57 +57,2 @@
--                        new InternalArtifactUploadController(artifacts, completion, persistence, "secret"))
-+                        new InternalArtifactUploadController(artifacts, completion, persistence, "secret",
-+                                Clock.fixed(Instant.parse("2026-11-06T00:00:00Z"), java.time.ZoneOffset.UTC)))
-@@ -110,0 +112,12 @@
-+    }
-+
-+    @Test
-+    void rejectsPrepareForExpiredAttemptLease() throws Exception {
-+        when(persistence.findTaskAttempt(ATTEMPT_ID)).thenReturn(Optional.of(attempt("scheduler",
-+                Instant.parse("2026-11-05T23:59:59Z"))));
-+
-+        mockMvc.perform(post("/internal/v1/artifacts/uploads")
-+                        .header(InternalArtifactUploadController.TOKEN_HEADER, "secret")
-+                        .contentType(MediaType.APPLICATION_JSON)
-+                        .content(prepareBody(AGENT_ID)))
-+                .andExpect(status().isConflict());
-@@ -179,0 +193,4 @@
-+        return attempt(actor, Instant.parse("2026-11-07T00:00:00Z"));
-+    }
-+
-+    private static TaskAttemptRecord attempt(String actor, Instant leaseExpiresAt) {
-@@ -181 +198 @@
--                Instant.EPOCH.plusSeconds(3600), null, actor, "leader", "", "",
-+                leaseExpiresAt, null, actor, "leader", "", "",
-
-diff --git a/control-plane/src/test/java/io/agentteams/controlplane/persistence/FoundationRepositoryIT.java b/control-plane/src/test/java/io/agentteams/controlplane/persistence/FoundationRepositoryIT.java
---- a/control-plane/src/test/java/io/agentteams/controlplane/persistence/FoundationRepositoryIT.java
-+++ b/control-plane/src/test/java/io/agentteams/controlplane/persistence/FoundationRepositoryIT.java
-@@ -79,0 +79,6 @@
-+    @Test
-+    void createsTenantNeutralWorkerSlotsAndAssignmentBindingSchema() {
-+        assertThat(jdbc.queryForList("SELECT id FROM worker_slots WHERE false")).isEmpty();
-+        assertThat(jdbc.queryForList("SELECT worker_slot_id FROM task_assignments WHERE false")).isEmpty();
-+    }
-+
-
-diff --git a/control-plane/src/main/resources/db/migration/V123__worker_slot_assignment_binding.sql b/control-plane/src/main/resources/db/migration/V123__worker_slot_assignment_binding.sql
-new file mode 100644
---- /dev/null
-+++ b/control-plane/src/main/resources/db/migration/V123__worker_slot_assignment_binding.sql
-@@ -0,0 +1,17 @@
-+-- Tenant-neutral fixed execution slots are distinct from tenant-scoped Agents.
-+CREATE TABLE IF NOT EXISTS worker_slots (
-+    id UUID PRIMARY KEY,
-+    status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'DRAINING', 'DISABLED')),
-+    created_at TIMESTAMPTZ NOT NULL DEFAULT statement_timestamp(),
-+    updated_at TIMESTAMPTZ NOT NULL DEFAULT statement_timestamp()
-+);
-+
-+ALTER TABLE task_assignments
-+    ADD COLUMN worker_slot_id UUID REFERENCES worker_slots(id) ON DELETE RESTRICT;
-+
-+CREATE INDEX task_assignments_worker_slot_idx ON task_assignments(worker_slot_id);
-+CREATE UNIQUE INDEX task_assignments_active_worker_slot_unique
-+    ON task_assignments(worker_slot_id)
-+    WHERE worker_slot_id IS NOT NULL
-+      AND phase IN ('ASSIGNED', 'ACCEPTED', 'RUNNING')
-+      AND released_at IS NULL;
-diff --git a/control-plane/src/main/java/io/agentteams/controlplane/ControlPlaneConfiguration.java b/control-plane/src/main/java/io/agentteams/controlplane/ControlPlaneConfiguration.java
-index 693a19f..d906a4a 100644
---- a/control-plane/src/main/java/io/agentteams/controlplane/ControlPlaneConfiguration.java
-+++ b/control-plane/src/main/java/io/agentteams/controlplane/ControlPlaneConfiguration.java
-@@ -308 +308,2 @@ public class ControlPlaneConfiguration {
--            @Value("${agentteams.scheduler.lease-duration:30s}") java.time.Duration leaseDuration) {
-+            @Value("${agentteams.scheduler.lease-duration:30s}") java.time.Duration leaseDuration,
-+            @Value("${agentteams.scheduler.worker-slots.enabled:false}") boolean workerSlotSchedulingEnabled) {
-@@ -312 +313 @@ public class ControlPlaneConfiguration {
--                contextResolver.getIfAvailable(), contextAssembly.getIfAvailable());
-+                contextResolver.getIfAvailable(), contextAssembly.getIfAvailable(), workerSlotSchedulingEnabled);
-diff --git a/control-plane/src/main/java/io/agentteams/controlplane/persistence/FoundationTransaction.java b/control-plane/src/main/java/io/agentteams/controlplane/persistence/FoundationTransaction.java
-index 4cd465f..6c8b270 100644
---- a/control-plane/src/main/java/io/agentteams/controlplane/persistence/FoundationTransaction.java
-+++ b/control-plane/src/main/java/io/agentteams/controlplane/persistence/FoundationTransaction.java
-@@ -168 +168 @@ public final class FoundationTransaction {
--                SELECT id, task_id, attempt_id, agent_id, phase, assigned_at, accepted_at, released_at,
-+                SELECT id, task_id, attempt_id, agent_id, worker_slot_id, phase, assigned_at, accepted_at, released_at,
-@@ -178,0 +179 @@ public final class FoundationTransaction {
-+                            rs.getObject("worker_slot_id", java.util.UUID.class),
-@@ -338 +339 @@ public final class FoundationTransaction {
--                SELECT id, task_id, attempt_id, agent_id, phase, assigned_at, accepted_at, released_at,
-+                SELECT id, task_id, attempt_id, agent_id, worker_slot_id, phase, assigned_at, accepted_at, released_at,
-@@ -347,0 +349 @@ public final class FoundationTransaction {
-+                            rs.getObject("worker_slot_id", java.util.UUID.class),
-diff --git a/control-plane/src/main/java/io/agentteams/controlplane/persistence/TaskAssignmentRecord.java b/control-plane/src/main/java/io/agentteams/controlplane/persistence/TaskAssignmentRecord.java
-index 492e715..1d1eb7b 100644
---- a/control-plane/src/main/java/io/agentteams/controlplane/persistence/TaskAssignmentRecord.java
-+++ b/control-plane/src/main/java/io/agentteams/controlplane/persistence/TaskAssignmentRecord.java
-@@ -12,0 +13 @@ public record TaskAssignmentRecord(
-+        UUID workerSlotId,
-@@ -35,0 +37,7 @@ public record TaskAssignmentRecord(
-+
-+    public TaskAssignmentRecord(UUID id, UUID taskId, UUID attemptId, UUID agentId, TaskPhase phase,
-+            Instant assignedAt, Instant acceptedAt, Instant releasedAt, String detailsJson,
-+            Instant createdAt, Instant updatedAt, long version) {
-+        this(id, taskId, attemptId, agentId, null, phase, assignedAt, acceptedAt, releasedAt,
-+                detailsJson, createdAt, updatedAt, version);
-+    }
-diff --git a/control-plane/src/main/java/io/agentteams/controlplane/persistence/TaskAssignmentRepository.java b/control-plane/src/main/java/io/agentteams/controlplane/persistence/TaskAssignmentRepository.java
-index 64933a4..357b297 100644
---- a/control-plane/src/main/java/io/agentteams/controlplane/persistence/TaskAssignmentRepository.java
-+++ b/control-plane/src/main/java/io/agentteams/controlplane/persistence/TaskAssignmentRepository.java
-@@ -21 +21 @@ public final class TaskAssignmentRepository {
--                    (id, task_id, attempt_id, agent_id, phase, assigned_at, accepted_at, released_at,
-+                    (id, task_id, attempt_id, agent_id, worker_slot_id, phase, assigned_at, accepted_at, released_at,
-@@ -23 +23 @@ public final class TaskAssignmentRepository {
--                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-@@ -24,0 +25 @@ public final class TaskAssignmentRepository {
-+                assignment.workerSlotId(),
-@@ -33 +34 @@ public final class TaskAssignmentRepository {
--                SELECT id, task_id, attempt_id, agent_id, phase, assigned_at, accepted_at, released_at,
-+                SELECT id, task_id, attempt_id, agent_id, worker_slot_id, phase, assigned_at, accepted_at, released_at,
-@@ -41 +42 @@ public final class TaskAssignmentRepository {
--                SELECT id, task_id, attempt_id, agent_id, phase, assigned_at, accepted_at, released_at,
-+                SELECT id, task_id, attempt_id, agent_id, worker_slot_id, phase, assigned_at, accepted_at, released_at,
-@@ -46,0 +48,17 @@ public final class TaskAssignmentRepository {
-+    public Optional<UUID> lockNextAvailableWorkerSlot() {
-+        return jdbc.query("""
-+                SELECT slot.id
-+                  FROM worker_slots slot
-+                 WHERE slot.status = 'ACTIVE'
-+                   AND NOT EXISTS (
-+                       SELECT 1 FROM task_assignments assignment
-+                        WHERE assignment.worker_slot_id = slot.id
-+                          AND assignment.phase IN ('ASSIGNED', 'ACCEPTED', 'RUNNING')
-+                          AND assignment.released_at IS NULL
-+                   )
-+                 ORDER BY slot.created_at, slot.id
-+                 FOR UPDATE OF slot SKIP LOCKED
-+                 LIMIT 1
-+                """, (rs, row) -> rs.getObject(1, UUID.class)).stream().findFirst();
-+    }
-+
-@@ -77,0 +96 @@ public final class TaskAssignmentRepository {
-+                rs.getObject("worker_slot_id", UUID.class),
-diff --git a/control-plane/src/main/java/io/agentteams/controlplane/service/TaskAssignmentService.java b/control-plane/src/main/java/io/agentteams/controlplane/service/TaskAssignmentService.java
-index 1d09b4a..eaddfd7 100644
---- a/control-plane/src/main/java/io/agentteams/controlplane/service/TaskAssignmentService.java
-+++ b/control-plane/src/main/java/io/agentteams/controlplane/service/TaskAssignmentService.java
-@@ -41,0 +42 @@ public final class TaskAssignmentService {
-+    private final boolean workerSlotSchedulingEnabled;
-@@ -44 +45 @@ public final class TaskAssignmentService {
--        this(persistence, leaseDuration, TaskMetricsPort.noop());
-+        this(persistence, leaseDuration, TaskMetricsPort.noop(), false);
-@@ -49 +50,11 @@ public final class TaskAssignmentService {
--        this(persistence, leaseDuration, metrics, null, null);
-+        this(persistence, leaseDuration, metrics, false);
-+    }
-+
-+    public TaskAssignmentService(FoundationPersistenceService persistence, Duration leaseDuration,
-+            boolean workerSlotSchedulingEnabled) {
-+        this(persistence, leaseDuration, TaskMetricsPort.noop(), workerSlotSchedulingEnabled);
-+    }
-+
-+    private TaskAssignmentService(FoundationPersistenceService persistence, Duration leaseDuration,
-+            TaskMetricsPort metrics, boolean workerSlotSchedulingEnabled) {
-+        this(persistence, leaseDuration, metrics, null, null, workerSlotSchedulingEnabled);
-@@ -54,0 +66,6 @@ public final class TaskAssignmentService {
-+        this(persistence, leaseDuration, metrics, contextResolver, contextAssembly, false);
-+    }
-+
-+    public TaskAssignmentService(FoundationPersistenceService persistence, Duration leaseDuration,
-+            TaskMetricsPort metrics, ExecutionContextResolver contextResolver,
-+            ContextAssemblyService contextAssembly, boolean workerSlotSchedulingEnabled) {
-@@ -57,0 +75 @@ public final class TaskAssignmentService {
-+        this.workerSlotSchedulingEnabled = workerSlotSchedulingEnabled;
-@@ -87,0 +106,4 @@ public final class TaskAssignmentService {
-+            UUID workerSlotId = workerSlotSchedulingEnabled
-+                    ? tx.taskAssignments().lockNextAvailableWorkerSlot()
-+                            .orElseThrow(() -> new IllegalStateException("no ACTIVE worker slot is available"))
-+                    : null;
-@@ -100 +122 @@ public final class TaskAssignmentService {
--                    TaskPhase.ASSIGNED, now, null, null, "{}", now, now, 0);
-+                    workerSlotId, TaskPhase.ASSIGNED, now, null, null, "{}", now, now, 0);
-@@ -272,0 +295,3 @@ public final class TaskAssignmentService {
-+            if (assignment.workerSlotId() != null) {
-+                payload.put("workerSlotId", assignment.workerSlotId().toString());
-+            }
-diff --git a/control-plane/src/test/java/io/agentteams/controlplane/service/TaskAssignmentServiceTest.java b/control-plane/src/test/java/io/agentteams/controlplane/service/TaskAssignmentServiceTest.java
-index 2b0e1df..2d03a0f 100644
---- a/control-plane/src/test/java/io/agentteams/controlplane/service/TaskAssignmentServiceTest.java
-+++ b/control-plane/src/test/java/io/agentteams/controlplane/service/TaskAssignmentServiceTest.java
-@@ -15,0 +16 @@ import java.util.UUID;
-+import org.springframework.jdbc.core.JdbcTemplate;
-@@ -116,0 +118,86 @@ class TaskAssignmentServiceTest {
-+    @Test
-+    void atomicallyBindsAnAvailableWorkerSlotAndRoutesItInTaskAssignedOutbox() {
-+        UUID taskId = UUID.randomUUID();
-+        UUID slotId = UUID.fromString("00000000-0000-0000-0000-000000000010");
-+        AgentRecord ready = agent(UUID.randomUUID(), "tenant-agent", AgentPhase.READY, "{}");
-+        TaskRecord queued = queuedTask(taskId, "{}");
-+        insert(ready, queued);
-+        new JdbcTemplate(dataSource).update("INSERT INTO worker_slots(id, status) VALUES (?, 'ACTIVE')", slotId);
-+
-+        TaskAssignmentService.AssignmentResult result = new TaskAssignmentService(
-+                persistence, LEASE_DURATION, true).queueReadyTask(taskId, START);
-+
-+        assertThat(new JdbcTemplate(dataSource).queryForObject(
-+                "SELECT worker_slot_id FROM task_assignments WHERE id = ?", UUID.class, result.assignment().id()))
-+                .isEqualTo(slotId);
-+        var outboxEvent = persistence.inTransaction(tx -> tx.outboxEvents().findByEventId(result.eventId()));
-+        assertThat(outboxEvent)
-+                .get().satisfies(event -> assertThat(event.payloadJson())
-+                        .contains("\"workerSlotId\": \"" + slotId + "\""));
-+    }
-+
-+    @Test
-+    void leavesTaskQueuedWhenFixedWorkerCapacityIsExhausted() {
-+        UUID taskId = UUID.randomUUID();
-+        AgentRecord ready = agent(UUID.randomUUID(), "tenant-agent", AgentPhase.READY, "{}");
-+        insert(ready, queuedTask(taskId, "{}"));
-+
-+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> new TaskAssignmentService(
-+                persistence, LEASE_DURATION, true).queueReadyTask(taskId, START))
-+                .isInstanceOf(IllegalStateException.class)
-+                .hasMessageContaining("worker slot");
-+
-+        assertThat(persistence.findTask(taskId)).get().extracting(TaskRecord::phase).isEqualTo(TaskPhase.QUEUED);
-+        persistence.inTransaction(tx -> {
-+            assertThat(tx.taskAttempts().count()).isZero();
-+            assertThat(tx.taskAssignments().count()).isZero();
-+            assertThat(tx.agentLeases().count()).isZero();
-+            return null;
-+        });
-+    }
-+
-+    @Test
-+    void concurrentTasksCannotReserveTheSameWorkerSlot() throws Exception {
-+        UUID taskA = UUID.randomUUID();
-+        UUID taskB = UUID.randomUUID();
-+        AgentRecord firstAgent = agent(UUID.randomUUID(), "slot-agent-a", AgentPhase.READY, "{}");
-+        AgentRecord secondAgent = agent(UUID.randomUUID(), "slot-agent-b", AgentPhase.READY, "{}");
-+        insert(firstAgent, queuedTask(taskA, "{}"));
-+        insert(secondAgent, queuedTask(taskB, "{}"));
-+        UUID slotId = UUID.randomUUID();
-+        new JdbcTemplate(dataSource).update("INSERT INTO worker_slots(id, status) VALUES (?, 'ACTIVE')", slotId);
-+
-+        var pool = java.util.concurrent.Executors.newFixedThreadPool(2);
-+        var start = new java.util.concurrent.CountDownLatch(1);
-+        try {
-+            var first = pool.submit(() -> {
-+                start.await();
-+                return new TaskAssignmentService(persistence, LEASE_DURATION, true).queueReadyTask(taskA, START);
-+            });
-+            var second = pool.submit(() -> {
-+                start.await();
-+                return new TaskAssignmentService(persistence, LEASE_DURATION, true).queueReadyTask(taskB, START);
-+            });
-+            start.countDown();
-+            int assigned = 0;
-+            int exhausted = 0;
-+            for (var future : java.util.List.of(first, second)) {
-+                try {
-+                    assertThat(future.get().assignment().workerSlotId()).isEqualTo(slotId);
-+                    assigned++;
-+                } catch (java.util.concurrent.ExecutionException failure) {
-+                    assertThat(failure.getCause()).isInstanceOf(IllegalStateException.class)
-+                            .hasMessageContaining("worker slot");
-+                    exhausted++;
-+                }
-+            }
-+            assertThat(assigned).isEqualTo(1);
-+            assertThat(exhausted).isEqualTo(1);
-+        } finally {
-+            pool.shutdownNow();
-+        }
-+        assertThat(new JdbcTemplate(dataSource).queryForObject(
-+                "SELECT count(*) FROM task_assignments WHERE worker_slot_id = ? AND phase IN ('ASSIGNED','ACCEPTED','RUNNING') AND released_at IS NULL",
-+                Integer.class, slotId)).isEqualTo(1);
-+    }
-+
-@@ -227 +314,3 @@ class TaskAssignmentServiceTest {
--        AgentRecord agent = agent(UUID.randomUUID(), "fault-tolerant-agent", AgentPhase.READY,
-+        AgentRecord agent = agent(UUID.randomUUID(), "fault-tolerant-agent-a", AgentPhase.READY,
-+                "{\"python\":true}");
-+        AgentRecord secondAgent = agent(UUID.randomUUID(), "fault-tolerant-agent-b", AgentPhase.READY,
-@@ -232,0 +322 @@ class TaskAssignmentServiceTest {
-+            tx.agents().insert(secondAgent);
-@@ -235,0 +326 @@ class TaskAssignmentServiceTest {
-+            tx.insertResourceScope("WORKER", secondAgent.id(), "tenant-test", "project-test", "team-test", START);
