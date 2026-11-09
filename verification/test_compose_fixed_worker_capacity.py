@@ -15,7 +15,7 @@ class ComposeFixedWorkerCapacityTest(unittest.TestCase):
     def test_worker_pool_uses_attempt_scoped_credentials_from_proxy(self) -> None:
         compose = (ROOT / "deploy/compose/compose.yaml").read_text()
         example_env = EXAMPLE_ENV.read_text()
-        self.assertIn("AGENTTEAMS_ATTEMPT_CREDENTIAL_ISSUE_URL: http://credential-proxy:8085/internal/v1/attempt-credentials", compose)
+        self.assertIn("AGENTTEAMS_ATTEMPT_CAPABILITY_ISSUE_URL: http://credential-proxy:8085/internal/v1/attempt-capabilities", compose)
         self.assertNotIn("model_proxy_token_worker_", compose)
         self.assertIn("AGENTTEAMS_TENANT_CREDENTIAL_REFS_JSON=", example_env)
         self.assertIn("jsonb_to_recordset", compose)
@@ -87,7 +87,7 @@ class ComposeFixedWorkerCapacityTest(unittest.TestCase):
                 )
                 values[f"WORKER_{slot}_MODEL_CREDENTIAL_REF"] = "file:tenant-a/project-a/team-a/chatgpt"
                 credential_file = temp / f"worker-{slot}.runtime.env"
-                credential_file.write_text(f"AGENTTEAMS_GATEWAY_AUTH_TOKEN=ats_{'A' * 48}\n")
+                credential_file.write_text(f"AGENTTEAMS_GATEWAY_AUTH_TOKEN=wslot_{'A' * 43}\n")
                 credential_file.chmod(0o600)
                 values[f"WORKER_{slot}_CREDENTIALS_FILE"] = str(credential_file)
 
@@ -109,8 +109,10 @@ class ComposeFixedWorkerCapacityTest(unittest.TestCase):
                 python.write_text(
                     "#!/bin/sh\n"
                     "case \"$1\" in\n"
-                    "  -) sed -n 's/^CONTROL_PLANE_IMAGE=//p' \"$2\" | tail -1;;\n"
+                    "  -) if [ -f \"$2\" ] && grep -q '^CONTROL_PLANE_IMAGE=' \"$2\"; then sed -n 's/^CONTROL_PLANE_IMAGE=//p' \"$2\" | tail -1; else exec "
+                    + shlex.quote(os.sys.executable) + " \"$@\"; fi;;\n"
                     "  */build-control-plane-hardening.py) echo control-plane-builder >> \"$CALL_ORDER_LOG\";;\n"
+                    "  */build-gateway-hardening.py) echo gateway-builder >> \"$CALL_ORDER_LOG\";;\n"
                     "  */build-worker-hardening.py) echo worker-builder >> \"$CALL_ORDER_LOG\";;\n"
                     "  *) exec " + shlex.quote(os.sys.executable) + " \"$@\";;\n"
                     "esac\n"
@@ -140,7 +142,8 @@ class ComposeFixedWorkerCapacityTest(unittest.TestCase):
             if deployment_mode == "self-hosted-small" or replicas > 0:
                 order = call_order_log.read_text().splitlines()
                 self.assertEqual(order[-1], "docker")
-                expected = ["control-plane-builder", "worker-builder"] if replicas > 0 else ["control-plane-builder"]
+                expected = (["control-plane-builder", "gateway-builder", "worker-builder"]
+                            if replicas > 0 else ["control-plane-builder", "gateway-builder"])
                 self.assertEqual(order[:-1], expected)
             return shlex.split(calls[0])
 
@@ -214,7 +217,7 @@ class ComposeFixedWorkerCapacityTest(unittest.TestCase):
                     f"WORKER_{slot}_CREDENTIALS_FILE": str(temp / "worker.runtime.env"),
                 })
                 runtime = temp / "worker.runtime.env"
-                runtime.write_text("AGENTTEAMS_GATEWAY_AUTH_TOKEN=ats_" + "A" * 48 + "\n")
+                runtime.write_text("AGENTTEAMS_GATEWAY_AUTH_TOKEN=wslot_" + "A" * 43 + "\n")
                 runtime.chmod(0o600)
             env = temp / ".env"
             env.write_text("\n".join(f"{k}={v}" for k, v in values.items()) + "\n")
@@ -224,7 +227,10 @@ class ComposeFixedWorkerCapacityTest(unittest.TestCase):
             (mock_bin / "docker").write_text("#!/bin/sh\necho docker >> \"$CALL_ORDER_LOG\"\n")
             (mock_bin / "docker").chmod(0o700)
             (mock_bin / "python3").write_text(
-                "#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"$CALL_ORDER_LOG\"\n")
+                "#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"$CALL_ORDER_LOG\"\n"
+                "case \"$1\" in\n"
+                "  -) if [ -f \"$2\" ]; then sed -n 's/^CONTROL_PLANE_IMAGE=//p' \"$2\" | tail -1; fi;;\n"
+                "esac\n")
             (mock_bin / "python3").chmod(0o700)
             environment = os.environ.copy()
             environment.update(PATH=f"{mock_bin}:{environment['PATH']}", CALL_ORDER_LOG=str(log))
@@ -233,7 +239,8 @@ class ComposeFixedWorkerCapacityTest(unittest.TestCase):
             calls = log.read_text().splitlines()
             self.assertEqual(calls[-1], "docker")
             builders = [call.rsplit("/", 1)[-1] for call in calls[:-1] if call != "-"]
-            self.assertEqual(builders, ["build-control-plane-hardening.py", "build-worker-hardening.py"])
+            self.assertEqual(builders, ["build-control-plane-hardening.py", "build-gateway-hardening.py",
+                                        "build-worker-hardening.py"])
 
     def test_starts_exactly_the_configured_worker_slots(self) -> None:
         args = self.invoke_startup(2)
@@ -292,7 +299,7 @@ class ComposeFixedWorkerCapacityTest(unittest.TestCase):
         self.assertNotIn("AGENTTEAMS_CHATGPT_ACCESS_TOKEN_FILE", compose)
         self.assertNotIn("model_proxy_token_worker_", compose)
         self.assertIn("AGENTTEAMS_CHATGPT_RESPONSES_URL: http://credential-proxy:8085/v1/responses", compose)
-        self.assertIn("AGENTTEAMS_ATTEMPT_CREDENTIAL_ISSUE_URL: http://credential-proxy:8085/internal/v1/attempt-credentials", compose)
+        self.assertIn("AGENTTEAMS_ATTEMPT_CAPABILITY_ISSUE_URL: http://credential-proxy:8085/internal/v1/attempt-capabilities", compose)
         self.assertIn("PROVIDER_CREDENTIALS_DIR:?set PROVIDER_CREDENTIALS_DIR", compose)
         self.assertNotIn("model_token_worker_", compose)
         self.assertRegex(compose, r"worker-egress:\n\s+internal: true")
