@@ -87,7 +87,8 @@ class GatewaySessionHandshakeTest {
                 .withEnv("SPRING_DATASOURCE_USERNAME", POSTGRES.getUsername())
                 .withEnv("SPRING_DATASOURCE_PASSWORD", POSTGRES.getPassword())
                 .withEnv("AGENTTEAMS_GATEWAY_NATS_ENABLED", "false")
-                .waitingFor(Wait.forListeningPort().withStartupTimeout(java.time.Duration.ofMinutes(2)));
+                .waitingFor(Wait.forLogMessage(".*Started AgentGatewayApplication.*", 1)
+                        .withStartupTimeout(java.time.Duration.ofMinutes(2)));
         gateway.start();
     }
 
@@ -198,7 +199,10 @@ class GatewaySessionHandshakeTest {
     }
 
     private static Handshake connect(UUID agentId, String token) {
-        ManagedChannel channel = ManagedChannelBuilder.forAddress(gateway.getHost(), gateway.getMappedPort(9090))
+        String host = gateway.getHost();
+        // On macOS, Testcontainers may publish the port on IPv4 while localhost resolves to ::1 first.
+        if ("localhost".equalsIgnoreCase(host)) host = "127.0.0.1";
+        ManagedChannel channel = ManagedChannelBuilder.forAddress(host, gateway.getMappedPort(9090))
                 .usePlaintext().build();
         ClientCall<byte[], byte[]> call = channel.newCall(CONNECT, CallOptions.DEFAULT.withDeadlineAfter(60, TimeUnit.SECONDS));
         BlockingQueue<byte[]> responses = new LinkedBlockingQueue<>();

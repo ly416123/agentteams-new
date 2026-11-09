@@ -109,7 +109,11 @@ def main() -> int:
         require_tests(source)
         run([
             "mvn", "--batch-mode", "--no-transfer-progress", "-P", "!colima-testcontainers",
-            "-pl", "agent-gateway", "-am", "-DskipTests", "package",
+            "-pl", "agent-gateway", "-am", "-DskipTests", "install",
+        ], cwd=source)
+        run([
+            "mvn", "--batch-mode", "--no-transfer-progress", "-P", "!colima-testcontainers",
+            "-pl", "agent-gateway", "-DskipTests", "package", "spring-boot:repackage",
         ], cwd=source)
         image_context = work / "image-context"
         jar_relative = Path("agent-gateway/target/agentteams-agent-gateway-0.1.0-SNAPSHOT.jar")
